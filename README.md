@@ -111,7 +111,10 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 | 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 35 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息 |
 | 纯逻辑与宿主集成（真 HTTP + 真校验器 + 桩服务） | `npm test` | 49 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
+| 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
+
+`verify:live` 针对**正在运行的实例**：用 DSH 启动时打印的 token 换取鉴权 cookie，读启动页里的客户端模块组，把含本插件的那一组下载下来，断言插件自己的标记确实在其中。它证明的是「浏览器刷新后会拿到当前代码」，而不是「源码看起来没问题」——前端改动后这是唯一能确认已生效的自动手段。
 
 `verify:profile` 会另起独立端口 + 独立 `DSH_HOME` 的沙箱实例，**只按 pid 结束自己启动的进程**，绝不触碰你正在用的 DSH。也可以手动指定：
 
@@ -119,7 +122,7 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**尚未验证的一环（诚实说明）**：浏览器里的端到端交互（编辑按钮出现、就地编辑器渲染、点确认后行隐藏、新回复流入）**还没有在真实浏览器里跑过**。它需要 React + Playwright + 浏览器，以及一次真实模型调用来产生两轮对话（本机额度极低，故未执行）。客户端逻辑已通过上面的静态检查，宿主侧也已用真实校验器验证；但 `lib/client.js` 的 DOM 增强部分仍是「按已在本机生产运行的等价插件的模式实现」，没有实测。额度允许时建议先在一个沙箱 profile 里手工点一遍。
+**尚未验证的一环（诚实说明）**：客户端的**交互行为**——点编辑按钮、就地编辑器渲染、确认后被回退的行隐藏、新回复流入——**还没有被自动化验证**，需要真实浏览器交互（本机 React 与 Playwright 均不可用）。但比 v0.1.0 首次交付时进了一步：插件的客户端半部已确认**出现在运行实例的客户端模块图里**、且**下发的字节就是当前源码**（`verify:live`），不再只是「按等价插件的模式实现」。剩下的是纯点击路径，请人工过一遍。
 
 **开发前置**：`npm test` 与两个 `verify:*` 需要 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-tools` 可解析。本插件自身不依赖它们（宿主半部只 import `schemastery` 与 `dsh-tools`），测试需要一个装了 DSH 的 `node_modules`：
 
@@ -274,7 +277,15 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 | Official append contract against the real validator, in process | `npm run verify:contract` | 35 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message |
 | Pure logic and host integration (real HTTP + real validator + stubbed services) | `npm test` | 49 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, three-way version sync, wire contract) | `npm run verify:client` | all pass |
+| Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
+
+`verify:live` targets an instance that is **already running**: it exchanges the
+token DSH printed on boot for an auth cookie, reads the client module groups out
+of the boot page, downloads the group containing this plugin, and asserts the
+plugin's own markers are inside it. That proves "a browser reload gets the
+current code", which is stronger than "the source looks right" - and after a
+front-end edit it is the only automatic way to confirm the change took effect.
 
 `verify:profile` boots a sandbox instance on its own port with its own
 `DSH_HOME`, and terminates only the process it started, **by pid**. It never
@@ -284,16 +295,15 @@ touches the DSH you are using:
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**The one link that is NOT verified, stated plainly:** the end-to-end browser
-interaction (the edit action appearing, the in-place editor rendering, the rows
-hiding after a confirm, the new reply streaming in) has **not** been run in a
-real browser. That needs React plus Playwright plus a browser, and a real model
-call to produce two turns of conversation, which this machine's remaining budget
-could not cover. The client logic passes the static checks above and the host
-side is proven against the real validator, but the DOM enhancement in
-`lib/client.js` is implemented to the pattern of an equivalent plugin already
-running in production on this machine, not measured. Click through it once in a
-sandbox profile when budget allows.
+**The one link that is NOT verified, stated plainly:** the client's **interactive**
+behaviour - clicking the edit action, the in-place editor rendering, the rolled-back
+rows hiding, the new reply streaming in - is **not** covered by an automated check;
+it needs real browser interaction (React and Playwright are both unavailable on this
+machine). This is still stronger than the first v0.1.0 delivery, though: the browser
+half is now confirmed to be **present in the running instance's client module graph**
+and the **bytes being served are the current source** (`verify:live`), rather than
+"implemented to the pattern of an equivalent plugin". Only the click path is left -
+walk it once by hand.
 
 **Development prerequisite:** `npm test` and both `verify:*` commands need
 `@deepseek-ai/dsh-session` and `@deepseek-ai/dsh-tools` to resolve. The plugin
