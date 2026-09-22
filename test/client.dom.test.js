@@ -259,6 +259,9 @@ async function readyController() {
   })
   await harness.controller.load()
   render(harness, harness.controller, snapshot)
+  // The first DOM pass sees a changed row count and refreshes; let it settle so
+  // a later explicit load(true) is not answered by a stale in-flight request.
+  await harness.controller.load()
   return { harness, controller: harness.controller, snapshot, row: harness.document.body.children[0] }
 }
 
@@ -454,6 +457,54 @@ test('a rollback whose re-run did not start reaches the user', async () => {
   assert.equal(snapshotNow.notice, 'prompt')
   assert.equal(snapshotNow.editing, null)
   assert.equal(row.querySelector('.dshet-editor'), null)
+})
+
+test('a prompt created by a re-run becomes editable without a page reload', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const asked = []
+  // The host now reports the revised prompt as editable and the old one hidden.
+  globalThis.fetch = async (url) => {
+    asked.push(String(url))
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        hidden: [{ seq: 2, turn: 1 }],
+        turns: [{ seq: 20, turn: 3, messageId: 'm-u3', text: 'revised prompt', attachments: 0 }],
+        config: { confirm: true },
+      }),
+    }
+  }
+  // The re-run added a row to the transcript; that is the refresh signal.
+  const second = mountRow(harness.document, 'row-2')
+  const widened = {
+    nodes: new Map([
+      [ROW_KEY, { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
+      ['row-2', { kind: 'user', data: { seq: 20 }, anchorSeq: 20 }],
+    ]),
+  }
+  render(harness, controller, widened)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, widened)
+
+  assert.ok(asked.some((url) => url.includes('/state')), 'the client asked the host again')
+  assert.equal(byClass(second, 'dshet-action').length, 1, 'the revised prompt offers an edit action')
+  assert.equal(byClass(row, 'dshet-action').length, 0, 'the rolled-back prompt does not')
+  assert.equal(row.dataset.dshetHidden, '1', 'the rolled-back row stays hidden')
+  void snapshot
+})
+
+test('an unchanged row count does not re-ask the host', async () => {
+  const { harness, controller, snapshot } = await readyController()
+  const asked = []
+  globalThis.fetch = async (url) => {
+    asked.push(String(url))
+    return { ok: true, status: 200, json: async () => ({ ok: true, hidden: [], turns: [], config: {} }) }
+  }
+  render(harness, controller, snapshot)
+  render(harness, controller, snapshot)
+  assert.equal(asked.length, 0, 'no redundant /state traffic while nothing changed')
 })
 
 test('cancel closes the editor without posting', async () => {

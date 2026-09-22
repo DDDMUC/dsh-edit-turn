@@ -218,7 +218,63 @@ check('ONLY the system prompt and the marker survive', fallbackTexts.length === 
 check('the marker is the second message', fallbackTexts[1] === MARKER, fallbackTexts[1])
 
 // ---------------------------------------------------------------------------
-console.log('\n8. guard rails')
+console.log('\n8. a SECOND rollback of the revised prompt is accepted')
+const twice = freshSession('000000000004')
+buildTwoTurnLog(twice)
+const firstEvents = twice.snapshotEvents()
+const firstFold = foldSurface(firstEvents)
+const firstPlan = planRollback(firstEvents, firstFold.nodes, { seq: editableTurns(firstEvents, firstFold.nodes)[0].seq })
+const firstCarrier = buildCarrier(firstPlan, lastTurnOf(firstEvents), { carrier: 'system/message' })
+twice.append(firstCarrier.type, firstCarrier.data, {
+  surfaceOp: { op: 'replace', startSeq: firstPlan.startSeq, endSeq: firstPlan.endSeq },
+  sourceEventSeqs: firstPlan.shadowed,
+})
+
+// What the host's re-run does: prompt admission appends the revised prompt, and
+// the turn it starts eventually closes.
+twice.append('turn/start', { turn: 3 })
+twice.append('step/start', { turn: 3, step: 1 })
+twice.append('user/message', userMessage('m-u3', 'revised prompt'), { surfaceOp: 'append' })
+twice.append('assistant/message', { turn: 3, step: 1, message: modelMessage('m-a3', 'answer to revised'), stream: [] }, { surfaceOp: 'append' })
+twice.append('step/end', { turn: 3, step: 1 })
+twice.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+
+// This is what the client has to ask the host for after an edit: without a
+// refresh it never learns that the revised prompt became editable.
+const secondEvents = twice.snapshotEvents()
+const secondFold = foldSurface(secondEvents)
+const secondTargets = editableTurns(secondEvents, secondFold.nodes)
+check(
+  'the revised prompt is the only editable turn',
+  secondTargets.length === 1 && secondTargets[0].text === 'revised prompt',
+  JSON.stringify(secondTargets.map((entry) => entry.text)),
+)
+
+const secondPlan = planRollback(secondEvents, secondFold.nodes, { seq: secondTargets[0].seq })
+const secondCarrier = buildCarrier(secondPlan, lastTurnOf(secondEvents), { carrier: 'system/message' })
+let secondFailure
+try {
+  twice.append(secondCarrier.type, secondCarrier.data, {
+    surfaceOp: { op: 'replace', startSeq: secondPlan.startSeq, endSeq: secondPlan.endSeq },
+    sourceEventSeqs: secondPlan.shadowed,
+  })
+} catch (error) {
+  secondFailure = String((error && error.message) || error)
+}
+check('the validator ACCEPTED a second rollback', secondFailure === undefined, secondFailure)
+const afterSecond = texts(twice.deriveMessages())
+check(
+  'the second rollback leaves only the system prompt',
+  afterSecond.length === 1 && afterSecond[0] === 'VERIFY SYSTEM PROMPT',
+  JSON.stringify(afterSecond),
+)
+check('the revised prompt and its answer are gone', !afterSecond.some((text) => text.includes('revised')))
+const thirdFold = foldSurface(twice.snapshotEvents())
+check('nothing is editable after two rollbacks', editableTurns(twice.snapshotEvents(), thirdFold.nodes).length === 0)
+check('two rollbacks appended exactly two events', twice.seq > 0)
+
+// ---------------------------------------------------------------------------
+console.log('\n9. guard rails')
 const rejected = []
 try {
   planRollback(events, fold.nodes, { seq: fold.nodes[0] })
