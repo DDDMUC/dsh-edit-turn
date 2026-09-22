@@ -1,6 +1,6 @@
 {
   "name": "dsh-edit-turn",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Edit any user turn in DeepSeek Harness and re-run it: an inline editor on the message row rolls the conversation back to just before that turn through the official surface-replace contract, then re-prompts the agent with the revised text. The append-only session log is never rewritten.",
   "type": "module",
   "main": "lib/index.js",

@@ -21,6 +21,8 @@ import { Session } from '@deepseek-ai/dsh-session'
 import {
   PLUGIN_ID,
   buildCarrier,
+  buildCorrection,
+  editableReplies,
   editableTurns,
   foldSurface,
   isBusy,
@@ -274,7 +276,81 @@ check('nothing is editable after two rollbacks', editableTurns(twice.snapshotEve
 check('two rollbacks appended exactly two events', twice.seq > 0)
 
 // ---------------------------------------------------------------------------
-console.log('\n9. guard rails')
+console.log('\n9. editing what the model said')
+const replySession = freshSession('000000000005')
+buildTwoTurnLog(replySession)
+const replyEvents = replySession.snapshotEvents()
+const replyFold = foldSurface(replyEvents)
+const replyTargets = editableReplies(replyEvents, replyFold.nodes)
+check(
+  'replies with text are offered for editing',
+  replyTargets.length === 2 && replyTargets[0].text === '第一轮回答',
+  JSON.stringify(replyTargets.map((entry) => entry.text)),
+)
+const replyPlan = planRollback(replyEvents, replyFold.nodes, { seq: replyTargets[0].seq })
+check('a reply is planned as a reply edit, not a re-run', replyPlan.mode === 'reply', replyPlan.mode)
+check('its window opens at the reply and ends on the last surface node',
+  replyPlan.startSeq === replyPlan.shadowed[0] && replyPlan.endSeq === replyFold.nodes.at(-1))
+check('the correction inherits the original turn and step', replyPlan.turn === 1 && replyPlan.step === 1)
+
+// The rule the whole design has to work around.
+let carrierRefusal = null
+{
+  const probe = freshSession('000000000006')
+  buildTwoTurnLog(probe)
+  const events = probe.snapshotEvents()
+  const nodes = foldSurface(events).nodes
+  const plan = planRollback(events, nodes, { seq: editableReplies(events, nodes)[0].seq })
+  try {
+    probe.append('assistant/message', { turn: 1, step: 1, message: modelMessage('m-x', 'x'), stream: [] }, {
+      surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+      sourceEventSeqs: plan.shadowed,
+    })
+  } catch (error) {
+    carrierRefusal = String((error && error.message) || error)
+  }
+}
+check('an assistant message is REFUSED as a replacement carrier',
+  typeof carrierRefusal === 'string' && carrierRefusal.includes('sourceEventSeqs'), carrierRefusal)
+
+// What is accepted instead: roll back invisibly, then append the correction.
+const replyCarrier = buildCarrier(replyPlan, lastTurnOf(replyEvents), { carrier: 'system/message' })
+let replyFailure = null
+try {
+  replySession.append(replyCarrier.type, replyCarrier.data, {
+    surfaceOp: { op: 'replace', startSeq: replyPlan.startSeq, endSeq: replyPlan.endSeq },
+    sourceEventSeqs: replyPlan.shadowed,
+  })
+  const correction = buildCorrection(replyPlan, '改写后的回答')
+  replySession.append(correction.type, correction.data, { surfaceOp: 'append' })
+} catch (error) {
+  replyFailure = String((error && error.message) || error)
+}
+check('rollback + appended correction is ACCEPTED', replyFailure === null, replyFailure)
+const afterReply = texts(replySession.deriveMessages())
+const rolesAfterReply = replySession.deriveMessages().map((message) => message.role)
+check('the model now sees the corrected text as its own reply',
+  afterReply.length === 3 && afterReply[2] === '改写后的回答', JSON.stringify(afterReply))
+check('the earlier prompt is untouched and still first', afterReply[1] === '第一轮提问', JSON.stringify(afterReply))
+check('the history stays strictly alternating', rolesAfterReply.join(',') === 'system,user,assistant', rolesAfterReply.join(','))
+check('the tool result left together with the reply it belonged to',
+  !replySession.deriveMessages().some((message) => (message.content || []).some((block) => block.type === 'tool-result')))
+const appendedCorrection = replySession.snapshotEvents().at(-1)
+check('the correction is a model-kind reply, so it renders as one', appendedCorrection.data.message.source.kind === 'model')
+check('the correction records who wrote the text', appendedCorrection.data.message.source.editedBy === PLUGIN_ID)
+check('the correction carries a turn and a step, so reply nodes cannot collide',
+  appendedCorrection.data.turn === 1 && appendedCorrection.data.step === 1)
+let continueFailure = null
+try {
+  replySession.append('user/message', userMessage('m-next', '下一个问题'), { surfaceOp: 'append' })
+} catch (error) {
+  continueFailure = String((error && error.message) || error)
+}
+check('the conversation can continue from a corrected reply', continueFailure === null, continueFailure)
+check('the follow-up lands after the correction', texts(replySession.deriveMessages()).at(-1) === '下一个问题')
+
+// ---------------------------------------------------------------------------
+console.log('\n10. guard rails')
 const rejected = []
 try {
   planRollback(events, fold.nodes, { seq: fold.nodes[0] })

@@ -12,8 +12,11 @@ import { test } from 'node:test'
 import {
   PLUGIN_ID,
   buildCarrier,
+  buildCorrection,
+  editableReplies,
   editableTurns,
   foldSurface,
+  isAssistantReply,
   isBusy,
   isHumanPrompt,
   isSurfaceEvent,
@@ -192,13 +195,85 @@ test('the system prompt head is never editable', () => {
   assert.throws(() => planRollback(log, nodes, { seq: nodes[0] }), (error) => error.code === 'not-editable')
 })
 
-test('assistant, tool and injected rows are not editable', () => {
+test('tool results and injected rows are not editable', () => {
   const log = twoTurnLog()
   log.push(ev(11, 'user/message', { id: 'inj', role: 'user', content: [{ type: 'text', text: 'ctx' }], source: { kind: 'plugin', plugin: 'x' } }, append))
   const { nodes } = foldSurface(log)
-  for (const seq of [3, 7, 11]) {
+  for (const seq of [7, 11]) {
     assert.throws(() => planRollback(log, nodes, { seq }), (error) => error.code === 'not-editable', `seq ${seq}`)
   }
+})
+
+test('a model reply is planned as a reply edit that re-runs nothing', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  const plan = planRollback(log, nodes, { seq: 3 })
+  assert.equal(plan.mode, 'reply')
+  assert.equal(plan.original, '第一答')
+  assert.equal(plan.turn, 1)
+  assert.equal(plan.step, 1)
+  // The window still runs to the tail: a corrected answer invalidates everything
+  // that was built on top of it.
+  assert.deepEqual(plan.shadowed, [3, 6, 7, 8])
+})
+
+test('a prompt editing target reports the prompt mode', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  assert.equal(planRollback(log, nodes, { seq: 2 }).mode, 'prompt')
+})
+
+test('editableReplies lists replies with text, in conversation order', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  const replies = editableReplies(log, nodes)
+  assert.deepEqual(replies.map((entry) => entry.seq), [3, 8])
+  assert.deepEqual(replies.map((entry) => entry.text), ['第一答', '第二答'])
+  assert.deepEqual(replies.map((entry) => entry.turn), [1, 2])
+  assert.equal(replies[0].attachments, 0)
+})
+
+test('a reply with no text is not offered for editing', () => {
+  const log = twoTurnLog()
+  // A step that only produced tool calls has nothing to put in a text editor.
+  log.push(ev(12, 'assistant/message', { turn: 2, step: 2, message: { id: 'a3', role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c9', toolName: 'x', input: {} }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] }, append))
+  const { nodes } = foldSurface(log)
+  assert.deepEqual(editableReplies(log, nodes).map((entry) => entry.seq), [3, 8])
+})
+
+test('a reply carrying tool calls is offered, and counts them as non-text parts', () => {
+  const log = twoTurnLog()
+  log.push(ev(12, 'assistant/message', {
+    turn: 2,
+    step: 2,
+    message: {
+      id: 'a3',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '我来查一下' },
+        { type: 'tool-call', toolCallId: 'c9', toolName: 'x', input: {} },
+      ],
+      source: { kind: 'model', provider: 'p', model: 'm' },
+    },
+    stream: [],
+  }, append))
+  const { nodes } = foldSurface(log)
+  const last = editableReplies(log, nodes).at(-1)
+  assert.equal(last.seq, 12)
+  assert.equal(last.text, '我来查一下')
+  assert.equal(last.attachments, 1)
+})
+
+test('a shadowed reply is no longer offered', () => {
+  const log = twoTurnLog()
+  const first = planRollback(log, foldSurface(log).nodes, { seq: 3 })
+  log.push(
+    ev(12, 'system/message', { turn: 2, step: 1, message: { id: 'c', role: 'system', content: [], source: { kind: 'plugin', plugin: PLUGIN_ID } } }, {
+      surfaceOp: { op: 'replace', startSeq: first.startSeq, endSeq: first.endSeq },
+      sourceEventSeqs: first.shadowed,
+    }),
+  )
+  assert.deepEqual(editableReplies(log, foldSurface(log).nodes), [])
 })
 
 test('an already shadowed prompt is refused as stale rather than replanned', () => {
@@ -301,4 +376,58 @@ test('the fallback carrier is a non-empty plugin-sourced user message', () => {
   assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
   assert.deepEqual(carrier.data.source, { kind: 'plugin', plugin: PLUGIN_ID })
   assert.equal(carrier.data.role, 'user')
+})
+
+// --- the appended correction (editing a model reply) ------------------------
+
+test('the correction is an assistant message the model will treat as its own', () => {
+  const log = twoTurnLog()
+  const plan = planRollback(log, foldSurface(log).nodes, { seq: 3 })
+  const correction = buildCorrection(plan, '改写后的回答')
+  assert.equal(correction.type, 'assistant/message')
+  assert.equal(correction.data.turn, plan.turn)
+  assert.equal(correction.data.step, plan.step)
+  assert.equal(correction.data.message.role, 'assistant')
+  assert.deepEqual(correction.data.message.content, [{ type: 'text', text: '改写后的回答' }])
+  assert.equal(typeof correction.data.message.id, 'string')
+  assert.ok(correction.data.message.id.length > 0)
+  assert.equal(Array.isArray(correction.data.stream), true)
+})
+
+test('the correction stays a model reply and records who wrote the text', () => {
+  const log = twoTurnLog()
+  const plan = planRollback(log, foldSurface(log).nodes, { seq: 3 })
+  const source = buildCorrection(plan, 'x').data.message.source
+  // `kind: model` so it renders and projects exactly like an ordinary reply ...
+  assert.equal(source.kind, 'model')
+  // ... plus an honest marker that these words are not the model's.
+  assert.equal(source.editedBy, PLUGIN_ID)
+})
+
+test('the correction carries over the provider that produced the original', () => {
+  const log = twoTurnLog()
+  log[3].data.message.source = { kind: 'model', provider: 'stepfun', model: 'step-5-preview' }
+  const plan = planRollback(log, foldSurface(log).nodes, { seq: 3 })
+  const source = buildCorrection(plan, 'x').data.message.source
+  assert.equal(source.provider, 'stepfun')
+  assert.equal(source.model, 'step-5-preview')
+  assert.equal(source.editedBy, PLUGIN_ID)
+})
+
+test('the correction always carries turn and step', () => {
+  const log = twoTurnLog()
+  const plan = planRollback(log, foldSurface(log).nodes, { seq: 3 })
+  // The client keys a reply node by turn:step, so a missing step would make two
+  // corrections collide on "undefined:undefined".
+  const correction = buildCorrection({ ...plan, turn: null, step: null }, 'x')
+  assert.equal(correction.data.turn, 0)
+  assert.equal(correction.data.step, 1)
+})
+
+test('isAssistantReply tells replies apart from prompts and tool results', () => {
+  const log = twoTurnLog()
+  assert.equal(isAssistantReply(log.find((event) => event.type === 'assistant/message')), true)
+  assert.equal(isAssistantReply(log.find((event) => event.type === 'user/message')), false)
+  assert.equal(isAssistantReply(log.find((event) => event.type === 'tool/result')), false)
+  assert.equal(isAssistantReply(undefined), false)
 })

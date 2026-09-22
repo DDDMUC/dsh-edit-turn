@@ -25,6 +25,7 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 - **默认零上下文污染** —— 替换事件的载体是一个**空的 `system/message`**。官方格式文档里空的后置 system 节点是「dormant，不投影成任何消息」，所以回退后模型看到的上下文，和「对话真的停在那一点」完全一致，不会多出任何标记文本。
 - **轮边界安全** —— 遮蔽窗口右端固定为日志最后一个 surface 节点，左端固定为目标消息节点，因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
 - **重跑走官方准入路径** —— `ctx.sessionController.prompt()` 是唯一的口径：它会自己 resume 冷会话，并恰好开一个新轮次。
+- **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，再**追加**一条带改写文本的助手消息——模型会把改写后的内容当成自己说过的话，对话可以继续。`source.editedBy` 会如实记录这段文字由插件写入。
 - **一次点击即执行** —— 保存后不再有二次确认。编辑器本身已经是用户主动打开的动作，面板里也写明了保存会丢弃哪些内容；想恢复两步确认可在 profile 里一行开启（`confirm: true`）。
 - **中英双语 UI**，跟随 DSH 当前语言。
 - **皮肤友好** —— 编辑器面板自带不透明表面（`--dshet-panel`）而不是借用主题的表面色变量。皮肤的本意就是让表面半透明、把插画透出来，而它只会给**自己的**元素补可读背景，插件类名不在其中；借用皮肤变量的面板会变成全透明，文字直接压在插画上。暗色分支走官方属性 `body[data-ds-dark-theme]`（与 `dsh-client-ui-theme` 及多个官方 UI 包一致），并用 `backdrop-filter` 与皮肤融合。
@@ -52,6 +53,10 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 3. 编辑器与该轮之后的转录行一起消失，新提示词与新回复出现在下方。
 
 编辑器里如果提示「这条消息包含图片或文件附件」，说明改写只保留文字，附件会被丢弃。
+
+**编辑模型的回答**：悬停任意一条模型回复，同样会出现编辑入口。改完点「保存替换」——这条回答被替换为你写的内容，它之后的内容一并移除，模型从此把你写的内容当成自己说过的话，对话可以继续下去。
+
+注意：回答里的**工具调用与思考过程**无法保留（替换后只留文字，编辑器会提示），因为工具调用的结果已经不再成立。
 
 ### 配置
 
@@ -133,7 +138,9 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 已知限制
 
-- **只支持人类输入的消息**。注入的上下文行、助手消息、系统提示词都不提供编辑入口。
+- 可以编辑**你自己输入的消息**与**模型的回答**；注入的上下文行与系统提示词没有编辑入口。
+- 编辑一条回答会把它替换为**纯文本**：该回答里的工具调用与思考过程会被移除（编辑器会提示），因为它们的结果已不再成立。
+- 编辑一条用户消息会重跑那一轮；编辑一条模型回答只替换内容，**不会**重新问模型。
 - **编辑会丢弃该消息之后的全部轮次**（MVP 语义，和 ChatGPT 的编辑一致）。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
 - **只改写文本**。消息里含图片/文件附件时，改写后只保留文字（编辑器会提示）。
 - **会话必须当前在 DSH 中打开**，否则返回 `409 session-not-active`。
@@ -182,6 +189,7 @@ This plugin adds it:
 - **Zero context pollution by default.** The replacement carrier is an **empty `system/message`**. The official format documents empty later system nodes as dormant, projecting to no message, so the context after an edit is exactly what it would be had the conversation really stopped there - no marker text is added.
 - **Turn-boundary safe.** The shadow window always ends at the last surface node and always opens at the addressed message, so an assistant message (which carries its own tool_use blocks) and the tool/result it produced are shadowed together. A dangling call/result pair is impossible.
 - **Official re-run.** `ctx.sessionController.prompt()` is the only prompt admission path; it resumes a cold Session itself and opens exactly one new turn.
+- **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The answer is rolled back together with everything after it, and the corrected text is **appended** as a fresh reply - the model goes on treating it as its own. `source.editedBy` records honestly that the plugin wrote those words.
 - **One click applies** - no second confirmation. The editor is already an explicit action the user opened, and the panel states what saving discards; a profile can restore the two-step flow with `confirm: true`.
 - **Bilingual UI** that follows the current DSH locale.
 - **Skin-friendly** - the editor paints its own opaque surface (`--dshet-panel`) instead of borrowing the theme's surface colours. A skin exists to make surfaces translucent so its artwork shows through, and it only compensates for *its own* elements; a plugin's class names are not on that list, so a panel that borrows those variables can end up fully transparent with text sitting straight on the art. The dark branch uses the official `body[data-ds-dark-theme]` hook (the same one `dsh-client-ui-theme` and several official UI packages use) and blends in with `backdrop-filter`.
@@ -210,6 +218,15 @@ Restart the DSH process that serves that profile to pick it up.
 
 If the editor warns that the message carries attachments, the rewrite keeps the
 text only and drops them.
+
+**Editing what the model said.** Hover any model reply and the same edit action
+appears. Click "Save replacement" - the reply is replaced with your text,
+everything after it is removed, and the model goes on treating your words as its
+own, so the conversation can continue from there.
+
+Note that **tool calls and reasoning inside that reply cannot survive** the
+replacement (only text is kept, and the editor warns first): their results are no
+longer valid once you have changed what the model said.
 
 ### Configuration
 
@@ -319,7 +336,9 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### Known limitations
 
-- **Human messages only.** Injected context rows, assistant messages and the system prompt offer no edit entry.
+- **Human prompts and model replies** are both editable; injected context rows and the system prompt offer no edit entry.
+- **Editing a reply replaces it with plain text**: the tool calls and reasoning inside it are removed (the editor warns first), because their results are no longer valid.
+- **Editing a user message re-runs that turn; editing a model reply does not ask the model again** - it only replaces the text.
 - **An edit discards every later turn** (the MVP semantic, matching ChatGPT's edit). Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
 - **Text only.** A message carrying image or file attachments keeps its text and drops them (the editor warns first).
 - **The session must be open in DSH**, otherwise the route answers `409 session-not-active`.
