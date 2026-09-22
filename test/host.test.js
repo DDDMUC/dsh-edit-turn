@@ -15,7 +15,7 @@ import net from 'node:net'
 import { test } from 'node:test'
 
 import { Session } from '@deepseek-ai/dsh-session'
-import { PLUGIN_ID, apply } from '../lib/index.js'
+import { PLUGIN_ID, PLUGIN_VERSION, apply } from '../lib/index.js'
 import { foldSurface } from '../lib/index.js'
 
 const SESSION_ID = 'session-11111111-2222-4333-8444-555555555555'
@@ -188,7 +188,9 @@ test('GET /state reports the editable turns of a live session', async () => {
     assert.equal(res.json.surface.length, 6)
     assert.deepEqual(res.json.turns.map((turn) => turn.seq), [2, 6])
     assert.deepEqual(res.json.turns.map((turn) => turn.text), ['original prompt', 'second prompt'])
-    assert.equal(res.json.version, '0.1.0')
+    // Compared against the module, not a literal: a version bump must not require
+    // editing a test.
+    assert.equal(res.json.version, PLUGIN_VERSION)
     assert.equal(res.json.config.confirm, true)
   } finally {
     await h.close()
