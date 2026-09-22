@@ -25,6 +25,7 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 - **默认零上下文污染** —— 替换事件的载体是一个**空的 `system/message`**。官方格式文档里空的后置 system 节点是「dormant，不投影成任何消息」，所以回退后模型看到的上下文，和「对话真的停在那一点」完全一致，不会多出任何标记文本。
 - **轮边界安全** —— 遮蔽窗口右端固定为日志最后一个 surface 节点，左端固定为目标消息节点，因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
 - **重跑走官方准入路径** —— `ctx.sessionController.prompt()` 是唯一的口径：它会自己 resume 冷会话，并恰好开一个新轮次。
+- **一次点击即执行** —— 保存后不再有二次确认。编辑器本身已经是用户主动打开的动作，面板里也写明了保存会丢弃哪些内容；想恢复两步确认可在 profile 里一行开启（`confirm: true`）。
 - **中英双语 UI**，跟随 DSH 当前语言。
 - **皮肤友好** —— 编辑器面板自带不透明表面（`--dshet-panel`）而不是借用主题的表面色变量。皮肤的本意就是让表面半透明、把插画透出来，而它只会给**自己的**元素补可读背景，插件类名不在其中；借用皮肤变量的面板会变成全透明，文字直接压在插画上。暗色分支走官方属性 `body[data-ds-dark-theme]`（与 `dsh-client-ui-theme` 及多个官方 UI 包一致），并用 `backdrop-filter` 与皮肤融合。
 - **可配置载体**：万一某个 DSH 版本对空 system 节点处理不同，一行配置即可切回短标记载体。
@@ -47,9 +48,8 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 ### 使用
 
 1. 把鼠标移到你想改的那条**用户消息**上，点右侧的编辑图标（铅笔）。
-2. 消息下方展开编辑器，原文已预填。改完点「保存并重跑」。
-3. 出现确认步骤（默认开启）：确认后会从模型上下文中移除这条消息之后的一切，并重新跑这一轮。
-4. 编辑器与该轮之后的转录行一起消失，新提示词与新回复出现在下方。
+2. 消息下方展开编辑器，原文已预填。改完点「保存并重跑」——**一次点击即执行**：这条消息之后的一切从模型上下文中移除，并立刻重新跑这一轮。
+3. 编辑器与该轮之后的转录行一起消失，新提示词与新回复出现在下方。
 
 编辑器里如果提示「这条消息包含图片或文件附件」，说明改写只保留文字，附件会被丢弃。
 
@@ -69,7 +69,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 |---|---|---|
 | `carrier` | `system/message` | 替换事件的载体类型。`system/message` = 空节点，不投影成模型消息；`user/message` = 短标记文本，会作为一条用户消息进入上下文（等价插件在生产中用的是这种形状，作为兜底）。 |
 | `markerText` | 一段说明文字 | `carrier: user/message` 时的载体文本。 |
-| `confirm` | `true` | 客户端保存后是否先要求一次确认。 |
+| `confirm` | `false` | 客户端保存后是否先要求一次确认。默认**关闭**（一次点击即执行：编辑器本身已是用户主动打开的动作，面板里也写明了保存的后果）；设为 `true` 可恢复两步确认。 |
 
 ### 工作原理
 
@@ -182,6 +182,7 @@ This plugin adds it:
 - **Zero context pollution by default.** The replacement carrier is an **empty `system/message`**. The official format documents empty later system nodes as dormant, projecting to no message, so the context after an edit is exactly what it would be had the conversation really stopped there - no marker text is added.
 - **Turn-boundary safe.** The shadow window always ends at the last surface node and always opens at the addressed message, so an assistant message (which carries its own tool_use blocks) and the tool/result it produced are shadowed together. A dangling call/result pair is impossible.
 - **Official re-run.** `ctx.sessionController.prompt()` is the only prompt admission path; it resumes a cold Session itself and opens exactly one new turn.
+- **One click applies** - no second confirmation. The editor is already an explicit action the user opened, and the panel states what saving discards; a profile can restore the two-step flow with `confirm: true`.
 - **Bilingual UI** that follows the current DSH locale.
 - **Skin-friendly** - the editor paints its own opaque surface (`--dshet-panel`) instead of borrowing the theme's surface colours. A skin exists to make surfaces translucent so its artwork shows through, and it only compensates for *its own* elements; a plugin's class names are not on that list, so a panel that borrows those variables can end up fully transparent with text sitting straight on the art. The dark branch uses the official `body[data-ds-dark-theme]` hook (the same one `dsh-client-ui-theme` and several official UI packages use) and blends in with `backdrop-filter`.
 - **Configurable carrier**: if some DSH release treats empty system nodes differently, one config line restores the marker-text carrier.
@@ -204,9 +205,8 @@ Restart the DSH process that serves that profile to pick it up.
 ### Usage
 
 1. Hover the **user message** you want to change and click the pencil action.
-2. An editor opens below it with the original text pre-filled. Click "Save and re-run".
-3. A confirmation step appears (on by default). Confirming removes everything after this message from the model context and re-runs the turn.
-4. The editor disappears together with the discarded rows; the new prompt and its reply appear below.
+2. An editor opens below it with the original text pre-filled. Click "Save and re-run" - **one click applies**: everything after this message leaves the model context and the turn runs again immediately.
+3. The editor disappears together with the discarded rows; the new prompt and its reply appear below.
 
 If the editor warns that the message carries attachments, the rewrite keeps the
 text only and drops them.
@@ -225,7 +225,7 @@ text only and drops them.
 |---|---|---|
 | `carrier` | `system/message` | Event type carrying the replacement. `system/message` is an empty dormant node that projects to no model message. `user/message` is a short marker that does enter the context; an equivalent plugin runs that shape in production, so it is the fallback. |
 | `markerText` | an explanatory line | Carrier text when `carrier: user/message`. |
-| `confirm` | `true` | Whether the client asks for confirmation before applying. |
+| `confirm` | `false` | Whether the client asks for a second confirmation before applying. Off by default - one click applies, because the editor is already an explicit action the user opened and the panel states what saving discards. Set it to `true` to restore the two-step flow. |
 
 ### How it works
 

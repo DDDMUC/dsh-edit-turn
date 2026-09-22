@@ -100,8 +100,8 @@ slot 体系（`dsh-client-ui-slots`）提供三个可用位置：
 ```
 用户点「编辑」
   → 就地 textarea（预填原文，host 的 /state 已带上每个可编辑轮的首条人类提示文本）
-  → 确认
-  → POST /api/dsh-edit-turn/apply { sessionId, seq | turn, text }
+  → 点「保存并重跑」（一次点击即执行；二次确认是可选项 confirm，默认关闭）
+  → POST /dsh-edit-turn/apply { sessionId, seq | turn, text }
        host:
          1. 读事件流（sessionQuery.readSession，回退 live snapshot）
          2. foldSurface() → 当前 surface 节点顺序

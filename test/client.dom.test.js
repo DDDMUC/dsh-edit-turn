@@ -366,7 +366,7 @@ test('a revised draft is what gets posted', async () => {
   assert.equal(bodies[0].text, 'revised text')
 })
 
-test('with confirm disabled one click posts directly', async () => {
+test('one click applies directly on the default configuration', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   const bodies = []
   globalThis.fetch = async (url, init) => {
