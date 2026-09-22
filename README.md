@@ -26,6 +26,7 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 - **轮边界安全** —— 遮蔽窗口右端固定为日志最后一个 surface 节点，左端固定为目标消息节点，因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
 - **重跑走官方准入路径** —— `ctx.sessionController.prompt()` 是唯一的口径：它会自己 resume 冷会话，并恰好开一个新轮次。
 - **中英双语 UI**，跟随 DSH 当前语言。
+- **皮肤友好** —— 编辑器面板自带不透明表面（`--dshet-panel`）而不是借用主题的表面色变量。皮肤的本意就是让表面半透明、把插画透出来，而它只会给**自己的**元素补可读背景，插件类名不在其中；借用皮肤变量的面板会变成全透明，文字直接压在插画上。暗色分支走官方属性 `body[data-ds-dark-theme]`（与 `dsh-client-ui-theme` 及多个官方 UI 包一致），并用 `backdrop-filter` 与皮肤融合。
 - **可配置载体**：万一某个 DSH 版本对空 system 节点处理不同，一行配置即可切回短标记载体。
 - **宿主路由只限本机回环**，并校验 `Host` 与 `Origin`。
 
@@ -110,7 +111,7 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 |---|---|---|
 | 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 46 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受** |
 | 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 63 项通过 |
-| 客户端半部静态检查（注册、i18n 完整性、样式、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
+| 客户端半部静态检查（注册、i18n 完整性、样式、**皮肤可读性**、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
 
@@ -182,6 +183,7 @@ This plugin adds it:
 - **Turn-boundary safe.** The shadow window always ends at the last surface node and always opens at the addressed message, so an assistant message (which carries its own tool_use blocks) and the tool/result it produced are shadowed together. A dangling call/result pair is impossible.
 - **Official re-run.** `ctx.sessionController.prompt()` is the only prompt admission path; it resumes a cold Session itself and opens exactly one new turn.
 - **Bilingual UI** that follows the current DSH locale.
+- **Skin-friendly** - the editor paints its own opaque surface (`--dshet-panel`) instead of borrowing the theme's surface colours. A skin exists to make surfaces translucent so its artwork shows through, and it only compensates for *its own* elements; a plugin's class names are not on that list, so a panel that borrows those variables can end up fully transparent with text sitting straight on the art. The dark branch uses the official `body[data-ds-dark-theme]` hook (the same one `dsh-client-ui-theme` and several official UI packages use) and blends in with `backdrop-filter`.
 - **Configurable carrier**: if some DSH release treats empty system nodes differently, one config line restores the marker-text carrier.
 - **Loopback-only host routes** with `Host` and `Origin` validation.
 
@@ -276,7 +278,7 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 |---|---|---|
 | Official append contract against the real validator, in process | `npm run verify:contract` | 46 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted** |
 | Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 63 tests pass |
-| Browser-half static checks (registration, i18n completeness, styles, three-way version sync, wire contract) | `npm run verify:client` | all pass |
+| Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
 
