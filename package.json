@@ -37,6 +37,7 @@
     "test": "node --test \"test/*.test.js\"",
     "verify:contract": "node tools/verify-surface-contract.mjs",
     "verify:client": "node tools/verify-client-static.mjs",
+    "verify:live": "node tools/verify-live-client.mjs",
     "verify:profile": "bash tools/verify-dsh-plugin.sh",
     "check": "npm run test && npm run verify:contract && npm run verify:client"
   },
