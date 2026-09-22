@@ -33,6 +33,7 @@ const MARKERS = [
   { needle: 'ERROR_KEYS', what: 'the dictionary-validated error lookup' },
   { needle: "typeof view.notice !== 'string'", what: 'the guarded notice render' },
   { needle: 'editorMarker', what: 'the editor re-render marker that tracks every field' },
+  { needle: 'syncEditableSet', what: 'the transcript-change refresh of the editable set' },
 ]
 
 function arg(name) {
