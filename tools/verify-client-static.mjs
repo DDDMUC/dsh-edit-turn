@@ -227,6 +227,27 @@ const hiddenSelector = '[data-dshet-hidden="1"]'
 check('the row-hiding selector is present', css.includes(hiddenSelector))
 check('the code sets the matching data attribute', clientSource.includes('dshetHidden'))
 
+// A skin is free to make the theme's surface colours translucent - that is what
+// it is for - and it only compensates for its own elements. A plugin panel that
+// borrows those variables can therefore end up painted with a fully transparent
+// colour and become unreadable over the artwork, which is exactly what happened.
+// These checks pin the self-contained surface.
+console.log('\n  — readable under any skin —')
+check('the panel defines its own surface variables', css.includes('--dshet-panel:') && css.includes('--dshet-field:'))
+check('a dark-theme branch exists', css.includes('body[data-ds-dark-theme]'))
+const borrowedSurfaces = [...css.matchAll(/background:\s*var\(--dsw-alias-bg-[a-z0-9-]+/g)].map((match) => match[0])
+check('no surface is borrowed from a skin-mutable theme variable', borrowedSurfaces.length === 0, borrowedSurfaces.join(', '))
+check('the textarea is never left transparent', !/textarea\{[^}]*background:[^;}]*transparent/.test(css))
+check('the panel blurs what is behind it', css.includes('backdrop-filter'))
+const definedVars = new Set([...css.matchAll(/(--dshet-[a-z0-9-]+)\s*:/g)].map((match) => match[1]))
+const usedVars = new Set([...css.matchAll(/var\((--dshet-[a-z0-9-]+)/g)].map((match) => match[1]))
+const undefinedVars = [...usedVars].filter((name) => !definedVars.has(name))
+check('every --dshet-* variable used is defined', undefinedVars.length === 0, undefinedVars.join(', '))
+const darkBlock = /body\[data-ds-dark-theme\]\{([^}]*)\}/.exec(css)?.[1] ?? ''
+const mustFlip = ['--dshet-panel', '--dshet-field', '--dshet-ink', '--dshet-ink-dim', '--dshet-line', '--dshet-shadow']
+const missingInDark = mustFlip.filter((name) => !darkBlock.includes(`${name}:`))
+check('the dark branch overrides every surface variable that must flip', missingInDark.length === 0, missingInDark.join(', '))
+
 // --- 4. version sync ----------------------------------------------------------
 
 console.log('\n4. version is identical in all three places')

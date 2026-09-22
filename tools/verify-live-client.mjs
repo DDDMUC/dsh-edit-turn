@@ -34,6 +34,7 @@ const MARKERS = [
   { needle: "typeof view.notice !== 'string'", what: 'the guarded notice render' },
   { needle: 'editorMarker', what: 'the editor re-render marker that tracks every field' },
   { needle: 'syncEditableSet', what: 'the transcript-change refresh of the editable set' },
+  { needle: '--dshet-panel', what: 'the self-contained panel surface that survives a skin' },
 ]
 
 function arg(name) {
