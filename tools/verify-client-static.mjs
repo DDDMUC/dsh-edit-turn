@@ -123,7 +123,37 @@ for (const method of ['getSnapshot', 'subscribe', 'load', 'open', 'close', 'setD
 const snapshot = injectedProps.controller.getSnapshot()
 check('the initial snapshot is shaped as the component reads it', snapshot.hidden instanceof Map && snapshot.editable instanceof Map)
 check('the initial revision is zero', snapshot.revision === 0)
-check('the initial state is empty', snapshot.editing === null && snapshot.editing === snapshot.editing)
+check('the initial state is empty', snapshot.editing === null && snapshot.notice === null)
+// The overlay reads named fields off this snapshot and branches on them, so a
+// field that is missing from the initial value reads as `undefined` and slips
+// past `=== null` guards. Pin the exact key set: adding a field requires
+// updating this list, removing one breaks the build here rather than in the UI.
+const EXPECTED_SNAPSHOT_KEYS = [
+  'confirmStep',
+  'confirming',
+  'draft',
+  'editable',
+  'editing',
+  'failure',
+  'hidden',
+  'loadError',
+  'loaded',
+  'notice',
+  'pending',
+  'revision',
+  'surfaceReady',
+]
+const actualSnapshotKeys = Object.keys(snapshot).sort()
+check(
+  'the initial snapshot exposes exactly the documented fields',
+  JSON.stringify(actualSnapshotKeys) === JSON.stringify(EXPECTED_SNAPSHOT_KEYS),
+  `got ${actualSnapshotKeys.join(',')}`,
+)
+// Every `t(\`prefix.${value}\`)` lookup must be safe for a missing value,
+// otherwise the UI renders the raw key (e.g. "error.undefined").
+const dynamicLookups = [...clientSource.matchAll(/\bt\(`([^`$]*)\$\{([^}]*)\}`\)/g)]
+check('dynamic localised lookups are guarded, not raw', dynamicLookups.length === 0,
+  dynamicLookups.map((match) => `t(\`${match[1]}${'${'}${match[2]}}\`)`).join(', '))
 check('cleanup effects are registered', effects.length >= 2, `got ${effects.length}`)
 
 // --- 2. localisation completeness --------------------------------------------
