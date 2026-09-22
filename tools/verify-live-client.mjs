@@ -102,6 +102,20 @@ for (const marker of MARKERS) {
 }
 check('no stale naive error lookup survives in this plugin slice', !slice.includes('t(`error.${'))
 
+// The browser half does not only depend on its own code: it reads node shapes
+// that the host UI produces. If a DSH update renames those, actions silently
+// stop appearing on model replies - nothing throws, the feature just vanishes.
+// These needles are the exact shapes the client's targetFor() relies on, checked
+// against the whole served group because they come from other plugins' code.
+const hostShapes = [
+  { needle: '"assistant-step"', what: 'the node kind that assistant rows use' },
+  { needle: 'data.finalNode', what: 'where a reply seq lives on that node' },
+  { needle: 'kind: "user"', what: 'the node kind that prompt rows use' },
+]
+for (const shape of hostShapes) {
+  check(`the served group still produces ${shape.what}`, code.includes(shape.needle))
+}
+
 console.log(failures === 0
   ? '\n全部通过：运行中的实例正在下发本插件的当前代码（浏览器刷新即可生效）。'
   : `\n${failures} 项失败。`)
