@@ -296,7 +296,7 @@ test('clicking the action opens a prefilled in-place editor', async () => {
   assert.equal(area.disabled, false)
 })
 
-test('save advances to the confirmation step instead of doing nothing', async () => {
+test('the opt-in confirmation step advances instead of doing nothing', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
@@ -307,7 +307,7 @@ test('save advances to the confirmation step instead of doing nothing', async ()
   render(harness, controller, snapshot)
 
   // This is the regression: the editor must be rebuilt for the new state.
-  assert.deepEqual(editorText(row).buttons, ['取消', '确认回退'])
+  assert.deepEqual(editorText(row).buttons, ['取消', '确认执行'])
   const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(area.disabled, true, 'the draft is frozen during confirmation')
 })
@@ -505,6 +505,101 @@ test('an unchanged row count does not re-ask the host', async () => {
   render(harness, controller, snapshot)
   render(harness, controller, snapshot)
   assert.equal(asked.length, 0, 'no redundant /state traffic while nothing changed')
+})
+
+test('a model reply gets its own edit action and replaces in one click', async () => {
+  const harness = await loadBundle()
+  const promptRow = mountRow(harness.document, 'row-p')
+  const replyRow = mountRow(harness.document, 'row-r')
+  const controller = harness.controller
+  const snapshot = {
+    nodes: new Map([
+      ['row-p', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
+      // An assistant step spans several surface nodes; the reply is its final node.
+      ['row-r', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }],
+    ]),
+  }
+  globalThis.fetch = async (url) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [],
+      turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'the prompt', attachments: 0 }],
+      replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }],
+      config: { confirm: false },
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(byClass(replyRow, 'dshet-action').length, 1, 'the reply row offers an edit action')
+  assert.equal(byClass(replyRow, 'dshet-action')[0].getAttribute('aria-label'), '编辑这条回答')
+  assert.equal(byClass(promptRow, 'dshet-action').length, 1, 'the prompt row keeps its own action')
+
+  byClass(replyRow, 'dshet-action')[0].fire('click')
+  render(harness, controller, snapshot)
+  const box = replyRow.querySelector('.dshet-editor')
+  assert.ok(box, 'the editor opens on the reply row')
+  assert.deepEqual(byClass(box, 'dshet-editor-title').map((node) => node.textContent), ['编辑这条回答'])
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, 'the original answer', 'the reply text is pre-filled')
+  assert.match(byClass(box, 'dshet-note')[0].textContent, /替换为你写的内容/)
+  assert.deepEqual(editorText(replyRow).buttons, ['取消', '保存替换'])
+
+  const bodies = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/apply')) bodies.push(JSON.parse(init.body))
+    return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'reply', applied: true, appendedSeq: 9, shadowed: [5] }) }
+  }
+  byClass(box, 'dshet-btn-primary')[0].fire('click')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+
+  assert.equal(bodies.length, 1, 'one click applied it')
+  assert.equal(bodies[0].seq, 5)
+  assert.equal(bodies[0].text, 'the original answer')
+  assert.equal(replyRow.querySelector('.dshet-editor'), null, 'the editor closes on success')
+  assert.equal(controller.getSnapshot().pending, false)
+})
+
+test('a reply that carries tool calls warns before being replaced', async () => {
+  const harness = await loadBundle()
+  const replyRow = mountRow(harness.document, 'row-r')
+  const controller = harness.controller
+  const snapshot = { nodes: new Map([['row-r', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [],
+      turns: [],
+      replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: '我来查一下', attachments: 1 }],
+      config: { confirm: false },
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(replyRow, 'dshet-action')[0].fire('click')
+  render(harness, controller, snapshot)
+  const box = replyRow.querySelector('.dshet-editor')
+  assert.match(byClass(box, 'dshet-warn')[0].textContent, /工具调用或思考过程/)
+})
+
+test('a row the host does not report as editable gets no action', async () => {
+  const harness = await loadBundle()
+  const strayRow = mountRow(harness.document, 'row-stray')
+  const controller = harness.controller
+  const snapshot = { nodes: new Map([['row-stray', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, hidden: [], turns: [], replies: [], config: { confirm: false } }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(byClass(strayRow, 'dshet-action').length, 0, 'no action without an editable entry')
 })
 
 test('cancel closes the editor without posting', async () => {

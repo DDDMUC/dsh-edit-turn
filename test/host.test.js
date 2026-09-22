@@ -188,6 +188,9 @@ test('GET /state reports the editable turns of a live session', async () => {
     assert.equal(res.json.surface.length, 6)
     assert.deepEqual(res.json.turns.map((turn) => turn.seq), [2, 6])
     assert.deepEqual(res.json.turns.map((turn) => turn.text), ['original prompt', 'second prompt'])
+    // The model's answers are editable too, as a separate list.
+    assert.deepEqual(res.json.replies.map((reply) => reply.seq), [3, 8])
+    assert.deepEqual(res.json.replies.map((reply) => reply.text), ['first answer', 'second answer'])
     // Compared against the module, not a literal: a version bump must not require
     // editing a test.
     assert.equal(res.json.version, PLUGIN_VERSION)
@@ -217,6 +220,7 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised prompt' })
     assert.equal(res.status, 200, res.payload)
     assert.equal(res.json.ok, true)
+    assert.equal(res.json.kind, 'prompt')
     assert.equal(res.json.promptAccepted, true)
     assert.equal(res.json.flushed, true)
     assert.deepEqual(res.json.shadowed, [2, 3, 6, 7, 8])
@@ -332,10 +336,109 @@ test('a second edit of the same turn is refused as already rolled back', async (
   }
 })
 
-test('an assistant row cannot be edited', async () => {
+test('a tool result row is still refused', async () => {
   const h = await harness()
   try {
-    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'x' })
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 7, text: 'x' })
+    assert.equal(res.status, 400)
+    assert.equal(res.json.code, 'not-editable')
+  } finally {
+    await h.close()
+  }
+})
+
+// --- editing what the model said -------------------------------------------
+
+test('editing a reply replaces it without re-running the model', async () => {
+  const h = await harness()
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'corrected answer' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.kind, 'reply')
+    assert.equal(res.json.applied, true)
+    assert.equal(typeof res.json.appendedSeq, 'number')
+    // The window still runs to the tail: a corrected answer invalidates
+    // everything that was built on top of it.
+    assert.deepEqual(res.json.shadowed, [3, 6, 7, 8])
+
+    // Two appends: the invisible rollback carrier, then the corrected reply.
+    assert.equal(h.session.seq, before + 2)
+    const derived = h.session.deriveMessages()
+    assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant'])
+    assert.equal(derived[2].content[0].text, 'corrected answer')
+    assert.equal(derived[1].content[0].text, 'original prompt')
+
+    // Crucially: the model was NOT asked again.
+    assert.deepEqual(h.prompts, [])
+  } finally {
+    await h.close()
+  }
+})
+
+test('the appended correction is a normal reply that says who wrote it', async () => {
+  const h = await harness()
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'corrected answer' })
+    const appended = h.session.snapshotEvents().find((event) => event.seq === res.json.appendedSeq)
+    assert.equal(appended.type, 'assistant/message')
+    assert.equal(appended.surfaceOp, 'append')
+    assert.equal(appended.data.turn, 1)
+    assert.equal(appended.data.step, 1)
+    assert.equal(appended.data.message.role, 'assistant')
+    // `model` so it renders as an ordinary reply, plus an honest marker.
+    assert.equal(appended.data.message.source.kind, 'model')
+    assert.equal(appended.data.message.source.editedBy, PLUGIN_ID)
+    assert.equal(appended.data.message.source.provider, 'p')
+    assert.equal(appended.data.message.source.model, 'm')
+    assert.deepEqual(appended.data.message.content, [{ type: 'text', text: 'corrected answer' }])
+  } finally {
+    await h.close()
+  }
+})
+
+test('editing the last reply keeps the earlier conversation intact', async () => {
+  const h = await harness()
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 8, text: 'rewritten second answer' })
+    assert.equal(res.json.kind, 'reply')
+    assert.deepEqual(res.json.shadowed, [8])
+    const derived = h.session.deriveMessages()
+    // Turn 2 delivered a tool result, which derives as a user-role message too.
+    assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant', 'user', 'user', 'assistant'])
+    assert.equal(derived[2].content[0].text, 'first answer')
+    assert.equal(derived[5].content[0].text, 'rewritten second answer')
+  } finally {
+    await h.close()
+  }
+})
+
+test('a corrected reply can be corrected again', async () => {
+  const h = await harness()
+  try {
+    const first = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'version one' })
+    const second = await applyEdit(h.port, { sessionId: SESSION_ID, seq: first.json.appendedSeq, text: 'version two' })
+    assert.equal(second.status, 200, second.payload)
+    assert.equal(second.json.kind, 'reply')
+    const derived = h.session.deriveMessages()
+    assert.equal(derived.at(-1).content[0].text, 'version two')
+    assert.equal(derived.some((message) => (message.content || []).some((block) => block.type === 'text' && block.text === 'version one')), false)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a reply with no text is not editable', async () => {
+  const session = Session.create(SESSION_ID)
+  buildTwoTurnLog(session)
+  session.append(
+    'assistant/message',
+    { turn: 2, step: 2, message: { id: 'a3', role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c9', toolName: 'x', input: {} }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] },
+    { surfaceOp: 'append' },
+  )
+  const h = await harness({ session })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 11, text: 'x' })
     assert.equal(res.status, 400)
     assert.equal(res.json.code, 'not-editable')
   } finally {
@@ -544,9 +647,12 @@ test('the tool lists the editable turns and changes nothing', async () => {
     const tool = h.toolCalls[0]
     const text = await tool.execute({ sessionId: SESSION_ID, limit: 10 }, {})
     assert.equal(typeof text, 'string')
-    assert.match(text, /2 editable turn\(s\), idle/)
+    assert.match(text, /2 editable turn\(s\), 2 editable reply\/replies, idle/)
     assert.match(text, /turn 1 \(seq 2/)
     assert.match(text, /original prompt/)
+    assert.match(text, /reply \(seq 3/)
+    assert.match(text, /first answer/)
+    assert.match(text, /editing a turn re-runs it; editing a reply replaces its text/)
     assert.equal(h.session.seq, before)
   } finally {
     await h.close()
