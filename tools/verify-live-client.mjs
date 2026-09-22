@@ -32,6 +32,7 @@ const MARKERS = [
   { needle: 'dshet-notice', what: 'the notice stylesheet rule' },
   { needle: 'ERROR_KEYS', what: 'the dictionary-validated error lookup' },
   { needle: "typeof view.notice !== 'string'", what: 'the guarded notice render' },
+  { needle: 'editorMarker', what: 'the editor re-render marker that tracks every field' },
 ]
 
 function arg(name) {

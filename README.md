@@ -109,7 +109,7 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 | 验证 | 命令 | 结果 |
 |---|---|---|
 | 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 35 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息 |
-| 纯逻辑与宿主集成（真 HTTP + 真校验器 + 桩服务） | `npm test` | 49 项通过 |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 61 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
@@ -122,7 +122,7 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**尚未验证的一环（诚实说明）**：客户端的**交互行为**——点编辑按钮、就地编辑器渲染、确认后被回退的行隐藏、新回复流入——**还没有被自动化验证**，需要真实浏览器交互（本机 React 与 Playwright 均不可用）。但比 v0.1.0 首次交付时进了一步：插件的客户端半部已确认**出现在运行实例的客户端模块图里**、且**下发的字节就是当前源码**（`verify:live`），不再只是「按等价插件的模式实现」。剩下的是纯点击路径，请人工过一遍。
+**尚未验证的一环（诚实说明）**：与**真实 DSH 界面**的耦合——真实 DOM 结构、真实 CSS 布局、以及 React 调和器在重渲染行时是否会移除注入的节点——只能由真实浏览器验证（本机 React 与 Playwright 均不可用）。但纯点击路径本身已被自动覆盖：`test/client.dom.test.js` 用一个可读的 DOM 实现把真实的 `OverlayEntry` 跑起来，断言「点动作 → 编辑器出现并预填 → 点保存 → 进入确认步骤 → 点确认 → 发出正确请求 → 编辑器关闭」以及各失败分支的文案。这个测试是有意义的：把重绘标记改回旧写法时，其中 6 项会失败。
 
 **开发前置**：`npm test` 与两个 `verify:*` 需要 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-tools` 可解析。本插件自身不依赖它们（宿主半部只 import `schemastery` 与 `dsh-tools`），测试需要一个装了 DSH 的 `node_modules`：
 
@@ -275,7 +275,7 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 | Check | Command | Result |
 |---|---|---|
 | Official append contract against the real validator, in process | `npm run verify:contract` | 35 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message |
-| Pure logic and host integration (real HTTP + real validator + stubbed services) | `npm test` | 49 tests pass |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 61 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
@@ -295,15 +295,16 @@ touches the DSH you are using:
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**The one link that is NOT verified, stated plainly:** the client's **interactive**
-behaviour - clicking the edit action, the in-place editor rendering, the rolled-back
-rows hiding, the new reply streaming in - is **not** covered by an automated check;
-it needs real browser interaction (React and Playwright are both unavailable on this
-machine). This is still stronger than the first v0.1.0 delivery, though: the browser
-half is now confirmed to be **present in the running instance's client module graph**
-and the **bytes being served are the current source** (`verify:live`), rather than
-"implemented to the pattern of an equivalent plugin". Only the click path is left -
-walk it once by hand.
+**The one link that is NOT verified, stated plainly:** the coupling to the **real
+DSH interface** - the real DOM structure, real CSS layout, and whether React's
+reconciler drops an injected node when it re-renders a row - needs a real browser
+(React and Playwright are both unavailable on this machine). The click path
+itself is now covered: `test/client.dom.test.js` runs the real `OverlayEntry`
+against a readable DOM implementation and asserts "click the action -> the editor
+appears pre-filled -> click save -> the confirmation step appears -> click
+confirm -> the right request is posted -> the editor closes", plus every failure
+branch's message. That test is meaningful: reverting the re-render marker to its
+old form makes 6 of its cases fail.
 
 **Development prerequisite:** `npm test` and both `verify:*` commands need
 `@deepseek-ai/dsh-session` and `@deepseek-ai/dsh-tools` to resolve. The plugin
