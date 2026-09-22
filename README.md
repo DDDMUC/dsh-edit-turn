@@ -108,8 +108,8 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
-| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 35 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息 |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 61 项通过 |
+| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 46 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受** |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 63 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
@@ -274,8 +274,8 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 
 | Check | Command | Result |
 |---|---|---|
-| Official append contract against the real validator, in process | `npm run verify:contract` | 35 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 61 tests pass |
+| Official append contract against the real validator, in process | `npm run verify:contract` | 46 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted** |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 63 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
