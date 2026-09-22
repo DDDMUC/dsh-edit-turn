@@ -191,7 +191,9 @@ test('GET /state reports the editable turns of a live session', async () => {
     // Compared against the module, not a literal: a version bump must not require
     // editing a test.
     assert.equal(res.json.version, PLUGIN_VERSION)
-    assert.equal(res.json.config.confirm, true)
+    // Saving applies in one click by default; the second confirmation step is
+    // opt-in. The client mirrors whatever this endpoint reports.
+    assert.equal(res.json.config.confirm, false)
   } finally {
     await h.close()
   }
@@ -296,6 +298,21 @@ test('the fallback user/message carrier is used when configured', async () => {
     assert.equal(h.session.deriveMessages().length, 2)
   } finally {
     await h.close()
+  }
+})
+
+test('the second confirmation step is opt-in, and honoured when asked for', async () => {
+  const off = await harness()
+  try {
+    assert.equal((await getState(off.port)).json.config.confirm, false, 'off by default')
+  } finally {
+    await off.close()
+  }
+  const on = await harness({ config: { confirm: true } })
+  try {
+    assert.equal((await getState(on.port)).json.config.confirm, true, 'on when configured')
+  } finally {
+    await on.close()
   }
 })
 
