@@ -148,14 +148,26 @@ expect() {
   local got
   got="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$@" 2>/dev/null)"
   if [ "$got" = "$want" ]; then
-    ok "$label → $got"
+    ok "${label} -> ${got}"
   else
-    fail "$label：期望 $want，实际 $got"
+    fail "${label}: expected ${want}, got ${got:-(no response)}"
   fi
 }
 
 BASE="http://127.0.0.1:$PORT"
 UNKNOWN="session-00000000-0000-4000-8000-00000000ffff"
+
+# The boot probe above only proves the HTTP server answers; the plugin's own
+# routes can land a moment later. Poll them first so the checks below never
+# report a readiness race as a behavioural failure.
+ROUTE_READY=0
+for _ in $(seq 1 20); do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 3 "$BASE$ROUTE/state?sessionId=$UNKNOWN" 2>/dev/null)"
+  if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then ROUTE_READY=1; break; fi
+  sleep 1
+done
+[ "$ROUTE_READY" = "1" ] || fail "插件路由在 20 秒内没有就绪"
+ok "插件路由已就绪"
 
 # The sample session id must be well formed or the route answers 400 first.
 expect "GET $ROUTE/state 缺 sessionId"        400 "$BASE$ROUTE/state"
