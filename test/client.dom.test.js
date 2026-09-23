@@ -207,11 +207,24 @@ async function loadBundle() {
   }
   exports.apply(ctx)
 
-  const { definition, component } = registrations[0]
+  // Picked by name, not by index: this plugin registers more than one entry, and
+  // the order they were added in is not part of any contract.
+  const overlay = registrations.find((entry) => entry.definition.name === 'conversation.input.overlay')
+  if (overlay === undefined) throw new Error('the overlay entry was never registered')
+  const { definition, component } = overlay
   const props = definition.inject(SESSION_ID)
   const dict = dictionaries[0].dict.zh
   const t = (key) => (key in dict ? dict[key] : key)
-  return { component, controller: props.controller, t, document, cleanups, rows, fresh: () => cleanups.splice(0).forEach((fn) => fn()) }
+  return {
+    component,
+    controller: props.controller,
+    t,
+    document,
+    cleanups,
+    rows,
+    fresh: () => cleanups.splice(0).forEach((fn) => fn()),
+    registrations,
+  }
 }
 
 /** One user row whose only editable target is seq 2. */
@@ -507,66 +520,85 @@ test('an unchanged row count does not re-ask the host', async () => {
   assert.equal(asked.length, 0, 'no redundant /state traffic while nothing changed')
 })
 
-test('a model reply gets its own edit action and replaces in one click', async () => {
+// --- the reply entry, which lives in the official action strip ---------------
+
+test('the reply edit entry is registered in the assistant-actions strip', async () => {
   const harness = await loadBundle()
-  const promptRow = mountRow(harness.document, 'row-p')
-  const replyRow = mountRow(harness.document, 'row-r')
+  const entry = harness.registrations.find((item) => item.definition.name === 'conversation.chat.assistant-actions')
+  assert.ok(entry, 'an assistant-actions entry is registered')
+  assert.equal(entry.definition.id, 'edit-turn-reply')
+  assert.equal(typeof entry.definition.order, 'number', 'order decides where it sits among the host buttons')
+  // What the inject returns is what the component receives, plus the messageId
+  // the host adds. It has to give the component its controller.
+  const props = entry.definition.inject(SESSION_ID)
+  assert.equal(typeof props.controller, 'object')
+  assert.equal(typeof props.hooks.editTurn, 'object')
+})
+
+test('the reply entry draws a pencil only for an editable reply', async () => {
+  const harness = await loadBundle()
   const controller = harness.controller
-  const snapshot = {
-    nodes: new Map([
-      ['row-p', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
-      // An assistant step spans several surface nodes; the reply is its final node.
-      ['row-r', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }],
-    ]),
-  }
-  globalThis.fetch = async (url) => ({
+  const entry = harness.registrations.find((item) => item.definition.name === 'conversation.chat.assistant-actions')
+  const props = entry.definition.inject(SESSION_ID)
+  globalThis.fetch = async () => ({
     ok: true,
     status: 200,
     json: async () => ({
       ok: true,
       hidden: [],
-      turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'the prompt', attachments: 0 }],
+      turns: [],
       replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }],
       config: { confirm: false },
     }),
   })
   await controller.load(true)
+  const useEditTurn = (select) => select(controller.getSnapshot())
+
+  const unknown = entry.component({ ...props, messageId: 'm-other', useEditTurn, t: harness.t })
+  assert.equal(unknown, null, 'a reply the host did not report renders nothing')
+
+  const button = entry.component({ ...props, messageId: 'm-a1', useEditTurn, t: harness.t })
+  assert.equal(button.type, 'button')
+  assert.match(button.props.className, /dshet-action/)
+  assert.equal(button.props['aria-label'], '编辑这条回答')
+
+  button.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const editing = controller.getSnapshot().editing
+  assert.equal(editing.seq, 5, 'it opens the reply the host named')
+  assert.equal(editing.mode, 'reply')
+})
+
+test('the editor still anchors under the reply, not under its action strip', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document, 'row-r')
+  const snapshot = { nodes: new Map([['row-r', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [],
+      turns: [],
+      replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }],
+      config: { confirm: false },
+    }),
+  })
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 })
   render(harness, controller, snapshot)
 
-  assert.equal(byClass(replyRow, 'dshet-action').length, 1, 'the reply row offers an edit action')
-  assert.equal(byClass(replyRow, 'dshet-action')[0].getAttribute('aria-label'), '编辑这条回答')
-  assert.equal(byClass(promptRow, 'dshet-action').length, 1, 'the prompt row keeps its own action')
-
-  byClass(replyRow, 'dshet-action')[0].fire('click')
-  render(harness, controller, snapshot)
-  const box = replyRow.querySelector('.dshet-editor')
-  assert.ok(box, 'the editor opens on the reply row')
+  const box = row.querySelector('.dshet-editor')
+  assert.ok(box, 'the editor appears in the row holding the reply text')
   assert.deepEqual(byClass(box, 'dshet-editor-title').map((node) => node.textContent), ['编辑这条回答'])
-  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
-  assert.equal(area.value, 'the original answer', 'the reply text is pre-filled')
-  assert.match(byClass(box, 'dshet-note')[0].textContent, /替换为你写的内容/)
-  assert.deepEqual(editorText(replyRow).buttons, ['取消', '保存替换'])
-
-  const bodies = []
-  globalThis.fetch = async (url, init) => {
-    if (String(url).includes('/apply')) bodies.push(JSON.parse(init.body))
-    return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'reply', applied: true, appendedSeq: 9, shadowed: [5] }) }
-  }
-  byClass(box, 'dshet-btn-primary')[0].fire('click')
-  await new Promise((resolve) => setTimeout(resolve, 0))
-  render(harness, controller, snapshot)
-
-  assert.equal(bodies.length, 1, 'one click applied it')
-  assert.equal(bodies[0].seq, 5)
-  assert.equal(bodies[0].text, 'the original answer')
-  assert.equal(replyRow.querySelector('.dshet-editor'), null, 'the editor closes on success')
-  assert.equal(controller.getSnapshot().pending, false)
+  assert.equal(walk(box).find((node) => node.tagName === 'TEXTAREA').value, 'the original answer')
+  assert.deepEqual(editorText(row).buttons, ['取消', '保存替换'])
 })
 
 test('a reply that carries tool calls warns before being replaced', async () => {
   const harness = await loadBundle()
-  const replyRow = mountRow(harness.document, 'row-r')
   const controller = harness.controller
+  const row = mountRow(harness.document, 'row-r')
   const snapshot = { nodes: new Map([['row-r', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
   globalThis.fetch = async () => ({
     ok: true,
@@ -580,11 +612,9 @@ test('a reply that carries tool calls warns before being replaced', async () => 
     }),
   })
   await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: '我来查一下', attachments: 1 })
   render(harness, controller, snapshot)
-  byClass(replyRow, 'dshet-action')[0].fire('click')
-  render(harness, controller, snapshot)
-  const box = replyRow.querySelector('.dshet-editor')
-  assert.match(byClass(box, 'dshet-warn')[0].textContent, /工具调用或思考过程/)
+  assert.match(byClass(row.querySelector('.dshet-editor'), 'dshet-warn')[0].textContent, /工具调用或思考过程/)
 })
 
 test('a row the host does not report as editable gets no action', async () => {
