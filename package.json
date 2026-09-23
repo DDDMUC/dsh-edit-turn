@@ -39,6 +39,7 @@
     "verify:client": "node tools/verify-client-static.mjs",
     "verify:live": "node tools/verify-live-client.mjs",
     "verify:profile": "bash tools/verify-dsh-plugin.sh",
+    "probe:loaded": "node tools/probe-loaded.mjs",
     "check": "npm run test && npm run verify:contract && npm run verify:client"
   },
   "dependencies": {
