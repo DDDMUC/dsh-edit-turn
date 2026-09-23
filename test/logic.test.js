@@ -364,7 +364,7 @@ test('the default carrier is an empty dormant system message', () => {
   const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'system/message' })
   assert.equal(carrier.type, 'system/message')
   assert.deepEqual(carrier.data.message.content, [])
-  assert.equal(carrier.data.message.source.plugin, PLUGIN_ID)
+  assert.equal(carrier.data.message.source.kind, `plugin:${PLUGIN_ID}`)
   assert.equal(carrier.data.turn, 2)
 })
 
@@ -374,7 +374,7 @@ test('the fallback carrier is a non-empty plugin-sourced user message', () => {
   const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'user/message', markerText: 'MARK' })
   assert.equal(carrier.type, 'user/message')
   assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
-  assert.deepEqual(carrier.data.source, { kind: 'plugin', plugin: PLUGIN_ID })
+  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}` })
   assert.equal(carrier.data.role, 'user')
 })
 
