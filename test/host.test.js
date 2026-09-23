@@ -255,7 +255,8 @@ test('the carrier lands with complete shadow coverage and a plugin source', asyn
     assert.equal(carrier.type, 'system/message')
     assert.deepEqual(carrier.sourceEventSeqs, [2, 3, 6, 7, 8])
     assert.deepEqual(carrier.surfaceOp, { op: 'replace', startSeq: 2, endSeq: 8 })
-    assert.deepEqual(carrier.data.message.source, { kind: 'plugin', plugin: PLUGIN_ID })
+    // v4 format: producer-owned kind, no plugin wrapper
+  assert.deepEqual(carrier.data.message.source, { kind: `plugin:${PLUGIN_ID}` })
     assert.deepEqual(carrier.data.message.content, [])
   } finally {
     await h.close()
