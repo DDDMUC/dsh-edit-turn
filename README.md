@@ -114,11 +114,13 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
-| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 46 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 63 项通过 |
-| 客户端半部静态检查（注册、i18n 完整性、样式、**皮肤可读性**、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
-| 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过 |
+| 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
+| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 61 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受** |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 83 项通过 |
+| 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
+| 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
+| **真实浏览器端到端**（agent-browser 驱动 Chrome 打开运行实例） | 手动 | 已完成：模型回答行出现「编辑这条回答」、点开编辑器预填真实回复原文、取消后网络层 0 个 apply 请求。截图见 `docs/reply-editor-in-browser.png` |
 
 `verify:live` 针对**正在运行的实例**：用 DSH 启动时打印的 token 换取鉴权 cookie，读启动页里的客户端模块组，把含本插件的那一组下载下来，断言插件自己的标记确实在其中。它证明的是「浏览器刷新后会拿到当前代码」，而不是「源码看起来没问题」——前端改动后这是唯一能确认已生效的自动手段。
 
@@ -293,11 +295,13 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 
 | Check | Command | Result |
 |---|---|---|
-| Official append contract against the real validator, in process | `npm run verify:contract` | 46 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted** |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 63 tests pass |
+| Is the plugin actually mounted in a running instance? (read-only route-guard probe, no token needed) | `npm run probe:loaded [port]` | pass: `/state` answers 400 and `/apply` answers 405 - status codes only this plugin produces |
+| Official append contract against the real validator, in process | `npm run verify:contract` | 61 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted** |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 83 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
-| Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass |
+| Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass, **including anchors on the host's node shapes** |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
+| **Real browser, end to end** (agent-browser drives Chrome at a running instance) | manual | done: an edit action appears on model reply rows, the editor opens pre-filled with the real reply, and cancelling leaves zero `apply` requests. See `docs/reply-editor-in-browser.png` |
 
 `verify:live` targets an instance that is **already running**: it exchanges the
 token DSH printed on boot for an auth cookie, reads the client module groups out
