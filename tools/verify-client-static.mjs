@@ -106,13 +106,39 @@ moduleExports.apply(clientCtx)
 check('registers one locale dictionary', dictionaries.length === 1)
 check('the dictionary carries zh and en', Boolean(dictionaries[0] && dictionaries[0].dict.zh && dictionaries[0].dict.en))
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
-check('registers exactly one overlay entry', registrations.length === 1)
-const registration = registrations[0] || { definition: {} }
-check('the slot name matches the injection point', registration.definition.name === 'conversation.input.overlay')
-check('the entry has a stable id', registration.definition.id === 'edit-turn')
-check('the entry declares an order', typeof registration.definition.order === 'number')
-check('the entry is localised', registration.definition.locale === 'dsh-edit-turn')
-check('the entry renders a component', typeof registration.component === 'function')
+check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
+check('injects the official assistant-actions slot', injections.includes('conversation.chat.assistant-actions'), injections.join(','))
+
+// Two entries, two injection points. Picked by name so adding a third entry does
+// not silently re-point these checks at the wrong one.
+const byName = (name) => registrations.find((item) => item.definition.name === name) || { definition: {} }
+check('registers one entry per injection point', registrations.length === 2, `got ${registrations.length}`)
+const registration = byName('conversation.input.overlay')
+check('the overlay slot name matches its injection point', registration.definition.name === 'conversation.input.overlay')
+check('the overlay entry has a stable id', registration.definition.id === 'edit-turn')
+check('the overlay entry declares an order', typeof registration.definition.order === 'number')
+check('the overlay entry is localised', registration.definition.locale === 'dsh-edit-turn')
+check('the overlay entry renders a component', typeof registration.component === 'function')
+
+// The reply entry belongs to the host's own assistant-actions strip, which is
+// where every other action for a reply lives. Registered anywhere else puts the
+// pencil in a different place from the platform's own buttons.
+const replyEntry = byName('conversation.chat.assistant-actions')
+check('the reply entry targets the official strip', replyEntry.definition.name === 'conversation.chat.assistant-actions')
+check('the reply entry has a stable id', replyEntry.definition.id === 'edit-turn-reply')
+check('the reply entry declares an order', typeof replyEntry.definition.order === 'number', 'order decides where it sits among the host buttons')
+check('the reply entry is localised', replyEntry.definition.locale === 'dsh-edit-turn')
+check('the reply entry renders a component', typeof replyEntry.component === 'function')
+check(
+  'the reply entry sits ahead of the host feedback entry',
+  typeof replyEntry.definition.order !== 'number' || replyEntry.definition.order < 10,
+  `order ${replyEntry.definition.order} vs the host feedback entry's 10`,
+)
+const replyInjected = replyEntry.definition.inject
+  ? replyEntry.definition.inject('session-11111111-2222-4333-8444-555555555555')
+  : {}
+check('the reply entry receives the controller', typeof replyInjected.controller === 'object')
+check('the reply entry receives the controller hook', typeof replyInjected.hooks.editTurn === 'object')
 
 const injectedProps = registration.definition.inject('session-11111111-2222-4333-8444-555555555555')
 check('inject() yields the controller', typeof injectedProps.controller === 'object')
@@ -141,6 +167,7 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'notice',
   'pending',
   'replies',
+  'repliesByMessage',
   'revision',
   'surfaceReady',
 ]
