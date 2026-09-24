@@ -108,6 +108,21 @@ class StubElement {
     const hits = walk(this).filter((node) => matches(node, selector))
     return hits[0] ?? null
   }
+
+  /** Same matcher, every hit: the fallback path counts the pencils in a bar. */
+  querySelectorAll(selector) {
+    return walk(this).filter((node) => matches(node, selector))
+  }
+
+  /** Nearest ancestor (or self) matching the selector. */
+  closest(selector) {
+    let node = this
+    while (node !== null && node !== undefined) {
+      if (matches(node, selector)) return node
+      node = node.parentElement
+    }
+    return null
+  }
 }
 
 /** Pre-order (document order) traversal: a stack would reverse every sibling list. */
@@ -124,6 +139,13 @@ function walk(root) {
 }
 
 function matches(node, selector) {
+  // `.class:not([attr])` - a class plus the absence of an attribute. The
+  // fallback path uses it to tell its own pencil apart from the strip's.
+  const negated = /^\.([\w-]+):not\(\[([\w-]+)\]\)$/.exec(selector)
+  if (negated !== null) {
+    const [, name, attr] = negated
+    return node._classes.has(name) && !(attr in node.attributes)
+  }
   if (selector.startsWith('.') && !selector.includes('[')) return node._classes.has(selector.slice(1))
   const contains = /^\[([a-z-]+)\*="([^"]+)"\]$/.exec(selector)
   if (contains !== null) {
@@ -630,6 +652,78 @@ test('a row the host does not report as editable gets no action', async () => {
   await controller.load(true)
   render(harness, controller, snapshot)
   assert.equal(byClass(strayRow, 'dshet-action').length, 0, 'no action without an editable entry')
+})
+
+// --- the fallback for a reply whose strip entry never renders ---------------
+
+const turnTailSnapshot = (seq) => ({
+  nodes: new Map([
+    [
+      ROW_KEY,
+      { kind: 'turn-tail', anchorSeq: seq, data: { closing: { finalNode: { seq } } } },
+    ],
+  ]),
+})
+
+const replyState = () => ({
+  ok: true,
+  hidden: [],
+  turns: [],
+  replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }],
+  config: { confirm: false },
+})
+
+test("a reply whose strip entry never renders still gets a pencil in the platform bar", async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+
+  const bar = row.querySelector('[class*="_actions"]')
+  const pencils = [...bar.querySelectorAll('.dshet-row-action')]
+  assert.equal(pencils.length, 1, 'exactly one pencil')
+  assert.equal(pencils[0].getAttribute('aria-label'), '编辑这条回答')
+  assert.equal(pencils[0].closest('.dshet-action-host').dataset.dshetFallback, '1', 'marked as the fallback')
+
+  pencils[0].fire('click')
+  render(harness, controller, turnTailSnapshot(5))
+  assert.ok(row.querySelector('.dshet-editor'), 'clicking it opens the editor under the turn')
+  assert.deepEqual(byClass(row.querySelector('.dshet-editor'), 'dshet-editor-title').map((node) => node.textContent), ['编辑这条回答'])
+})
+
+test('the fallback never doubles an entry the strip did render', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  // The strip's own entry: same class, no fallback marker.
+  const stripPencil = harness.document.createElement('button')
+  stripPencil.className = 'dshet-action dshet-row-action'
+  row.querySelector('[class*="_actions"]').appendChild(stripPencil)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+
+  const bar = row.querySelector('[class*="_actions"]')
+  assert.equal(bar.querySelectorAll('.dshet-row-action').length, 1, 'no second pencil next to the strip entry')
+  assert.equal(bar.querySelectorAll('[data-dshet-fallback]').length, 0, 'the fallback stood down')
+})
+
+test('the fallback stands down once the reply leaves the surface', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+  assert.equal(row.querySelectorAll('.dshet-row-action').length, 1)
+
+  // A rollback shadows the reply, so the pencil must go with it.
+  controller.publish({ hidden: new Map([[5, 1]]) })
+  render(harness, controller, turnTailSnapshot(5))
+  assert.equal(row.querySelectorAll('.dshet-row-action').length, 0, 'the pencil is removed with the reply')
 })
 
 test('cancel closes the editor without posting', async () => {
