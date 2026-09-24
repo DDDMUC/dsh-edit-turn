@@ -323,10 +323,26 @@ try {
   })
   const correction = buildCorrection(replyPlan, '改写后的回答')
   replySession.append(correction.type, correction.data, { surfaceOp: 'append' })
+  // The host anchors a turn's tail - its duration and action strip - at the turn's
+  // LAST `turn/end`. A correction appended after the old one therefore lands
+  // outside the turn and the tail renders above the corrected text, so the turn is
+  // closed again behind it.
+  replySession.append('step/end', { turn: correction.data.turn, step: correction.data.step })
+  replySession.append('turn/end', { turn: correction.data.turn, reason: { kind: 'completed' } })
 } catch (error) {
   replyFailure = String((error && error.message) || error)
 }
 check('rollback + appended correction is ACCEPTED', replyFailure === null, replyFailure)
+check(
+  'the turn is closed again behind the correction',
+  replySession.snapshotEvents().slice(-3).map((event) => event.type).join(',') === 'assistant/message,step/end,turn/end',
+  replySession.snapshotEvents().slice(-3).map((event) => event.type).join(','),
+)
+check(
+  'the closing event names the edited turn',
+  replySession.snapshotEvents().at(-1).data.turn === replyPlan.turn,
+  String(replySession.snapshotEvents().at(-1).data.turn),
+)
 const afterReply = texts(replySession.deriveMessages())
 const rolesAfterReply = replySession.deriveMessages().map((message) => message.role)
 check('the model now sees the corrected text as its own reply',
@@ -335,7 +351,11 @@ check('the earlier prompt is untouched and still first', afterReply[1] === '第�
 check('the history stays strictly alternating', rolesAfterReply.join(',') === 'system,user,assistant', rolesAfterReply.join(','))
 check('the tool result left together with the reply it belonged to',
   !replySession.deriveMessages().some((message) => (message.content || []).some((block) => block.type === 'tool-result')))
-const appendedCorrection = replySession.snapshotEvents().at(-1)
+// Found by its marker, not by position: the closing events now come after it.
+const appendedCorrection = replySession
+  .snapshotEvents()
+  .find((event) => event.data && event.data.message && event.data.message.source && event.data.message.source.editedBy === PLUGIN_ID)
+check('the correction can be found by its marker', appendedCorrection !== undefined)
 check('the correction is a model-kind reply, so it renders as one', appendedCorrection.data.message.source.kind === 'model')
 check('the correction records who wrote the text', appendedCorrection.data.message.source.editedBy === PLUGIN_ID)
 check('the correction carries a turn and a step, so reply nodes cannot collide',
