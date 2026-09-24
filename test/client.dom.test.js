@@ -123,6 +123,11 @@ class StubElement {
     }
     return null
   }
+
+  /** Element.matches, so the plugin can test the row element itself. */
+  matches(selector) {
+    return matches(this, selector)
+  }
 }
 
 /** Pre-order (document order) traversal: a stack would reverse every sibling list. */
@@ -665,6 +670,18 @@ const turnTailSnapshot = (seq) => ({
   ]),
 })
 
+/** A turn-tail row shaped like the host's: marker element, strip as its child. */
+function mountTurnTailRow(document, key = ROW_KEY) {
+  const row = mountRow(document, key)
+  const tailRoot = document.createElement('div')
+  tailRoot.setAttribute('data-turn-tail', '1')
+  const bar = document.createElement('span')
+  bar.className = 'turn_tail_actions'
+  tailRoot.appendChild(bar)
+  row.appendChild(tailRoot)
+  return { row, bar, tailRoot }
+}
+
 const replyState = () => ({
   ok: true,
   hidden: [],
@@ -676,12 +693,11 @@ const replyState = () => ({
 test("a reply whose strip entry never renders still gets a pencil in the platform bar", async () => {
   const harness = await loadBundle()
   const controller = harness.controller
-  const row = mountRow(harness.document)
+  const { row, bar } = mountTurnTailRow(harness.document)
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
   await controller.load(true)
   render(harness, controller, turnTailSnapshot(5))
 
-  const bar = row.querySelector('[class*="_actions"]')
   const pencils = [...bar.querySelectorAll('.dshet-row-action')]
   assert.equal(pencils.length, 1, 'exactly one pencil')
   assert.equal(pencils[0].getAttribute('aria-label'), '编辑这条回答')
@@ -714,35 +730,43 @@ test('the fallback never doubles an entry the strip did render', async () => {
 test('the fallback stands down once the reply leaves the surface', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
-  const row = mountRow(harness.document)
+  const { row, bar } = mountTurnTailRow(harness.document)
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
   await controller.load(true)
   render(harness, controller, turnTailSnapshot(5))
-  assert.equal(row.querySelectorAll('.dshet-row-action').length, 1)
+  assert.equal(bar.querySelectorAll('.dshet-row-action').length, 1)
 
   // A rollback shadows the reply, so the pencil must go with it.
   controller.publish({ hidden: new Map([[5, 1]]) })
   render(harness, controller, turnTailSnapshot(5))
-  assert.equal(row.querySelectorAll('.dshet-row-action').length, 0, 'the pencil is removed with the reply')
+  assert.equal(bar.querySelectorAll('.dshet-row-action').length, 0, 'the pencil is removed with the reply')
+  assert.equal(row.querySelectorAll('.dshet-editor').length, 0)
 })
 
 test('the fallback parks in the turn tail own strip, never in a tool-call bar', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
   const row = mountRow(harness.document)
-  // A tool-call row inside the tail carries an action bar of its own. It is the
-  // FIRST _actions in the row, and it unmounts as the call expands - a pencil
-  // parked there sits in the wrong place and blinks.
+  // The row is a wrapper: the marker sits on an element inside it, and the
+  // strip is that element's last direct child.
+  const tailRoot = harness.document.createElement('div')
+  tailRoot.setAttribute('data-turn-tail', '1')
+  const tail = harness.document.createElement('div')
+  tail.className = 'turn_tail'
+  // A tool-call row inside the tail carries an action bar of its own: it is the
+  // first _actions here, and it unmounts as the call expands, so a pencil parked
+  // in it sits in the wrong place and blinks.
   const toolCall = harness.document.createElement('div')
   toolCall.className = 'tool_call_row'
   const toolBar = harness.document.createElement('span')
   toolBar.className = 'tool_call_actions'
   toolCall.appendChild(toolBar)
-  row.appendChild(toolCall)
-  // The turn tail's own strip: the LAST direct child of the row root.
+  tail.appendChild(toolCall)
+  tailRoot.appendChild(tail)
   const ownBar = harness.document.createElement('span')
   ownBar.className = 'turn_tail_actions'
-  row.appendChild(ownBar)
+  tailRoot.appendChild(ownBar)
+  row.appendChild(tailRoot)
 
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
   await controller.load(true)
@@ -751,6 +775,22 @@ test('the fallback parks in the turn tail own strip, never in a tool-call bar', 
   assert.equal(toolBar.querySelectorAll('.dshet-row-action').length, 0, 'not in the tool call bar')
   assert.equal(ownBar.querySelectorAll('.dshet-row-action').length, 1, 'in the turn tail own strip')
   assert.equal(ownBar.querySelector('.dshet-row-action').getAttribute('aria-label'), '编辑这条回答')
+})
+
+test('the fallback also works when the row itself is the turn tail root', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  row.setAttribute('data-turn-tail', '1')
+  const ownBar = harness.document.createElement('span')
+  ownBar.className = 'turn_tail_actions'
+  row.appendChild(ownBar)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+
+  assert.equal(ownBar.querySelectorAll('.dshet-row-action').length, 1, 'the row is its own tail root')
 })
 
 test('cancel closes the editor without posting', async () => {

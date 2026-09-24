@@ -202,10 +202,37 @@ test('GET /state reports the editable turns of a live session', async () => {
   }
 })
 
-test('both routes are mounted, so a missing one never silently passes', async () => {
+test('every route is mounted, so a missing one never silently passes', async () => {
   const h = await harness()
   try {
-    assert.deepEqual([...h.routes.keys()].sort(), ['/dsh-edit-turn/apply', '/dsh-edit-turn/state'])
+    assert.deepEqual([...h.routes.keys()].sort(), [
+      '/dsh-edit-turn/apply',
+      '/dsh-edit-turn/debug',
+      '/dsh-edit-turn/state',
+    ])
+  } finally {
+    await h.close()
+  }
+})
+
+test('the debug route reports what the browser half asked for', async () => {
+  const h = await harness()
+  try {
+    await getState(h.port)
+    const res = await raw(h.port, { path: '/dsh-edit-turn/debug' })
+    assert.equal(res.status, 200)
+    assert.equal(res.json.ok, true)
+    assert.equal(res.json.version, PLUGIN_VERSION)
+    // The log is module-level, so earlier tests in this file are in it too: what
+    // matters is the entry this test's request just produced.
+    const last = res.json.requests.at(-1)
+    assert.equal(last.kind, 'state')
+    assert.equal(last.ok, true)
+    assert.equal(last.sessionId, SESSION_ID)
+    assert.equal(last.turns, 2, 'the counts the client would have received')
+    assert.equal(last.replies, 2)
+    // The diagnostic route itself is not worth recording.
+    assert.equal(res.json.requests.some((entry) => entry.kind === 'debug'), false)
   } finally {
     await h.close()
   }

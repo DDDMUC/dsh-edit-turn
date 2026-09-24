@@ -22,9 +22,11 @@ import {
   isSurfaceEvent,
   lastTurnOf,
   messageIdOf,
+  noteRequest,
   openTurn,
   planRollback,
   readMessageText,
+  recentRequests,
   rollbackLedger,
   turnIndex,
 } from '../lib/index.js'
@@ -430,4 +432,20 @@ test('isAssistantReply tells replies apart from prompts and tool results', () =>
   assert.equal(isAssistantReply(log.find((event) => event.type === 'user/message')), false)
   assert.equal(isAssistantReply(log.find((event) => event.type === 'tool/result')), false)
   assert.equal(isAssistantReply(undefined), false)
+})
+
+test('the request log records failures too, and stays bounded', () => {
+  const before = recentRequests().length
+  noteRequest({ kind: 'state', ok: false, code: 'session-not-found', sessionId: 'x' })
+  const after = recentRequests()
+  // A failure is exactly the entry a diagnosis needs: "the client asked and got
+  // nothing" must not look like "the client never asked".
+  assert.equal(after.length >= before + 1, true)
+  assert.deepEqual(
+    after.at(-1),
+    { at: after.at(-1).at, kind: 'state', ok: false, code: 'session-not-found', sessionId: 'x' },
+  )
+  for (let index = 0; index < 60; index += 1) noteRequest({ kind: 'state', ok: true, n: index })
+  assert.equal(recentRequests().length, 40, 'the ring drops the oldest')
+  assert.equal(recentRequests().at(-1).n, 59)
 })
