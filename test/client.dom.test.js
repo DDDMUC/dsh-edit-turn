@@ -21,7 +21,19 @@ class StubElement {
     this.tagName = String(tag).toUpperCase()
     this.children = []
     this.parentElement = null
-    this.dataset = {}
+    // `dataset.x` and `data-x` are the same thing in the DOM, and the plugin
+    // relies on that: it marks a pencil through dataset and finds it again with
+    // an attribute selector. Two detached objects here would hide that contract.
+    this.dataset = new Proxy(
+      {},
+      {
+        set: (target, key, value) => {
+          target[key] = value
+          this.attributes[`data-${String(key).replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`] = String(value)
+          return true
+        },
+      },
+    )
     this.style = {}
     this.attributes = {}
     this.listeners = new Map()
@@ -701,12 +713,31 @@ test("a reply whose strip entry never renders still gets a pencil in the platfor
   const pencils = [...bar.querySelectorAll('.dshet-row-action')]
   assert.equal(pencils.length, 1, 'exactly one pencil')
   assert.equal(pencils[0].getAttribute('aria-label'), '编辑这条回答')
-  assert.equal(pencils[0].closest('.dshet-action-host').dataset.dshetFallback, '1', 'marked as the fallback')
+  assert.equal(pencils[0].dataset.dshetFallback, '1', 'marked as the fallback, on the button itself')
 
   pencils[0].fire('click')
   render(harness, controller, turnTailSnapshot(5))
   assert.ok(row.querySelector('.dshet-editor'), 'clicking it opens the editor under the turn')
   assert.deepEqual(byClass(row.querySelector('.dshet-editor'), 'dshet-editor-title').map((node) => node.textContent), ['编辑这条回答'])
+})
+
+test('the fallback pencil survives a second pass instead of deleting itself', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { bar } = mountTurnTailRow(harness.document)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+  const first = bar.querySelectorAll('.dshet-row-action')
+  assert.equal(first.length, 1)
+
+  // The pass that looks for the strip's own entry queries buttons. With the
+  // fallback marker on the wrapper only, this pencil looked like the strip's own
+  // and deleted itself - then the next pass put it back. The user saw flicker.
+  for (let pass = 0; pass < 3; pass += 1) render(harness, controller, turnTailSnapshot(5))
+  const later = bar.querySelectorAll('.dshet-row-action')
+  assert.equal(later.length, 1, 'still exactly one pencil')
+  assert.equal(later[0], first[0], 'the same element, never rebuilt')
 })
 
 test('the fallback never doubles an entry the strip did render', async () => {
