@@ -390,8 +390,16 @@ test('editing a reply replaces it without re-running the model', async () => {
     // everything that was built on top of it.
     assert.deepEqual(res.json.shadowed, [3, 6, 7, 8])
 
-    // Two appends: the invisible rollback carrier, then the corrected reply.
-    assert.equal(h.session.seq, before + 2)
+    // Four appends: the invisible rollback carrier, the corrected reply, and the
+    // two events that close the turn again behind it.
+    assert.equal(h.session.seq, before + 4)
+    const lastTwo = h.session.snapshotEvents().slice(-2).map((event) => event.type)
+    // Without this the correction lands outside the turn and the host renders
+    // the turn's tail - duration and action strip - above the corrected text.
+    assert.deepEqual(lastTwo, ['step/end', 'turn/end'])
+    const tail = h.session.snapshotEvents().at(-1)
+    assert.equal(tail.data.turn, 1, "the turn that was edited")
+    assert.equal(tail.data.reason.kind, 'completed')
     const derived = h.session.deriveMessages()
     assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant'])
     assert.equal(derived[2].content[0].text, 'corrected answer')
