@@ -726,6 +726,33 @@ test('the fallback stands down once the reply leaves the surface', async () => {
   assert.equal(row.querySelectorAll('.dshet-row-action').length, 0, 'the pencil is removed with the reply')
 })
 
+test('the fallback parks in the turn tail own strip, never in a tool-call bar', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  // A tool-call row inside the tail carries an action bar of its own. It is the
+  // FIRST _actions in the row, and it unmounts as the call expands - a pencil
+  // parked there sits in the wrong place and blinks.
+  const toolCall = harness.document.createElement('div')
+  toolCall.className = 'tool_call_row'
+  const toolBar = harness.document.createElement('span')
+  toolBar.className = 'tool_call_actions'
+  toolCall.appendChild(toolBar)
+  row.appendChild(toolCall)
+  // The turn tail's own strip: the LAST direct child of the row root.
+  const ownBar = harness.document.createElement('span')
+  ownBar.className = 'turn_tail_actions'
+  row.appendChild(ownBar)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+
+  assert.equal(toolBar.querySelectorAll('.dshet-row-action').length, 0, 'not in the tool call bar')
+  assert.equal(ownBar.querySelectorAll('.dshet-row-action').length, 1, 'in the turn tail own strip')
+  assert.equal(ownBar.querySelector('.dshet-row-action').getAttribute('aria-label'), '编辑这条回答')
+})
+
 test('cancel closes the editor without posting', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   let posted = 0
