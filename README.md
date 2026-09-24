@@ -110,11 +110,12 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 
 ### 验证状态
 
-本插件在 DSH `0.1.6-alpha.2` 上完成以下验证（全部**零模型调用**）：
+本插件在 DSH `0.1.6-alpha.2` 与 `0.1.7-rc.1` 上完成以下验证：
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
+| 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
 | 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 61 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受** |
 | 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 83 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
@@ -149,6 +150,22 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **进行中拒绝编辑**：未闭合的轮次或正在压缩时返回 `409 busy`。
 - **回退是持久的，隐藏不是**。回退写进日志后，模型上下文永久改变；转录里那些行的隐藏是本插件客户端半部做的。卸载插件后，旧行会重新显示出来（而模型上下文里的回退仍然生效）——因为替换事件是官方事件，不会随插件消失。
 - 回退后**系统提示词保持不变**（窗口永不包含 surface 节点 0，该节点也永不可编辑）。
+- **旧会话（v3 格式日志）在 DSH 0.1.7 下读不到**：DSH 的会话读取层对这类日志返回 `session-not-found`，本插件因此在其中完全不工作（表现为没有编辑入口）。新写的会话是 v4，正常。
+
+### 更新日志
+
+**0.2.1** —— 修 0.1.7 上的两处界面问题，并补上让问题可自证的诊断手段。
+
+- 修复：模型回复的编辑入口改注册进官方插槽 `conversation.chat.assistant-actions`，与平台自己的 复制 / 赞 / 踩 / 分支 / 用量 同排（此前是 DOM 注入，位置不一致、且会随工具调用行卸载而闪烁）。
+- 修复：编辑模型回答后**重新闭合该轮**（`step/end` + `turn/end`）。此前修正消息被追加到 `turn/end` 之后、落在轮外，导致那一轮的尾巴（用时、动作条）渲染到回复正文**上面**。
+- 修复：DSH 0.1.7 兼容——会话格式 v4 的 producer-owned source kind（`plugin:<id>`）、助手消息文本取自 `data.message.content`。
+- 新增：只读诊断路由 `GET /dsh-edit-turn/debug`；`npm run probe:loaded [端口]`。
+
+**0.2.0** —— 可以编辑模型的回答。回退该回答及其后内容，再追加一条带改写文本的助手消息（回答无法原地替换：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`）。不重跑模型；`source.editedBy` 如实标记文字由插件写入。
+
+**0.1.1** —— 去掉多余的二次确认（默认一次点击即执行）；修皮肤下界面可读性。
+
+**0.1.0** —— 首版：回退并重跑你自己发过的消息。
 
 ### 姊妹插件
 
@@ -158,7 +175,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 兼容性
 
-- `dsh.engines.dsh`: `>=0.1.6-alpha.2`（本插件依赖该版本的消息行定义与 surface 语义，并已在此版本实测）。
+- `dsh.engines.dsh`: `>=0.1.6-alpha.2`（本插件依赖该版本的消息行定义与 surface 语义；`0.1.6-alpha.2` 与 `0.1.7-rc.1` 均已实测）。
 - 客户端依赖：`dsh-client-locale`、`dsh-client-ui-chat`、`dsh-client-ui-conversation`、`dsh-client-ui-primitives`。
 - 宿主依赖：`dsh-settings`、`dsh-tools`（peer）；`@deepseek-ai/schemastery`（直接依赖）。
 
