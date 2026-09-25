@@ -86,6 +86,26 @@ class StubElement {
     return child
   }
 
+  /** Same, for the revision bubble the plugin plants right after a rewritten row. */
+  get nextElementSibling() {
+    if (this.parentElement === null) return null
+    const siblings = this.parentElement.children
+    const index = siblings.indexOf(this)
+    return index === -1 || index === siblings.length - 1 ? null : siblings[index + 1]
+  }
+
+  /** Insert a sibling right after this node: how the revision bubble is planted. */
+  after(sibling) {
+    if (this.parentElement === null) return
+    const siblings = this.parentElement.children
+    const index = siblings.indexOf(this)
+    if (index === -1) return
+    const existing = siblings.indexOf(sibling)
+    if (existing !== -1) siblings.splice(existing, 1)
+    sibling.parentElement = this.parentElement
+    this.parentElement.children.splice(index + 1, 0, sibling)
+  }
+
   /** The plugin positions its action relative to a sibling, so this has to exist. */
   get nextSibling() {
     if (this.parentElement === null) return null
