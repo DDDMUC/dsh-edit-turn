@@ -152,6 +152,32 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - 回退后**系统提示词保持不变**（窗口永不包含 surface 节点 0，该节点也永不可编辑）。
 - **旧会话（v3 格式日志）在 DSH 0.1.7 下读不到**：DSH 的会话读取层对这类日志返回 `session-not-found`，本插件因此在其中完全不工作（表现为没有编辑入口）。新写的会话是 v4，正常。
 
+### 排查：编辑入口整个不见了
+
+先分清是"插件没加载"还是"加载了但没渲染"——两者的现场完全不同，别猜。
+
+1. **插件加载了吗？** 在插件目录跑 `npm run probe:loaded [端口]`（默认 3080）。返回 `400`/`405` 说明宿主半部在跑；返回 `404` 说明插件根本没加载。
+2. **没加载时看宿主启动输出**，找这一行：
+
+   ```
+   dsh-edit-turn (dsh-edit-turn): failed to import
+   ```
+
+   这行的原因几乎总是**依赖解析失败**，最常见的是：插件以 `link:` 方式安装（开发目录直接挂进 profile），而插件目录的 `node_modules` 是个指向某处 npx 缓存的软链——缓存被 `npx` 清理后软链变死链，静态 `import` 直接抛错，整个插件消失。修法是在插件目录里真实安装依赖：
+
+   ```sh
+   cd <插件目录> && rm -f node_modules && npm install --omit=dev --legacy-peer-deps
+   ```
+
+   注意区分两类依赖：宿主提供的 **peer**（`dsh-tools`、`dsh-settings`）由 DSH 加载器解析，可以不装；**普通 dependencies**（如 `schemastery`）必须能解析到，加载器不会替你找。
+3. **加载了但没入口时**，用只读诊断路由看浏览器半部到底问了什么：
+
+   ```sh
+   curl "http://127.0.0.1:<端口>/dsh-edit-turn/debug"
+   ```
+
+   记录里有 `state` 且 `replies` 大于 0 → 数据到了客户端，问题在渲染；**一条记录都没有** → 客户端半部没跑起来（看浏览器控制台）。
+
 ### 更新日志
 
 **0.2.1** —— 修 0.1.7 上的两处界面问题，并补上让问题可自证的诊断手段。
@@ -366,6 +392,32 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **Running work is refused**: an unclosed turn or an in-flight compaction answers `409 busy`.
 - **The rollback is durable; the hiding is not.** Once written, the rollback permanently changes the model context. Hiding those rows in the transcript is this plugin's browser half. Uninstall the plugin and the old rows reappear - while the rollback in the model context still stands, because the replacement is an official event that outlives the plugin.
 - **The system prompt is never touched**: the window can never include surface node 0, and that node is never editable.
+
+### Troubleshooting: the edit entry disappeared entirely
+
+Separate "the plugin never loaded" from "it loaded but nothing rendered" - the two have nothing in common, so do not guess.
+
+1. **Is the plugin loaded?** `npm run probe:loaded [port]` (default 3080) from the plugin directory. `400`/`405` means the host half is running; `404` means it never loaded.
+2. **When it did not load, look at the host's startup output** for:
+
+   ```
+   dsh-edit-turn (dsh-edit-turn): failed to import
+   ```
+
+   That line is almost always a **dependency resolution failure**, and the usual cause is a `link:` install (the development directory mounted into the profile) whose `node_modules` is a symlink into an npx cache - once npx prunes that cache the symlink dangles, the static `import` throws, and the whole plugin vanishes. Fix it by installing the dependencies for real:
+
+   ```sh
+   cd <plugin dir> && rm -f node_modules && npm install --omit=dev --legacy-peer-deps
+   ```
+
+   Mind the two kinds of dependency: **peers** provided by the host (`dsh-tools`, `dsh-settings`) are resolved by the DSH loader and need no install; **regular dependencies** (like `schemastery`) must resolve on their own - the loader will not find them for you.
+3. **When it did load but shows no entry**, ask the read-only diagnostic route what the browser half actually requested:
+
+   ```sh
+   curl "http://127.0.0.1:<port>/dsh-edit-turn/debug"
+   ```
+
+   Entries with `state` and `replies` above zero mean the data reached the client, so the problem is rendering; **no entries at all** means the browser half never ran (check its console).
 
 ### Sister plugins
 
