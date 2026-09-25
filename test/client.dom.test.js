@@ -76,6 +76,24 @@ class StubElement {
     return child
   }
 
+  /** DOM semantics: moves an existing child, and appends when the reference is null. */
+  insertBefore(child, reference) {
+    const existing = this.children.indexOf(child)
+    if (existing !== -1) this.children.splice(existing, 1)
+    const at = reference === null || reference === undefined ? this.children.length : this.children.indexOf(reference)
+    child.parentElement = this
+    this.children.splice(at === -1 ? this.children.length : at, 0, child)
+    return child
+  }
+
+  /** The plugin positions its action relative to a sibling, so this has to exist. */
+  get nextSibling() {
+    if (this.parentElement === null) return null
+    const siblings = this.parentElement.children
+    const index = siblings.indexOf(this)
+    return index === -1 || index === siblings.length - 1 ? null : siblings[index + 1]
+  }
+
   remove() {
     if (this.parentElement === null) return
     const index = this.parentElement.children.indexOf(this)
@@ -217,7 +235,19 @@ async function loadBundle() {
   globalThis.requestAnimationFrame = (fn) => fn()
 
   // A React whose effects actually run, so the component's DOM pass happens.
-  const react = { useEffect: (fn) => { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup) } }
+  const react = {
+    useEffect: (fn) => {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+    },
+    // Read through the initialiser on every render: the component under test
+    // subscribes to its own controller, and a fresh render must see the state
+    // the test just published.
+    useState: (init) => {
+      const slot = { value: typeof init === 'function' ? init() : init }
+      return [slot.value, (next) => { slot.value = next }]
+    },
+  }
   const cleanups = []
   const jsx = (type, props) => ({ type, props: props ?? {} })
   const jsxs = (type, props) => ({ type, props: props ?? {} })
@@ -822,6 +852,40 @@ test('the fallback also works when the row itself is the turn tail root', async 
   render(harness, controller, turnTailSnapshot(5))
 
   assert.equal(ownBar.querySelectorAll('.dshet-row-action').length, 1, 'the row is its own tail root')
+})
+
+test('the fallback parks after the last platform action, not behind the clock', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { row, bar, tailRoot } = mountTurnTailRow(harness.document)
+  // The strip as the host builds it: action icons carry a hashed `_action`
+  // class, the clock trails them. A plain append would park the pencil behind
+  // the clock - the row's trailing info - which is not where an action belongs.
+  const copy = harness.document.createElement('button')
+  copy.className = 'xzv4MW_action'
+  copy.setAttribute('aria-label', '复制')
+  const branch = harness.document.createElement('button')
+  branch.className = 'xzv4MW_action'
+  branch.setAttribute('aria-label', '在新对话中分支')
+  const clock = harness.document.createElement('span')
+  clock.className = 'xzv4MW_timeEnd'
+  clock.textContent = '15:13'
+  bar.appendChild(copy)
+  bar.appendChild(branch)
+  bar.appendChild(clock)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => replyState() })
+  await controller.load(true)
+  render(harness, controller, turnTailSnapshot(5))
+
+  const order = Array.from(bar.children).map((child) => String(child.className).slice(0, 18))
+  assert.equal(order.length, 4, `expected one added host, got ${order.join(' | ')}`)
+  assert.equal(bar.children[0], copy, 'copy stays first')
+  assert.equal(bar.children[1], branch, 'branch stays where the host put it')
+  assert.equal(bar.children[2].className, 'dshet-action-host', 'the pencil follows the last action')
+  assert.equal(bar.children[3], clock, 'the clock stays behind every action')
+  assert.equal(tailRoot.children.length, 1, 'the tail root itself is untouched')
+  assert.equal(row.children.length > 1, true)
 })
 
 test('cancel closes the editor without posting', async () => {
