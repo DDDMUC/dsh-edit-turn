@@ -81,10 +81,6 @@ async function harness(options = {}) {
           return {
             resolveAgent: async () => ({ agent: { session } }),
             prompt: async (request) => {
-              // `breakPrompt` stands in for a re-run that cannot start: the edit
-              // has already landed, so the plugin has to report the failure
-              // rather than pretend nothing was saved.
-              if (options.breakPrompt === true) throw new Error('prompt refused')
               prompts.push(request)
               return { accepted: true }
             },
@@ -252,65 +248,29 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
     assert.equal(res.status, 200, res.payload)
     assert.equal(res.json.ok, true)
     assert.equal(res.json.kind, 'prompt')
-    assert.equal(res.json.applied, true)
-    assert.equal(res.json.reran, false, 'saving does not run the turn again')
+    assert.equal(res.json.promptAccepted, true)
     assert.equal(res.json.flushed, true)
     assert.deepEqual(res.json.shadowed, [2, 3, 6, 7, 8])
 
-    // The log grew by exactly two events: the rollback carrier and the revised
-    // prompt written behind it, append-only.
-    assert.equal(h.session.seq, before + 2)
+    // The log grew by exactly one event: the replacement, append-only.
+    assert.equal(h.session.seq, before + 1)
 
-    // The whole point of the rewrite: the model has to read the revised text.
-    // Rolling back alone would only DELETE the old prompt - the edit would be a
-    // UI change and the next turn would still be answered against the old
-    // wording - so the revision is written into the context here.
+    // The derived model context is exactly the surviving system prompt: the
+    // default carrier is an empty dormant system node, so it adds no message.
     const derived = h.session.deriveMessages()
-    const last = derived[derived.length - 1]
-    assert.equal(last.role, 'user')
-    assert.equal(last.content[0].text, 'revised prompt')
-    assert.deepEqual(
-      derived.map((message) => message.role),
-      ['system', 'user'],
-      'the system prompt survives and the revision is the latest word',
-    )
+    assert.equal(derived.length, 1)
+    assert.equal(derived[0].content[0].text, 'SYS')
+    assert.deepEqual(foldSurface(h.session.snapshotEvents()).nodes, [1, res.json.replacementSeq])
 
-    // ... without spending a model call.
-    assert.deepEqual(h.prompts, [], 'no turn was started')
-  } finally {
-    await h.close()
-  }
-})
-
-test('rerun: true keeps the old behaviour, and reports when the re-run fails', async () => {
-  const h = await harness({ config: { rerun: true } })
-  try {
-    const before = h.session.seq
-    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised prompt' })
-    assert.equal(res.status, 200, res.payload)
-    assert.equal(res.json.applied, true)
-    assert.equal(res.json.reran, true)
-    // Carrier + revision + the turn the re-run starts.
-    assert.equal(h.session.seq, before + 2)
+    // Exactly one prompt was admitted, carrying the revised text.
     assert.equal(h.prompts.length, 1)
+    assert.equal(h.prompts[0].sessionId, SESSION_ID)
+    assert.equal(h.prompts[0].mode, 'queue')
     assert.deepEqual(h.prompts[0].content, [{ type: 'text', text: 'revised prompt' }])
+    assert.equal(typeof h.prompts[0].requestId, 'string')
+    assert.ok(h.prompts[0].requestId.length > 0)
   } finally {
     await h.close()
-  }
-
-  // The re-run is best-effort: when it cannot start, the edit still stands and
-  // the failure is reported instead of pretending the rollback failed.
-  const broken = await harness({ config: { rerun: true }, breakPrompt: true })
-  try {
-    const res = await applyEdit(broken.port, { sessionId: SESSION_ID, seq: 2, text: 'revised prompt' })
-    assert.equal(res.status, 200, res.payload)
-    assert.equal(res.json.applied, true, 'the revision is in the context')
-    assert.equal(res.json.reran, false)
-    assert.match(String(res.json.rerunError), /prompt refused/)
-    const derived = broken.session.deriveMessages()
-    assert.equal(derived[derived.length - 1].content[0].text, 'revised prompt')
-  } finally {
-    await broken.close()
   }
 })
 
@@ -340,9 +300,7 @@ test('after the rollback the state hides the discarded rows', async () => {
     assert.deepEqual(res.json.hidden.map((entry) => entry.turn), [1, 1, 2, 2, 2])
     assert.deepEqual(res.json.surface, (await getState(h.port)).json.surface)
     assert.equal(res.json.edits, 1)
-    // The revision is itself a human message, so it stands where the old prompt
-    // did: it is the editable last word of the conversation.
-    assert.deepEqual(res.json.turns.map((turn) => turn.text), ['revised'])
+    assert.deepEqual(res.json.turns, [])
   } finally {
     await h.close()
   }
@@ -355,9 +313,8 @@ test('editing the LAST turn keeps every earlier turn editable', async () => {
     assert.deepEqual(res.json.shadowed, [6, 7, 8])
     const state = await getState(h.port)
     assert.deepEqual(state.json.hidden.map((entry) => entry.seq), [6, 7, 8])
-    // The first prompt survives untouched; the revision is appended after it, so
-    // both are offered for editing.
-    assert.deepEqual(state.json.turns.map((turn) => turn.text), ['original prompt', 'revised second'])
+    assert.deepEqual(state.json.turns.map((turn) => turn.seq), [2])
+    assert.equal(state.json.turns[0].text, 'original prompt')
   } finally {
     await h.close()
   }
@@ -370,8 +327,7 @@ test('the fallback user/message carrier is used when configured', async () => {
     const carrier = h.session.snapshotEvents().find((event) => event.seq === res.json.replacementSeq)
     assert.equal(carrier.type, 'user/message')
     assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
-    // System prompt + the marker carrier + the revised prompt written after it.
-    assert.equal(h.session.deriveMessages().length, 3)
+    assert.equal(h.session.deriveMessages().length, 2)
   } finally {
     await h.close()
   }
@@ -401,8 +357,8 @@ test('a second edit of the same turn is refused as already rolled back', async (
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'again' })
     assert.equal(res.status, 409)
     assert.equal(res.json.code, 'already-rolled-back')
-    assert.deepEqual(h.prompts, [], 'no model call was made')
-    assert.equal(h.session.seq, 12)
+    assert.equal(h.prompts.length, 1)
+    assert.equal(h.session.seq, 11)
   } finally {
     await h.close()
   }
@@ -578,10 +534,7 @@ test('an unknown session id is a 404 and a malformed one a 400', async () => {
   }
 })
 
-test('saving does not depend on the prompt path at all', async () => {
-  // A session whose prompt path is broken outright. Saving a revised prompt must
-  // still land, because the revision is written into the context rather than
-  // prompted - that is the whole reason the write exists.
+test('a failed re-run is reported without pretending the rollback failed', async () => {
   const services = {
     sessionController: {
       resolveAgent: async () => undefined,
@@ -596,11 +549,9 @@ test('saving does not depend on the prompt path at all', async () => {
   try {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
     assert.equal(res.status, 200)
-    assert.equal(res.json.applied, true)
-    assert.equal(res.json.reran, false)
-    const derived = session.deriveMessages()
-    assert.equal(derived[derived.length - 1].role, 'user')
-    assert.equal(derived[derived.length - 1].content[0].text, 'revised')
+    assert.equal(res.json.promptAccepted, false)
+    assert.match(res.json.promptError, /inbox closed/)
+    assert.equal(session.deriveMessages().length, 1)
   } finally {
     await h.close()
   }
