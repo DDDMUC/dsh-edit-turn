@@ -121,20 +121,30 @@ check('first target text is the original prompt', targets[0] && targets[0].text 
 
 const plan = planRollback(events, fold.nodes, { seq: targets[0].seq })
 check('window opens on the addressed prompt', plan.shadowed[0] === targets[0].seq)
-check('window closes on the LAST surface node', plan.endSeq === fold.nodes[fold.nodes.length - 1])
-check('window covers u1, a1, u2, tool-result, a2', plan.shadowed.length === 5, `got ${plan.shadowed.length}`)
+// A revised prompt is replaced IN PLACE. The window is the message itself, so
+// the reply under it and every later turn stay exactly where they were - that is
+// what "edit the wording, keep the conversation" means.
+check(
+  'window is exactly the addressed message',
+  plan.shadowed.length === 1 && plan.startSeq === plan.endSeq && plan.endSeq === targets[0].seq,
+  `got ${JSON.stringify(plan.shadowed)}`,
+)
 check('plan reports the original text', plan.original === '第一轮提问', plan.original)
 
 // ---------------------------------------------------------------------------
 console.log('\n3. commit the rollback replacement and re-derive')
+const REVISED = '改后的第一轮提问'
 const before = session.seq
+// The carrier IS the revision: one replace event removes the old wording and
+// stands in its place, so nothing else has to be appended (appending a user
+// message makes the platform answer it) and nothing else is disturbed.
 const replacement = session.append(
   'user/message',
   {
     id: 'm-carrier',
     role: 'user',
-    content: [{ type: 'text', text: MARKER }],
-    source: { kind: 'plugin', plugin: PLUGIN_ID },
+    content: [{ type: 'text', text: REVISED }],
+    source: { kind: `plugin:${PLUGIN_ID}`, editedBy: PLUGIN_ID },
   },
   { surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq }, sourceEventSeqs: plan.shadowed },
 )
@@ -143,17 +153,22 @@ const afterDerived = session.deriveMessages()
 const afterTexts = texts(afterDerived)
 
 check('the real validator ACCEPTED the replacement', typeof replacement.seq === 'number', `seq ${replacement.seq}`)
-check('derived history shrank to 2 messages', afterDerived.length === 2, `got ${afterDerived.length}`)
+check('the context kept its size (nothing else was dropped)', afterDerived.length === 6, `got ${afterDerived.length}`)
 check('surviving prefix is the system prompt', afterTexts[0] === 'VERIFY SYSTEM PROMPT', afterTexts[0])
-check('replacement carrier took the tail position', afterTexts[1] === MARKER, afterTexts[1])
-check('the edited prompt left the model context', !afterTexts.includes('第一轮提问'))
-check('its reply left the model context', !afterTexts.includes('第一轮回答'))
-check('the LATER turn left the model context', !afterTexts.includes('第二轮提问') && !afterTexts.includes('第二轮回答'))
-check('the tool result left with its call', !afterDerived.some((m) => m.content.some((b) => b.type === 'tool-result')))
+check('the model now reads the revised wording', afterTexts.includes(REVISED))
+check('the old wording is gone', !afterTexts.includes('第一轮提问'))
+check(
+  'the revised wording sits exactly where the old one was',
+  afterTexts.indexOf(REVISED) === afterTexts.indexOf('第一轮回答') - 1,
+  JSON.stringify(afterTexts),
+)
+check('the reply under the edited prompt SURVIVES', afterTexts.includes('第一轮回答'))
+check('the LATER turn survives untouched', afterTexts.includes('第二轮提问') && afterTexts.includes('第二轮回答'))
+check('the tool result survives with its call', afterDerived.some((m) => m.content.some((b) => b.type === 'tool-result')))
 
 // ---------------------------------------------------------------------------
 console.log('\n4. the log is append-only')
-check('exactly one event was appended', afterEvents.length === events.length + 1, `${events.length} -> ${afterEvents.length}`)
+check('exactly one event was appended (the in-place replacement)', afterEvents.length === events.length + 1, `${events.length} -> ${afterEvents.length}`)
 check('session.seq advanced by one', session.seq === before + 1)
 check(
   'every original event survives byte-identical',
@@ -164,14 +179,17 @@ check('the shadowed events are still readable', afterEvents.some((e) => e.data &
 // ---------------------------------------------------------------------------
 console.log('\n5. the client ledger rebuilds from the log alone')
 const ledger = rollbackLedger(afterEvents)
-check('5 shadowed seqs are recorded as hidden', ledger.hidden.length === 5, `got ${ledger.hidden.length}`)
+check('only the edited message is recorded as hidden', ledger.hidden.length === 1, `got ${ledger.hidden.length}`)
 check('one rollback is recorded', ledger.edits.length === 1, `got ${ledger.edits.length}`)
-check('hidden entries carry their turn', ledger.hidden.filter((h) => h.turn === 2).length === 3, JSON.stringify(ledger.hidden))
+check('the hidden entry carries its turn', ledger.hidden[0] && ledger.hidden[0].turn === 1, JSON.stringify(ledger.hidden))
 const refold = foldSurface(afterEvents)
-// The window ran to the end of the log, so the LATER turn was discarded too:
-// right after a rollback there is nothing left to edit until the revised prompt
-// opens a new turn.
-check('no turn is editable right after the rollback', editableTurns(afterEvents, refold.nodes).length === 0)
+// Nothing was discarded, so the conversation goes on: the revised message and
+// the later prompt are both still offered for editing.
+check(
+  'the revised prompt and the later turn are still editable',
+  editableTurns(afterEvents, refold.nodes).length === 2,
+  JSON.stringify(editableTurns(afterEvents, refold.nodes).map((entry) => entry.text)),
+)
 
 // ---------------------------------------------------------------------------
 console.log('\n6. the default carrier: an EMPTY system/message acts as an invisible replacement')
@@ -191,11 +209,15 @@ try {
   })
   const probeDerived = probe.describe ? probe.deriveMessages() : probe.deriveMessages()
   const probeTexts = texts(probeDerived)
-  silentOk = probeDerived.length === 1 && probeTexts[0] === 'VERIFY SYSTEM PROMPT'
+  // Baseline: the log has 6 messages; the silent carrier replaces one node and
+  // projects to nothing, so 5 remain - and everything behind the edited message
+  // is still there.
+  silentOk = probeDerived.length === 5 && probeTexts[0] === 'VERIFY SYSTEM PROMPT'
   check('the validator ACCEPTED the empty system/message carrier', true)
-  check('the carrier projects to NO model message', probeDerived.length === 1, `got ${probeDerived.length}`)
+  check('the empty carrier projects to NO model message', probeDerived.length === 5, `got ${probeDerived.length}`)
   check('the system prompt survives the rollback intact', probeTexts[0] === 'VERIFY SYSTEM PROMPT', probeTexts[0])
-  check('the whole shadowed tail is gone', !probeTexts.includes('第一轮提问') && !probeTexts.includes('第二轮回答'))
+  check('the edited prompt is the only thing that left', !probeTexts.includes('第一轮提问'))
+  check('the reply and the later turn survive the silent carrier too', probeTexts.includes('第一轮回答') && probeTexts.includes('第二轮回答'))
 } catch (error) {
   check('the validator ACCEPTED the empty system/message carrier', false, String((error && error.message) || error))
 }
@@ -216,8 +238,9 @@ fallback.append(fallbackCarrier.type, fallbackCarrier.data, {
   sourceEventSeqs: fallbackPlan.shadowed,
 })
 const fallbackTexts = texts(fallback.deriveMessages())
-check('ONLY the system prompt and the marker survive', fallbackTexts.length === 2, `got ${fallbackTexts.length}`)
+check('the marker replaces the prompt, everything else stays', fallbackTexts.length === 6, `got ${fallbackTexts.length}`)
 check('the marker is the second message', fallbackTexts[1] === MARKER, fallbackTexts[1])
+check('the reply behind the edited prompt is untouched', fallbackTexts.includes('第一轮回答'))
 
 // ---------------------------------------------------------------------------
 console.log('\n8. a SECOND rollback of the revised prompt is accepted')
@@ -234,21 +257,17 @@ twice.append(firstCarrier.type, firstCarrier.data, {
 
 // What the host's re-run does: prompt admission appends the revised prompt, and
 // the turn it starts eventually closes.
-twice.append('turn/start', { turn: 3 })
-twice.append('step/start', { turn: 3, step: 1 })
-twice.append('user/message', userMessage('m-u3', 'revised prompt'), { surfaceOp: 'append' })
-twice.append('assistant/message', { turn: 3, step: 1, message: modelMessage('m-a3', 'answer to revised'), stream: [] }, { surfaceOp: 'append' })
-twice.append('step/end', { turn: 3, step: 1 })
-twice.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+// The new flow has no re-run here: the surface already holds the revision.
 
-// This is what the client has to ask the host for after an edit: without a
-// refresh it never learns that the revised prompt became editable.
+// A rewritten prompt stays editable (edit it again), and so does every later
+// turn: an in-place edit takes nothing else away.
 const secondEvents = twice.snapshotEvents()
 const secondFold = foldSurface(secondEvents)
 const secondTargets = editableTurns(secondEvents, secondFold.nodes)
 check(
-  'the revised prompt is the only editable turn',
-  secondTargets.length === 1 && secondTargets[0].text === 'revised prompt',
+  'the revised prompt is still editable, together with the later turn',
+  secondTargets.length === 2 &&
+    [...secondTargets.map((entry) => entry.text)].sort().join('|') === [REVISED, '第二轮提问'].sort().join('|'),
   JSON.stringify(secondTargets.map((entry) => entry.text)),
 )
 
@@ -263,17 +282,26 @@ try {
 } catch (error) {
   secondFailure = String((error && error.message) || error)
 }
-check('the validator ACCEPTED a second rollback', secondFailure === undefined, secondFailure)
+check('the validator ACCEPTED a second edit of the same message', secondFailure === undefined, secondFailure)
 const afterSecond = texts(twice.deriveMessages())
 check(
-  'the second rollback leaves only the system prompt',
-  afterSecond.length === 1 && afterSecond[0] === 'VERIFY SYSTEM PROMPT',
+  'the second edit removed only that message',
+  !afterSecond.some((text) => text.includes(REVISED)) && afterSecond.length === 5,
   JSON.stringify(afterSecond),
 )
-check('the revised prompt and its answer are gone', !afterSecond.some((text) => text.includes('revised')))
+check(
+  'the later turn survived both edits',
+  afterSecond.includes('第二轮提问') && afterSecond.includes('第二轮回答'),
+  JSON.stringify(afterSecond),
+)
 const thirdFold = foldSurface(twice.snapshotEvents())
-check('nothing is editable after two rollbacks', editableTurns(twice.snapshotEvents(), thirdFold.nodes).length === 0)
-check('two rollbacks appended exactly two events', twice.seq > 0)
+check(
+  'the later turn is still editable after two edits',
+  editableTurns(twice.snapshotEvents(), thirdFold.nodes).map((entry) => entry.text).join('|') === '第二轮提问',
+  // Two in-place edits: the second one replaced the revision with a silent carrier,
+  // and the later turn is still there because nothing else was ever in the window.
+  JSON.stringify(editableTurns(twice.snapshotEvents(), thirdFold.nodes).map((entry) => entry.text)),
+)
 
 // ---------------------------------------------------------------------------
 console.log('\n9. editing what the model said')
