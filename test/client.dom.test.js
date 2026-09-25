@@ -353,7 +353,7 @@ test('the edit action is injected onto the user row', async () => {
   const { row, harness } = await readyController()
   const actions = byClass(row, 'dshet-action')
   assert.equal(actions.length, 1, 'one edit action')
-  assert.equal(actions[0].getAttribute('aria-label'), '编辑这条消息并重跑')
+  assert.equal(actions[0].getAttribute('aria-label'), '编辑这条消息')
   // It is placed in the row's own action bar when the host UI has one.
   assert.equal(actions[0].parentElement.className, 'dshet-action-host')
   assert.equal(actions[0].parentElement.parentElement.className, 'message_actions')
@@ -372,7 +372,7 @@ test('clicking the action opens a prefilled in-place editor', async () => {
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
   assert.ok(row.querySelector('.dshet-editor'), 'the editor appears on the row')
-  assert.deepEqual(editorText(row).buttons, ['取消', '保存并重跑'])
+  assert.deepEqual(editorText(row).buttons, ['取消', '保存'])
   const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(area.value, 'original', 'the original text is pre-filled')
   assert.equal(area.disabled, false)
@@ -384,7 +384,7 @@ test('the opt-in confirmation step advances instead of doing nothing', async () 
   render(harness, controller, snapshot)
 
   const submit = byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0]
-  assert.equal(submit.textContent, '保存并重跑')
+  assert.equal(submit.textContent, '保存')
   submit.fire('click')
   render(harness, controller, snapshot)
 
@@ -399,7 +399,7 @@ test('the confirmation click posts the revised text and closes on success', asyn
   const calls = []
   globalThis.fetch = async (url, init) => {
     calls.push({ url, init })
-    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2, 3], promptAccepted: true, replacementSeq: 9 }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2, 3], applied: true, replacementSeq: 9 }) }
   }
 
   byClass(row, 'dshet-action')[0].fire('click')
@@ -431,7 +431,7 @@ test('a revised draft is what gets posted', async () => {
       return { ok: true, status: 200, json: async () => ({ ok: true, hidden: [], turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'original', attachments: 0 }], config: { confirm: false } }) }
     }
     bodies.push(JSON.parse(init.body))
-    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], promptAccepted: true }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], applied: true }) }
   }
   await controller.load(true)
 
@@ -456,7 +456,7 @@ test('one click applies directly on the default configuration', async () => {
       return { ok: true, status: 200, json: async () => ({ ok: true, hidden: [], turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'original', attachments: 0 }], config: { confirm: false } }) }
     }
     bodies.push(JSON.parse(init.body))
-    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], promptAccepted: true }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], applied: true }) }
   }
   await controller.load(true)
   byClass(row, 'dshet-action')[0].fire('click')
@@ -524,7 +524,7 @@ test('an unknown host code falls back instead of printing the raw key', async ()
 
 test('a rollback whose re-run did not start reaches the user', async () => {
   const { harness, controller, snapshot, row } = await readyController()
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], promptAccepted: false, promptError: 'inbox closed' }) })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], applied: false, applyError: 'the revised prompt was refused' }) })
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
   byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
