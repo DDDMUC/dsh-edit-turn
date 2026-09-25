@@ -22,6 +22,7 @@ import {
   PLUGIN_ID,
   buildCarrier,
   buildCorrection,
+  buildRevisedPrompt,
   editableReplies,
   editableTurns,
   foldSurface,
@@ -251,6 +252,55 @@ check(
   secondTargets.length === 1 && secondTargets[0].text === 'revised prompt',
   JSON.stringify(secondTargets.map((entry) => entry.text)),
 )
+
+// Saving must not depend on a re-run. Rolling back only DELETES the old prompt;
+// if nothing writes the revision back, the edit is a UI change and the next turn
+// is still answered against the old wording. So the revision is appended as a
+// plain human message - which is what this proves against the real validator.
+console.log('\n8b. a saved prompt reaches the model even with no re-run')
+{
+  const fresh = Session.create('session-00000000-0000-4000-8000-0000000000cc')
+  fresh.append('turn/start', { turn: 1 })
+  fresh.append('step/start', { turn: 1, step: 1 })
+  fresh.append('system/message', { turn: 1, step: 1, message: systemMessage('sys') }, { surfaceOp: 'append' })
+  fresh.append('user/message', userMessage('m-u1', 'the old wording'), { surfaceOp: 'append' })
+  fresh.append('assistant/message', { turn: 1, step: 1, message: modelMessage('m-a1', 'an answer to the old wording'), stream: [] }, { surfaceOp: 'append' })
+  fresh.append('step/end', { turn: 1, step: 1 })
+  fresh.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+  const events = fresh.snapshotEvents()
+  const nodes = foldSurface(events).nodes
+  const plan = planRollback(events, nodes, { seq: editableTurns(events, nodes)[0].seq })
+  const carrier = buildCarrier(plan, lastTurnOf(events), { carrier: 'system/message' })
+  fresh.append(carrier.type, carrier.data, {
+    surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq },
+    sourceEventSeqs: plan.shadowed,
+  })
+  const revised = buildRevisedPrompt(plan, 'the new wording')
+  let saveFailure = null
+  try {
+    fresh.append(revised.type, revised.data, { surfaceOp: 'append' })
+  } catch (error) {
+    saveFailure = String((error && error.message) || error)
+  }
+  check('the revised prompt is ACCEPTED as an append', saveFailure === null, saveFailure)
+
+  const derived = fresh.deriveMessages()
+  const last = derived[derived.length - 1]
+  check(
+    'the model reads the revised wording as the user last message',
+    last.role === 'user' && last.content[0].text === 'the new wording',
+    JSON.stringify(derived.map((message) => `${message.role}:${message.content[0].text}`)),
+  )
+  check(
+    'the old wording is gone from the context',
+    !derived.some((message) => message.content.some((block) => block.type === 'text' && block.text === 'the old wording')),
+  )
+  check(
+    'no turn was started by saving',
+    !fresh.snapshotEvents().slice(-3).some((event) => event.type === 'turn/start'),
+  )
+}
 
 const secondPlan = planRollback(secondEvents, secondFold.nodes, { seq: secondTargets[0].seq })
 const secondCarrier = buildCarrier(secondPlan, lastTurnOf(secondEvents), { carrier: 'system/message' })
