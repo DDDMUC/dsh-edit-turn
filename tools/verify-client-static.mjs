@@ -168,7 +168,6 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'pending',
   'replies',
   'repliesByMessage',
-  'rerun',
   'revision',
   'surfaceReady',
 ]
@@ -293,7 +292,7 @@ const routePrefix = /const ROUTE_PREFIX = '([^']+)'/.exec(clientSource)[1]
 check('the client talks to the host route prefix', hostSource.includes(`const ROUTE_PREFIX = '${routePrefix}'`), routePrefix)
 check('the client calls the state route', clientSource.includes('${ROUTE_PREFIX}/state'))
 check('the client calls the apply route', clientSource.includes('${ROUTE_PREFIX}/apply'))
-for (const field of ['sessionId', 'shadowed', 'applied', 'turns', 'replies', 'kind', 'hidden', 'config']) {
+for (const field of ['sessionId', 'shadowed', 'promptAccepted', 'turns', 'replies', 'kind', 'hidden', 'config']) {
   check(`the host returns "${field}"`, hostSource.includes(field))
 }
 
