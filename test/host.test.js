@@ -248,9 +248,11 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
     assert.equal(res.status, 200, res.payload)
     assert.equal(res.json.ok, true)
     assert.equal(res.json.kind, 'prompt')
-    assert.equal(res.json.promptAccepted, true)
+    assert.equal(res.json.applied, true)
+    assert.equal(res.json.reran, false)
     assert.equal(res.json.flushed, true)
-    assert.deepEqual(res.json.shadowed, [2, 3, 6, 7, 8])
+    // In place: only the edited message leaves the surface.
+    assert.deepEqual(res.json.shadowed, [2])
 
     // The log grew by exactly one event: the replacement, append-only.
     assert.equal(h.session.seq, before + 1)
@@ -279,12 +281,13 @@ test('the carrier lands with complete shadow coverage and a plugin source', asyn
   try {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
     const carrier = h.session.snapshotEvents().find((event) => event.seq === res.json.replacementSeq)
-    assert.equal(carrier.type, 'system/message')
-    assert.deepEqual(carrier.sourceEventSeqs, [2, 3, 6, 7, 8])
-    assert.deepEqual(carrier.surfaceOp, { op: 'replace', startSeq: 2, endSeq: 8 })
+    assert.equal(carrier.type, 'user/message')
+    assert.deepEqual(carrier.sourceEventSeqs, [2])
+    assert.deepEqual(carrier.surfaceOp, { op: 'replace', startSeq: 2, endSeq: 2 })
+    assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'revised' }], 'the carrier IS the revision')
     // v4 format: producer-owned kind, no plugin wrapper
-  assert.deepEqual(carrier.data.message.source, { kind: `plugin:${PLUGIN_ID}` })
-    assert.deepEqual(carrier.data.message.content, [])
+  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}`, editedBy: PLUGIN_ID })
+    assert.equal(carrier.data.content.length, 1, 'a rewritten prompt carrier carries text')
   } finally {
     await h.close()
   }
@@ -296,11 +299,12 @@ test('after the rollback the state hides the discarded rows', async () => {
     await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
     const res = await getState(h.port)
     assert.equal(res.status, 200)
-    assert.deepEqual(res.json.hidden.map((entry) => entry.seq), [2, 3, 6, 7, 8])
-    assert.deepEqual(res.json.hidden.map((entry) => entry.turn), [1, 1, 2, 2, 2])
+    assert.deepEqual(res.json.hidden.map((entry) => entry.seq), [2])
+    assert.deepEqual(res.json.hidden.map((entry) => entry.turn), [1])
     assert.deepEqual(res.json.surface, (await getState(h.port)).json.surface)
     assert.equal(res.json.edits, 1)
-    assert.deepEqual(res.json.turns, [])
+    // The revision stands where the old prompt did, and stays editable.
+    assert.deepEqual(res.json.turns.map((turn) => turn.text), ['revised'])
   } finally {
     await h.close()
   }
@@ -310,10 +314,10 @@ test('editing the LAST turn keeps every earlier turn editable', async () => {
   const h = await harness()
   try {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, turn: 2, text: 'revised second' })
-    assert.deepEqual(res.json.shadowed, [6, 7, 8])
+    assert.deepEqual(res.json.shadowed, [6])
     const state = await getState(h.port)
-    assert.deepEqual(state.json.hidden.map((entry) => entry.seq), [6, 7, 8])
-    assert.deepEqual(state.json.turns.map((turn) => turn.seq), [2])
+    assert.deepEqual(state.json.hidden.map((entry) => entry.seq), [6])
+    assert.deepEqual(state.json.turns.map((turn) => turn.text), ['original prompt', 'revised second'])
     assert.equal(state.json.turns[0].text, 'original prompt')
   } finally {
     await h.close()
@@ -326,8 +330,9 @@ test('the fallback user/message carrier is used when configured', async () => {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
     const carrier = h.session.snapshotEvents().find((event) => event.seq === res.json.replacementSeq)
     assert.equal(carrier.type, 'user/message')
-    assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
-    assert.equal(h.session.deriveMessages().length, 2)
+    assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'revised' }])
+    // System prompt + the revision + the reply and later turn it never touched.
+    assert.equal(h.session.deriveMessages().length, 6)
   } finally {
     await h.close()
   }
