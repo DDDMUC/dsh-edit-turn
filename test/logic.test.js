@@ -155,23 +155,23 @@ test('messageIdOf reads the durable id of each surface type', () => {
 
 // --- planning ---------------------------------------------------------------
 
-test('the rollback window opens at the prompt and ends at the last surface node', () => {
+test('a prompt is rewritten in place: the window is exactly that message', () => {
   const log = twoTurnLog()
   const { nodes } = foldSurface(log)
   const plan = planRollback(log, nodes, { seq: 2 })
   assert.equal(plan.startSeq, 2)
-  assert.equal(plan.endSeq, 8)
-  assert.deepEqual(plan.shadowed, [2, 3, 6, 7, 8])
+  assert.equal(plan.endSeq, 2)
+  assert.deepEqual(plan.shadowed, [2])
   assert.equal(plan.turn, 1)
   assert.equal(plan.original, '第一问')
 })
 
-test('a later prompt narrows the window to just its own turn', () => {
+test('a later prompt is rewritten in place too', () => {
   const log = twoTurnLog()
   const { nodes } = foldSurface(log)
   const plan = planRollback(log, nodes, { turn: 2 })
-  assert.deepEqual(plan.shadowed, [6, 7, 8])
-  assert.equal(plan.endSeq, 8)
+  assert.deepEqual(plan.shadowed, [6])
+  assert.equal(plan.endSeq, 6)
 })
 
 test('a target resolves by durable messageId too', () => {
@@ -180,13 +180,12 @@ test('a target resolves by durable messageId too', () => {
   assert.equal(planRollback(log, nodes, { messageId: 'u2' }).targetSeq, 6)
 })
 
-test('the window is always contiguous and ends on the tail', () => {
+test('the window is always exactly the edited prompt', () => {
   const log = twoTurnLog()
   const { nodes } = foldSurface(log)
   for (const seq of [2, 6]) {
     const plan = planRollback(log, nodes, { seq })
-    const startIdx = nodes.indexOf(plan.startSeq)
-    assert.deepEqual(plan.shadowed, nodes.slice(startIdx))
+    assert.deepEqual(plan.shadowed, [seq])
   }
 })
 
@@ -320,7 +319,10 @@ test('editableTurns drops a prompt an earlier rollback shadowed', () => {
       sourceEventSeqs: first.shadowed,
     }),
   )
-  assert.deepEqual(editableTurns(log, foldSurface(log).nodes), [])
+  // In place: the LATER prompt never left the surface, so it is still editable.
+  const remaining = editableTurns(log, foldSurface(log).nodes)
+  assert.equal(remaining.length, 1, 'the untouched later prompt stays editable')
+  assert.notEqual(remaining[0].seq, 2, 'the shadowed prompt is gone from the editable set')
 })
 
 // --- ledger -----------------------------------------------------------------
@@ -340,8 +342,8 @@ test('rollbackLedger records the shadowed seqs and their turns', () => {
     ),
   )
   const ledger = rollbackLedger(log)
-  assert.deepEqual(ledger.hidden.map((entry) => entry.seq), [2, 3, 6, 7, 8])
-  assert.deepEqual(ledger.hidden.map((entry) => entry.turn), [1, 1, 2, 2, 2])
+  assert.deepEqual(ledger.hidden.map((entry) => entry.seq), [2])
+  assert.deepEqual(ledger.hidden.map((entry) => entry.turn), [1])
   assert.equal(ledger.edits.length, 1)
   assert.equal(ledger.edits[0].replacementSeq, 12)
 })
@@ -376,7 +378,7 @@ test('the fallback carrier is a non-empty plugin-sourced user message', () => {
   const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'user/message', markerText: 'MARK' })
   assert.equal(carrier.type, 'user/message')
   assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
-  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}` })
+  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}`, editedBy: PLUGIN_ID })
   assert.equal(carrier.data.role, 'user')
 })
 

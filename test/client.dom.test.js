@@ -544,7 +544,7 @@ test('an unknown host code falls back instead of printing the raw key', async ()
 
 test('a rollback whose re-run did not start reaches the user', async () => {
   const { harness, controller, snapshot, row } = await readyController()
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], promptAccepted: false, promptError: 'inbox closed' }) })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], applied: false, applyError: 'the revised prompt was refused' }) })
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
   byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')

@@ -168,8 +168,9 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'pending',
   'replies',
   'repliesByMessage',
-  'revisions',
+  'rerun',
   'revision',
+  'revisions',
   'surfaceReady',
 ]
 const actualSnapshotKeys = Object.keys(snapshot).sort()
