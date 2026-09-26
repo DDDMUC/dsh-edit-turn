@@ -259,18 +259,17 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
 
     // The derived model context is exactly the surviving system prompt: the
     // default carrier is an empty dormant system node, so it adds no message.
+    // The whole point: the revision is in the context, in the old prompt's place,
+    // and the reply behind it was never touched.
     const derived = h.session.deriveMessages()
-    assert.equal(derived.length, 1)
+    assert.equal(derived.length, 6, 'nothing else left the context')
     assert.equal(derived[0].content[0].text, 'SYS')
-    assert.deepEqual(foldSurface(h.session.snapshotEvents()).nodes, [1, res.json.replacementSeq])
+    const revised = derived.findIndex((message) => message.content.some((block) => block.type === 'text' && block.text === 'revised prompt'))
+    assert.ok(revised > 0, 'the revised wording is in the context')
+    assert.ok(!derived.some((message) => message.content.some((block) => block.type === 'text' && block.text === 'original prompt')))
 
-    // Exactly one prompt was admitted, carrying the revised text.
-    assert.equal(h.prompts.length, 1)
-    assert.equal(h.prompts[0].sessionId, SESSION_ID)
-    assert.equal(h.prompts[0].mode, 'queue')
-    assert.deepEqual(h.prompts[0].content, [{ type: 'text', text: 'revised prompt' }])
-    assert.equal(typeof h.prompts[0].requestId, 'string')
-    assert.ok(h.prompts[0].requestId.length > 0)
+    // ...and no model call was made for it.
+    assert.deepEqual(h.prompts, [], 'saving does not start a turn')
   } finally {
     await h.close()
   }
@@ -303,8 +302,10 @@ test('after the rollback the state hides the discarded rows', async () => {
     assert.deepEqual(res.json.hidden.map((entry) => entry.turn), [1])
     assert.deepEqual(res.json.surface, (await getState(h.port)).json.surface)
     assert.equal(res.json.edits, 1)
-    // The revision stands where the old prompt did, and stays editable.
-    assert.deepEqual(res.json.turns.map((turn) => turn.text), ['revised'])
+    // The revision stands where the old prompt did, and stays editable; the later
+    // prompt was never touched, so it is offered too (listed by sequence, which is
+    // why the revision - the newer event - comes last).
+    assert.deepEqual([...res.json.turns.map((turn) => turn.text)].sort(), ['revised', 'second prompt'].sort())
   } finally {
     await h.close()
   }
@@ -362,7 +363,7 @@ test('a second edit of the same turn is refused as already rolled back', async (
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'again' })
     assert.equal(res.status, 409)
     assert.equal(res.json.code, 'already-rolled-back')
-    assert.equal(h.prompts.length, 1)
+    assert.deepEqual(h.prompts, [], 'no model call was made')
     assert.equal(h.session.seq, 11)
   } finally {
     await h.close()
@@ -554,9 +555,9 @@ test('a failed re-run is reported without pretending the rollback failed', async
   try {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
     assert.equal(res.status, 200)
-    assert.equal(res.json.promptAccepted, false)
-    assert.match(res.json.promptError, /inbox closed/)
-    assert.equal(session.deriveMessages().length, 1)
+    assert.equal(res.json.applied, true, 'the revision landed without touching the prompt path')
+    assert.equal(res.json.reran, false)
+    assert.equal(session.deriveMessages().length, 6)
   } finally {
     await h.close()
   }
