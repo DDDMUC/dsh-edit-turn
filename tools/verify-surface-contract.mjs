@@ -18,6 +18,7 @@
 //
 //   node tools/verify-surface-contract.mjs
 import { Session } from '@deepseek-ai/dsh-session'
+import { currentSessionMessageProjections } from '@deepseek-ai/dsh-session-format-catalog/message-projections'
 import {
   PLUGIN_ID,
   buildCarrier,
@@ -27,6 +28,7 @@ import {
   foldSurface,
   isBusy,
   lastTurnOf,
+  nextTurnOf,
   planRollback,
   rollbackLedger,
 } from '../lib/index.js'
@@ -61,16 +63,34 @@ function systemMessage(id) {
     id,
     role: 'system',
     content: [{ type: 'text', text: 'VERIFY SYSTEM PROMPT' }],
-    source: { kind: 'plugin', plugin: 'verify-bundle' },
+    // The read path admits only system-prompt sources on a system message.
+    source: { kind: 'system-prompt' },
   }
 }
 
 function toolResultMessage(id, callId) {
+  // Mirrors a real record from a loadable session: role tool, `toolCallId` on
+  // the message (not inside the content block), and the call id also on the
+  // source. The old shape here was accepted by appends and refused by readers.
   return {
     id,
-    role: 'user',
-    content: [{ type: 'tool-result', toolCallId: callId, content: [{ type: 'text', text: 'file body' }] }],
+    role: 'tool',
+    toolCallId: callId,
+    content: [{ type: 'text', text: 'file body' }],
     source: { kind: 'tool', callId },
+  }
+}
+
+/** The assistant message that advertises a tool call the result can pair with. */
+function toolCallMessage(id, text, callId, name, args) {
+  return {
+    id,
+    role: 'assistant',
+    content: [
+      { type: 'text', text },
+      { type: 'tool-call', id: callId, name, arguments: args },
+    ],
+    source: { kind: 'model', provider: 'verify', model: 'verify-model' },
   }
 }
 
@@ -87,6 +107,9 @@ function buildTwoTurnLog(session) {
   session.append('turn/start', { turn: 2 })
   session.append('step/start', { turn: 2, step: 1 })
   session.append('user/message', userMessage('m-u2', '第二轮提问'), { surfaceOp: 'append' })
+  // The tool call has to be advertised by an assistant message first, or the
+  // read path has no lifecycle for the result that follows.
+  session.append('assistant/message', { turn: 2, step: 1, message: toolCallMessage('m-a2-open', '', 'call-1', 'read_file', '{}'), stream: [] }, { surfaceOp: 'append' })
   session.append('tool/call', { turn: 2, step: 1, callId: 'call-1', name: 'read_file', arguments: '{}' })
   session.append('tool/result', { turn: 2, step: 1, message: toolResultMessage('m-t1', 'call-1') }, { surfaceOp: 'append' })
   session.append('assistant/message', { turn: 2, step: 1, message: modelMessage('m-a2', '第二轮回答'), stream: [] }, { surfaceOp: 'append' })
@@ -96,6 +119,21 @@ function buildTwoTurnLog(session) {
 
 function freshSession(label) {
   return Session.create(`session-00000000-0000-4000-8000-${label}`)
+}
+
+// The append path is lenient; the READ path is not. A session whose log does
+// not survive this call is unreadable in DSH - the plugin once wrote a carrier
+// that append accepted and every reader refused, which bricked the session for
+// good (SessionFormatError on load, no edit entries afterwards). Every write
+// sequence in this file is checked through the read path for exactly that
+// reason: this is the validator that bites users.
+function loadFailure(session) {
+  try {
+    Session.create('session-00000000-0000-4000-8000-reload', session.snapshotEvents(), undefined, undefined, currentSessionMessageProjections)
+    return null
+  } catch (error) {
+    return String((error && error.message) || error)
+  }
 }
 
 const texts = (messages) => messages.map((message) => message.content.map((block) => block.text ?? '').join(''))
@@ -108,9 +146,9 @@ const events = session.snapshotEvents()
 const fold = foldSurface(events)
 const derived = session.deriveMessages()
 
-check('log has 15 events', events.length === 15, `got ${events.length}`)
-check('surface has 6 nodes (system, u1, a1, u2, tool-result, a2)', fold.nodes.length === 6, `got ${fold.nodes.length}`)
-check('derived history has all 6 messages', derived.length === 6, `got ${derived.length}`)
+check('log has 16 events', events.length === 16, `got ${events.length}`)
+check('surface has 7 nodes (system, u1, a1, u2, a2-open, tool-result, a2)', fold.nodes.length === 7, `got ${fold.nodes.length}`)
+check('derived history has all 7 messages', derived.length === 7, `got ${derived.length}`)
 check('session is idle (no open turn)', isBusy(events) === false)
 
 // ---------------------------------------------------------------------------
@@ -153,8 +191,15 @@ const afterDerived = session.deriveMessages()
 const afterTexts = texts(afterDerived)
 
 check('the real validator ACCEPTED the replacement', typeof replacement.seq === 'number', `seq ${replacement.seq}`)
-check('the context kept its size (nothing else was dropped)', afterDerived.length === 6, `got ${afterDerived.length}`)
+check('the context kept its size (nothing else was dropped)', afterDerived.length === 7, `got ${afterDerived.length}`)
 check('surviving prefix is the system prompt', afterTexts[0] === 'VERIFY SYSTEM PROMPT', afterTexts[0])
+// The prompt write is only real if the log still LOADS: the append path is
+// lenient, the read path is what users hit.
+check(
+  'the prompt edit survives the read-path validator',
+  loadFailure(session) === null,
+  String(loadFailure(session)),
+)
 check('the model now reads the revised wording', afterTexts.includes(REVISED))
 check('the old wording is gone', !afterTexts.includes('第一轮提问'))
 check(
@@ -164,7 +209,7 @@ check(
 )
 check('the reply under the edited prompt SURVIVES', afterTexts.includes('第一轮回答'))
 check('the LATER turn survives untouched', afterTexts.includes('第二轮提问') && afterTexts.includes('第二轮回答'))
-check('the tool result survives with its call', afterDerived.some((m) => m.content.some((b) => b.type === 'tool-result')))
+check('the tool result survives with its call', afterDerived.some((m) => m.role === 'tool' && m.toolCallId === 'call-1'))
 
 // ---------------------------------------------------------------------------
 console.log('\n4. the log is append-only')
@@ -192,15 +237,22 @@ check(
 )
 
 // ---------------------------------------------------------------------------
-console.log('\n6. the default carrier: an EMPTY system/message acts as an invisible replacement')
+console.log('\n6. the default carrier: an EMPTY developer/message acts as an invisible replacement')
 const probe = freshSession('000000000002')
 buildTwoTurnLog(probe)
 const probeEvents = probe.snapshotEvents()
 const probeFold = foldSurface(probeEvents)
 const probePlan = planRollback(probeEvents, probeFold.nodes, { seq: editableTurns(probeEvents, probeFold.nodes)[0].seq })
 const probeCarrier = buildCarrier(probePlan, lastTurnOf(probeEvents), { carrier: 'system/message' })
-check('default carrier is an empty system/message', probeCarrier.type === 'system/message', probeCarrier.type)
+check('default carrier is an empty developer/message', probeCarrier.type === 'developer/message', probeCarrier.type)
 check('its content is empty', probeCarrier.data.message.content.length === 0)
+// Every replacement carries the marker, this one included: a sibling plugin that
+// recognises rewrites by `editedBy` must not have to special-case empty carriers.
+check(
+  'the silent carrier also says who wrote it',
+  probeCarrier.data.message.source.editedBy === PLUGIN_ID,
+  JSON.stringify(probeCarrier.data.message.source),
+)
 let silentOk = false
 try {
   probe.append(probeCarrier.type, probeCarrier.data, {
@@ -213,15 +265,20 @@ try {
   // projects to nothing, so 5 remain - and everything behind the edited message
   // is still there.
   silentOk = probeDerived.length === 5 && probeTexts[0] === 'VERIFY SYSTEM PROMPT'
-  check('the validator ACCEPTED the empty system/message carrier', true)
-  check('the empty carrier projects to NO model message', probeDerived.length === 5, `got ${probeDerived.length}`)
+  check('the validator ACCEPTED the empty developer/message carrier', true)
+  check('the empty carrier projects to NO model message', probeDerived.length === 6, `got ${probeDerived.length}`)
   check('the system prompt survives the rollback intact', probeTexts[0] === 'VERIFY SYSTEM PROMPT', probeTexts[0])
   check('the edited prompt is the only thing that left', !probeTexts.includes('第一轮提问'))
   check('the reply and the later turn survive the silent carrier too', probeTexts.includes('第一轮回答') && probeTexts.includes('第二轮回答'))
 } catch (error) {
-  check('the validator ACCEPTED the empty system/message carrier', false, String((error && error.message) || error))
+  check('the validator ACCEPTED the empty developer/message carrier', false, String((error && error.message) || error))
 }
 console.log(`  · verdict: ${silentOk ? 'the default carrier is model-invisible' : 'fall back to the user/message marker'}`)
+check(
+  'the silent carrier write survives the read-path validator',
+  loadFailure(probe) === null,
+  String(loadFailure(probe)),
+)
 
 console.log('\n7. the fallback carrier: a short user/message marker')
 const fallback = freshSession('000000000003')
@@ -238,26 +295,33 @@ fallback.append(fallbackCarrier.type, fallbackCarrier.data, {
   sourceEventSeqs: fallbackPlan.shadowed,
 })
 const fallbackTexts = texts(fallback.deriveMessages())
-check('the marker replaces the prompt, everything else stays', fallbackTexts.length === 6, `got ${fallbackTexts.length}`)
+check('the marker replaces the prompt, everything else stays', fallbackTexts.length === 7, `got ${fallbackTexts.length}`)
 check('the marker is the second message', fallbackTexts[1] === MARKER, fallbackTexts[1])
 check('the reply behind the edited prompt is untouched', fallbackTexts.includes('第一轮回答'))
 
 // ---------------------------------------------------------------------------
 console.log('\n8. a SECOND rollback of the revised prompt is accepted')
+// A prompt edit does NOT take `config.carrier` as given: applyEdit forces
+// `carrier: 'user/message'` with the revised text as the marker (lib/index.js,
+// `const carrier = buildCarrier(...)`), because the revision has to travel as
+// the replace-carrier or it would be lost from the model context - and an
+// appended user message would be answered. The empty `system/message` carrier
+// is therefore never produced for a prompt; building one here would test a path
+// production cannot take, and would silently drop the wording it is supposed to
+// keep.
+const promptCarrier = (plan, lastTurn, markerText) =>
+  buildCarrier(plan, lastTurn, { carrier: 'user/message', markerText })
+
 const twice = freshSession('000000000004')
 buildTwoTurnLog(twice)
 const firstEvents = twice.snapshotEvents()
 const firstFold = foldSurface(firstEvents)
 const firstPlan = planRollback(firstEvents, firstFold.nodes, { seq: editableTurns(firstEvents, firstFold.nodes)[0].seq })
-const firstCarrier = buildCarrier(firstPlan, lastTurnOf(firstEvents), { carrier: 'system/message' })
+const firstCarrier = promptCarrier(firstPlan, lastTurnOf(firstEvents), REVISED)
 twice.append(firstCarrier.type, firstCarrier.data, {
   surfaceOp: { op: 'replace', startSeq: firstPlan.startSeq, endSeq: firstPlan.endSeq },
   sourceEventSeqs: firstPlan.shadowed,
 })
-
-// What the host's re-run does: prompt admission appends the revised prompt, and
-// the turn it starts eventually closes.
-// The new flow has no re-run here: the surface already holds the revision.
 
 // A rewritten prompt stays editable (edit it again), and so does every later
 // turn: an in-place edit takes nothing else away.
@@ -271,8 +335,10 @@ check(
   JSON.stringify(secondTargets.map((entry) => entry.text)),
 )
 
+const REVISED_TWICE = '再次改后的第一轮提问'
 const secondPlan = planRollback(secondEvents, secondFold.nodes, { seq: secondTargets[0].seq })
-const secondCarrier = buildCarrier(secondPlan, lastTurnOf(secondEvents), { carrier: 'system/message' })
+check('the second window is the revised prompt itself', secondPlan.original === REVISED, secondPlan.original)
+const secondCarrier = promptCarrier(secondPlan, lastTurnOf(secondEvents), REVISED_TWICE)
 let secondFailure
 try {
   twice.append(secondCarrier.type, secondCarrier.data, {
@@ -286,7 +352,7 @@ check('the validator ACCEPTED a second edit of the same message', secondFailure 
 const afterSecond = texts(twice.deriveMessages())
 check(
   'the second edit removed only that message',
-  !afterSecond.some((text) => text.includes(REVISED)) && afterSecond.length === 5,
+  !afterSecond.includes(REVISED) && afterSecond.includes(REVISED_TWICE) && afterSecond.length === 7,
   JSON.stringify(afterSecond),
 )
 check(
@@ -295,12 +361,57 @@ check(
   JSON.stringify(afterSecond),
 )
 const thirdFold = foldSurface(twice.snapshotEvents())
+const thirdTargets = editableTurns(twice.snapshotEvents(), thirdFold.nodes)
 check(
   'the later turn is still editable after two edits',
-  editableTurns(twice.snapshotEvents(), thirdFold.nodes).map((entry) => entry.text).join('|') === '第二轮提问',
-  // Two in-place edits: the second one replaced the revision with a silent carrier,
-  // and the later turn is still there because nothing else was ever in the window.
-  JSON.stringify(editableTurns(twice.snapshotEvents(), thirdFold.nodes).map((entry) => entry.text)),
+  thirdTargets.length === 2 &&
+    thirdTargets.map((entry) => entry.text).join('|') === [REVISED_TWICE, '第二轮提问'].join('|'),
+  // Two in-place edits: each carrier replaced the wording before it, so the
+  // newest revision and the untouched later turn are what the host still offers.
+  JSON.stringify(thirdTargets.map((entry) => entry.text)),
+)
+
+// ---------------------------------------------------------------------------
+// The shape a sibling plugin is told it can rely on: a rewritten message keeps
+// its original transcript row, so an entry that validates by surface
+// (dsh-delete-turn's delete action) can only keep working if the rewrite lands
+// the way these checks pin. Break one and that action silently withdraws from
+// the row - nothing throws, the entry just stops resolving its target.
+console.log('\n8b. invariants a sibling plugin builds on')
+const firstTarget = editableTurns(firstEvents, firstFold.nodes)[0]
+const firstTargetEvent = firstEvents.find((event) => event.seq === firstTarget.seq)
+const landedCarrier = secondEvents.find(
+  (event) => event.data && event.data.id === firstCarrier.data.id,
+)
+check(
+  'a prompt rewrite keeps a single-node window on the message it replaces',
+  firstPlan.shadowed.length === 1 && firstPlan.shadowed[0] === firstTarget.seq,
+  JSON.stringify({ shadowed: firstPlan.shadowed, target: firstTarget.seq }),
+)
+check(
+  'the replacement event has the type of the message it replaces',
+  firstTargetEvent !== undefined && firstCarrier.type === firstTargetEvent.type && firstTargetEvent.type === 'user/message',
+  `${firstTargetEvent === undefined ? '?' : firstTargetEvent.type} -> ${firstCarrier.type}`,
+)
+check(
+  'the landed replacement lists the whole window it shadows',
+  landedCarrier !== undefined && JSON.stringify(landedCarrier.sourceEventSeqs) === JSON.stringify(firstPlan.shadowed),
+  JSON.stringify(landedCarrier === undefined ? null : landedCarrier.sourceEventSeqs),
+)
+check(
+  'the landed replacement carries the semantic marker',
+  landedCarrier !== undefined &&
+    landedCarrier.data.source.kind === `plugin:${PLUGIN_ID}` &&
+    landedCarrier.data.source.editedBy === PLUGIN_ID,
+  JSON.stringify(landedCarrier === undefined ? null : landedCarrier.data.source),
+)
+// Documented behaviour, not an accident: a consumer that finds human prompts by
+// `source.kind === 'user'` will classify the revision as plugin content. That is
+// deliberate - it is not a fresh human turn, and the platform must not answer it.
+check(
+  'a rewritten prompt is plugin content, not a fresh human turn',
+  landedCarrier !== undefined && landedCarrier.data.source.kind !== 'user',
+  JSON.stringify(landedCarrier === undefined ? null : landedCarrier.data.source.kind),
 )
 
 // ---------------------------------------------------------------------------
@@ -319,7 +430,13 @@ const replyPlan = planRollback(replyEvents, replyFold.nodes, { seq: replyTargets
 check('a reply is planned as a reply edit, not a re-run', replyPlan.mode === 'reply', replyPlan.mode)
 check('its window opens at the reply and ends on the last surface node',
   replyPlan.startSeq === replyPlan.shadowed[0] && replyPlan.endSeq === replyFold.nodes.at(-1))
-check('the correction inherits the original turn and step', replyPlan.turn === 1 && replyPlan.step === 1)
+check('the plan names the original turn and step', replyPlan.turn === 1 && replyPlan.step === 1)
+// The correction cannot reuse the original turn: by the time it is written that
+// turn is closed, and the read path refuses a step message outside an open turn
+// and step. It gets a turn of its own, which also advances the runtime's own
+// counter (it projects `lastTurn` from every turn/start it observes).
+const replyTurn = nextTurnOf(replyEvents)
+check('the correction gets the next turn in the log', replyTurn === 3, String(replyTurn))
 
 // The rule the whole design has to work around.
 let carrierRefusal = null
@@ -341,36 +458,39 @@ let carrierRefusal = null
 check('an assistant message is REFUSED as a replacement carrier',
   typeof carrierRefusal === 'string' && carrierRefusal.includes('sourceEventSeqs'), carrierRefusal)
 
-// What is accepted instead: roll back invisibly, then append the correction.
-const replyCarrier = buildCarrier(replyPlan, lastTurnOf(replyEvents), { carrier: 'system/message' })
+// What is accepted instead: open a turn, roll back invisibly, append the
+// correction inside it, close it.
+const replyCarrier = buildCarrier(replyPlan, replyTurn, { carrier: 'system/message' })
 let replyFailure = null
 try {
+  replySession.append('turn/start', { turn: replyTurn })
+  replySession.append('step/start', { turn: replyTurn, step: 1 })
   replySession.append(replyCarrier.type, replyCarrier.data, {
     surfaceOp: { op: 'replace', startSeq: replyPlan.startSeq, endSeq: replyPlan.endSeq },
     sourceEventSeqs: replyPlan.shadowed,
   })
-  const correction = buildCorrection(replyPlan, '改写后的回答')
+  const correction = buildCorrection(replyPlan, '改写后的回答', replyTurn, 1)
   replySession.append(correction.type, correction.data, { surfaceOp: 'append' })
-  // The host anchors a turn's tail - its duration and action strip - at the turn's
-  // LAST `turn/end`. A correction appended after the old one therefore lands
-  // outside the turn and the tail renders above the corrected text, so the turn is
-  // closed again behind it.
-  replySession.append('step/end', { turn: correction.data.turn, step: correction.data.step })
-  replySession.append('turn/end', { turn: correction.data.turn, reason: { kind: 'completed' } })
+  replySession.append('step/end', { turn: replyTurn, step: 1 })
+  replySession.append('turn/end', { turn: replyTurn, reason: { kind: 'completed' } })
 } catch (error) {
   replyFailure = String((error && error.message) || error)
 }
-check('rollback + appended correction is ACCEPTED', replyFailure === null, replyFailure)
+check('turn + rollback + appended correction is ACCEPTED', replyFailure === null, replyFailure)
 check(
-  'the turn is closed again behind the correction',
+  'the turn is closed behind the correction',
   replySession.snapshotEvents().slice(-3).map((event) => event.type).join(',') === 'assistant/message,step/end,turn/end',
   replySession.snapshotEvents().slice(-3).map((event) => event.type).join(','),
 )
 check(
-  'the closing event names the edited turn',
-  replySession.snapshotEvents().at(-1).data.turn === replyPlan.turn,
+  'the closing turn/end names the correction turn',
+  replySession.snapshotEvents().at(-1).data.turn === replyTurn,
   String(replySession.snapshotEvents().at(-1).data.turn),
 )
+// THE check this file was missing: the read path. Without it the suite blessed
+// a write that only the lenient append accepted.
+const replyLoadFailure = loadFailure(replySession)
+check('the reply edit survives the read-path validator', replyLoadFailure === null, String(replyLoadFailure))
 const afterReply = texts(replySession.deriveMessages())
 const rolesAfterReply = replySession.deriveMessages().map((message) => message.role)
 check('the model now sees the corrected text as its own reply',
@@ -380,14 +500,28 @@ check('the history stays strictly alternating', rolesAfterReply.join(',') === 's
 check('the tool result left together with the reply it belonged to',
   !replySession.deriveMessages().some((message) => (message.content || []).some((block) => block.type === 'tool-result')))
 // Found by its marker, not by position: the closing events now come after it.
+// The type is part of the search: the silent carrier of the rollback carries the
+// same marker, and this is about the correction that follows it.
 const appendedCorrection = replySession
   .snapshotEvents()
-  .find((event) => event.data && event.data.message && event.data.message.source && event.data.message.source.editedBy === PLUGIN_ID)
+  .find((event) => event.type === 'assistant/message' &&
+    event.data && event.data.message && event.data.message.source &&
+    event.data.message.source.editedBy === PLUGIN_ID)
 check('the correction can be found by its marker', appendedCorrection !== undefined)
+check('the silent carrier is an empty developer message', replyCarrier.type === 'developer/message' && replyCarrier.data.message.content.length === 0, replyCarrier.type)
 check('the correction is a model-kind reply, so it renders as one', appendedCorrection.data.message.source.kind === 'model')
 check('the correction records who wrote the text', appendedCorrection.data.message.source.editedBy === PLUGIN_ID)
 check('the correction carries a turn and a step, so reply nodes cannot collide',
-  appendedCorrection.data.turn === 1 && appendedCorrection.data.step === 1)
+  appendedCorrection.data.turn === replyTurn && appendedCorrection.data.step === 1)
+// A reply edit is a multi-node rollback plus an appended correction, never an
+// in-place swap: an assistant message may not carry `sourceEventSeqs`, and the
+// old reply row is meant to keep no entry - the new row carries it. Pinning
+// this so a future "keep the old row's actions" change cannot sneak in.
+check(
+  'the correction carries no sourceEventSeqs',
+  appendedCorrection.sourceEventSeqs === undefined,
+  JSON.stringify(appendedCorrection.sourceEventSeqs),
+)
 let continueFailure = null
 try {
   replySession.append('user/message', userMessage('m-next', '下一个问题'), { surfaceOp: 'append' })
@@ -396,6 +530,25 @@ try {
 }
 check('the conversation can continue from a corrected reply', continueFailure === null, continueFailure)
 check('the follow-up lands after the correction', texts(replySession.deriveMessages()).at(-1) === '下一个问题')
+// And a full turn after a reply edit opens the turn the format expects (the one
+// our edit consumed), which is what keeps the NEXT user message writable and
+// readable. This is the other half of what the old write got wrong.
+let nextTurnFailure = null
+try {
+  replySession.append('turn/start', { turn: replyTurn + 1 })
+  replySession.append('step/start', { turn: replyTurn + 1, step: 1 })
+  replySession.append('user/message', userMessage('m-later', '再下一个问题'), { surfaceOp: 'append' })
+  replySession.append('step/end', { turn: replyTurn + 1, step: 1 })
+  replySession.append('turn/end', { turn: replyTurn + 1, reason: { kind: 'completed' } })
+} catch (error) {
+  nextTurnFailure = String((error && error.message) || error)
+}
+check('the next real turn opens the expected number', nextTurnFailure === null, nextTurnFailure)
+check(
+  'the log still loads after the next real turn',
+  loadFailure(replySession) === null,
+  String(loadFailure(replySession)),
+)
 
 // ---------------------------------------------------------------------------
 console.log('\n10. guard rails')

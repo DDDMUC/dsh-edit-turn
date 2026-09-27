@@ -94,6 +94,18 @@ class StubElement {
     return index === -1 || index === siblings.length - 1 ? null : siblings[index + 1]
   }
 
+  /**
+   * The mirror of the above, for the bubble planted *before* a rewritten row:
+   * that is where it goes when the row has no action bar to keep alive, so
+   * displaying the row away cannot take the message with it.
+   */
+  get previousElementSibling() {
+    if (this.parentElement === null) return null
+    const siblings = this.parentElement.children
+    const index = siblings.indexOf(this)
+    return index <= 0 ? null : siblings[index - 1]
+  }
+
   /** Insert a sibling right after this node: how the revision bubble is planted. */
   after(sibling) {
     if (this.parentElement === null) return
@@ -135,8 +147,8 @@ class StubElement {
     this.listeners.set(type, list)
   }
 
-  fire(type) {
-    const event = { type, preventDefault() {}, stopPropagation() {} }
+  fire(type, extra = {}) {
+    const event = { type, preventDefault() {}, stopPropagation() {}, ...extra }
     // Both wiring styles are in use: `el.onclick = fn` on the injected actions,
     // `addEventListener` on the editor's textarea.
     const property = this[`on${type}`]
@@ -146,12 +158,26 @@ class StubElement {
   }
 
   getBoundingClientRect() {
-    return { height: 20 }
+    return { x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }
   }
 
-  focus() {}
+  get isConnected() {
+    let node = this
+    while (node !== null && node !== undefined) {
+      if (node === globalThis.document.body) return true
+      node = node.parentElement
+    }
+    return false
+  }
 
-  setSelectionRange() {}
+  focus() {
+    this.focusCalls = (this.focusCalls ?? 0) + 1
+  }
+
+  setSelectionRange(start, end) {
+    this.selectionStart = start
+    this.selectionEnd = end
+  }
 
   /** Supports the two selector forms the plugin uses on an element. */
   querySelector(selector) {
@@ -229,10 +255,25 @@ let bundleFactory = null
 /** Load the bundle and return the registered overlay component plus its deps. */
 async function loadBundle() {
   const rows = []
+  const documentListeners = new Map()
   const document = {
     body: new StubElement('body'),
     head: new StubElement('head'),
     createElement: (tag) => new StubElement(tag),
+    // The plugin watches document-level pointerdown to learn "the user pressed
+    // outside the editor"; tests fire it through `fireDocument`.
+    addEventListener(type, handler) {
+      const list = documentListeners.get(type) ?? []
+      list.push(handler)
+      documentListeners.set(type, list)
+    },
+    removeEventListener(type, handler) {
+      const list = documentListeners.get(type) ?? []
+      documentListeners.set(type, list.filter((item) => item !== handler))
+    },
+    fireDocument(type, event) {
+      for (const handler of documentListeners.get(type) ?? []) handler(event)
+    },
     querySelector: (selector) => (rows.length > 0 ? matches(rows[0], selector) ? rows[0] : null : null),
     querySelectorAll(selector) {
       const all = walk(document.body)
@@ -242,10 +283,20 @@ async function loadBundle() {
     },
   }
   globalThis.document = document
+  const windowListeners = new Map()
   globalThis.window = {
     __ModuleLoader__: { load: ({ factory }) => { bundleFactory = factory } },
     setTimeout: (fn) => setTimeout(fn, 0),
     clearTimeout: (id) => clearTimeout(id),
+    addEventListener(type, handler) {
+      const list = windowListeners.get(type) ?? []
+      list.push(handler)
+      windowListeners.set(type, list)
+    },
+    removeEventListener(type, handler) {
+      const list = windowListeners.get(type) ?? []
+      windowListeners.set(type, list.filter((item) => item !== handler))
+    },
   }
   globalThis.HTMLElement = StubElement
   globalThis.MutationObserver = class {
@@ -269,8 +320,19 @@ async function loadBundle() {
     },
   }
   const cleanups = []
-  const jsx = (type, props) => ({ type, props: props ?? {} })
-  const jsxs = (type, props) => ({ type, props: props ?? {} })
+  // The runtime the host ships reads `config.key` without a null check, so a
+  // `jsx(Type, null)` that a tolerant stub waved through threw in the browser,
+  // the slot boundary caught it and the entry was abdicated for the whole page -
+  // the pencil simply never appeared, with nothing in the console the user saw.
+  // Fail here instead, on the same call the runtime would have made.
+  const assertConfig = (type, props) => {
+    if (props === null || props === undefined) {
+      throw new TypeError(`Cannot read properties of ${props} (reading 'key')`)
+    }
+    return { type, props }
+  }
+  const jsx = assertConfig
+  const jsxs = assertConfig
   const requireStub = (id) => {
     if (id === 'react') return react
     if (id === 'react/jsx-runtime') return { jsx, jsxs, Fragment: 'Fragment' }
@@ -328,6 +390,53 @@ function mountRow(document, key = ROW_KEY) {
   return row
 }
 
+/**
+ * A user row shaped the way the platform actually ships one: a slot container,
+ * a layout row, the message stack and the action bar as siblings of it.
+ *
+ * The class names are CSS-module hashes exactly as the browser sees them, which
+ * is the point: the plugin may only rely on the stable `_actions` suffix, and a
+ * fixture built out of plugin class names would prove nothing about that. The
+ * idealised single-child row above cannot express "the message and the bar are
+ * separate branches", which is what hiding a row has to get right.
+ */
+function mountHostUserRow(document, key = ROW_KEY) {
+  const row = document.createElement('div')
+  row.dataset = {}
+  row.setAttribute('data-chat-flow-key', key)
+  row.setAttribute('data-chat-flow-kind', 'user')
+
+  const slot = document.createElement('div')
+  slot.setAttribute('data-slot', 'conversation.chat.node')
+
+  const layout = document.createElement('div')
+  layout.className = 'Sixlwa_userRow'
+
+  const stack = document.createElement('div')
+  stack.className = 'Sixlwa_userStack'
+  const bubble = document.createElement('div')
+  bubble.className = 'Sixlwa_bubble'
+  stack.appendChild(bubble)
+
+  const bar = document.createElement('div')
+  bar.className = 'xzv4MW_actions'
+  const time = document.createElement('span')
+  time.className = 'xzv4MW_timeStart'
+  time.textContent = '9月25日 19:19'
+  const copy = document.createElement('button')
+  copy.className = 'xzv4MW_action'
+  copy.setAttribute('aria-label', '复制')
+  bar.appendChild(time)
+  bar.appendChild(copy)
+
+  layout.appendChild(stack)
+  layout.appendChild(bar)
+  slot.appendChild(layout)
+  row.appendChild(slot)
+  document.body.appendChild(row)
+  return { row, stack, bubble, bar, time, copy }
+}
+
 const snapshotFor = (seq) => ({ nodes: new Map([[ROW_KEY, { kind: 'user', data: { seq }, anchorSeq: seq }]]) })
 
 /** Render the component the way the slot runtime does, then return the DOM. */
@@ -342,8 +451,27 @@ function render(harness, controller, snapshot) {
 }
 
 const byClass = (root, className) => walk(root).filter((node) => node._classes.has(className))
-const editorText = (row) => {
-  const box = row.querySelector('.dshet-editor')
+
+/**
+ * The bubble standing in for a rewritten prompt, wherever the plugin planted it.
+ *
+ * Normally it sits inside the row it replaced, ahead of the action bar; a row
+ * with no bar to keep is displayed away entirely, so the bubble is then parked
+ * before the row where hiding the row cannot take it.
+ */
+function revisionBubble(row) {
+  const inside = row.querySelector('.dshet-revision')
+  if (inside !== null) return inside
+  const previous = row.previousElementSibling
+  return previous !== null && previous.classList.contains('dshet-revision') ? previous : null
+}
+
+// The editor is hosted on a layer of its own (outside the message row, where
+// the host's re-renders cannot reach it), so tests look it up in the document.
+const editorIn = (harness) => harness.document.body.querySelector('.dshet-editor')
+
+const editorText = (harness) => {
+  const box = editorIn(harness)
   if (box === null) return null
   const buttons = byClass(box, 'dshet-btn')
   return { button: buttons[0] ? buttons[0].textContent : null, buttons: buttons.map((b) => b.textContent) }
@@ -391,11 +519,189 @@ test('clicking the action opens a prefilled in-place editor', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  assert.ok(row.querySelector('.dshet-editor'), 'the editor appears on the row')
-  assert.deepEqual(editorText(row).buttons, ['取消', '保存'])
-  const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
+  assert.ok(editorIn(harness), 'the editor appears on the row')
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'])
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(area.value, 'original', 'the original text is pre-filled')
   assert.equal(area.disabled, false)
+})
+
+test('a pointer press opens the pencil even if the host rebuilds the row under it', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const pencil = byClass(row, 'dshet-action')[0]
+  // The press is the action, not the click that follows it: when the host
+  // re-renders the row between mousedown and mouseup, the click never fires,
+  // and from outside the button simply "does nothing".
+  pencil.fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.ok(editorIn(harness), 'the editor appeared on the press')
+  // The pass re-ran above (as it does on every snapshot) but the button keeps
+  // its press guard, so the release-click on the same node must not open again
+  // and reset the draft.
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  area.value = 'already typing'
+  area.fire('input')
+  pencil.fire('click')
+  render(harness, controller, snapshot)
+  const again = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(again.value, 'already typing', 'the swallowed click did not re-open the editor')
+})
+
+test('Enter acts, Shift+Enter breaks the line, Escape leaves', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  area.value = 'typed instead'
+  area.fire('input')
+  area.fire('keydown', { key: 'Enter', shiftKey: true })
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'Shift+Enter writes a newline, it does not save')
+  // A composition in progress owns its Enter: committing Chinese/Japanese text
+  // must never count as saving. Two shapes arrive - the conventional
+  // `isComposing` one and the legacy `keyCode 229` one the platform also guards.
+  area.fire('keydown', { key: 'Enter', isComposing: true })
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'a composing Enter does not save')
+  area.fire('keydown', { key: 'Enter', keyCode: 229 })
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'the commit-Enter of an IME does not save either')
+
+  area.fire('keydown', { key: 'Enter' })
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '确认执行'], 'Enter advances like the save button')
+
+  const frozen = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  frozen.fire('keydown', { key: 'Escape' })
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'Escape steps back out of the confirmation')
+
+  const back = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  back.fire('keydown', { key: 'Escape' })
+  render(harness, controller, snapshot)
+  assert.equal(editorIn(harness), null, 'Escape again closes the editor')
+})
+
+test('the editor box grows with its text instead of leaving an empty half', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  // A real browser measures the content; the stub reports one from a set height.
+  area.scrollHeight = 120
+  area.fire('input')
+  assert.equal(area.style.height, '122px', 'the measured height is applied')
+})
+
+test('a rebuilt editor never steals focus from what the user is typing in', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  const first = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(first.focusCalls, 1, 'opening the editor focuses it')
+
+  // The user moves to the composer and the host re-renders the row: the box is
+  // rebuilt, and it must not pull the caret back out of the composer.
+  controller.editorFocus = false
+  controller.publish({ failure: 'generic' })
+  render(harness, controller, snapshot)
+  const second = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.notEqual(second, first, 'the host re-render rebuilt the box')
+  assert.equal(second.focusCalls ?? 0, 0, 'and the rebuild left the focus alone')
+})
+
+test('a rebuild mid-typing hands the focus back, at the caret', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  const first = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  controller.editorFocus = true
+  first.selectionStart = 1
+  first.selectionEnd = 1
+
+  controller.publish({ failure: 'generic' })
+  render(harness, controller, snapshot)
+  const second = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(second.focusCalls, 1, 'the user was typing here, so the rebuild refocuses')
+  assert.equal(second.selectionStart, 1, 'and the caret is where it was')
+})
+
+test('pressing the pencil again keeps what was typed', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const pencil = byClass(row, 'dshet-action')[0]
+  pencil.fire('pointerdown')
+  render(harness, controller, snapshot)
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  area.value = 'half-written'
+  area.fire('input')
+
+  pencil.fire('pointerdown')
+  render(harness, controller, snapshot)
+  const again = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
+})
+
+test('a host re-render of the row cannot take the editor with it', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  assert.ok(box, 'the editor is open')
+  assert.equal(box.parentElement.className, 'dshet-layer', 'it is hosted on its own layer')
+  assert.equal(row.querySelector('.dshet-editor'), null, 'and not inside the row the host owns')
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  area.value = 'half-written'
+  area.fire('input')
+  controller.editorFocus = true
+
+  // The host replaces the row's DOM wholesale - this used to wipe the editor
+  // mid-gesture, which is what killed drag selection, IME and clicks.
+  for (const child of [...row.children]) child.remove()
+  render(harness, controller, snapshot)
+
+  assert.equal(editorIn(harness), box, 'the same box is still there')
+  assert.equal(area.value, 'half-written', 'with everything that was typed')
+  assert.equal(area.focusCalls, 1, 'and it never had to be rebuilt')
+})
+
+test('a refused save gives the focus back to the rebuilt box', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.equal(walk(editorIn(harness)).find((n) => n.tagName === 'TEXTAREA').focusCalls, 1)
+
+  // In flight: the box is rebuilt disabled, so it cannot hold the focus.
+  controller.publish({ pending: true })
+  render(harness, controller, snapshot)
+  // The host refuses the save: rebuilt again, enabled - the caret belongs here.
+  controller.publish({ pending: false, failure: 'generic' })
+  render(harness, controller, snapshot)
+  const third = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(third.focusCalls, 1, 'the rebuild after a refused save takes the focus back')
+})
+
+test('pressing outside the editor releases the caret', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  // The user presses somewhere else (the composer, a rename field, anywhere).
+  harness.document.fireDocument('pointerdown', { target: harness.document.body })
+  controller.publish({ failure: 'generic' })
+  render(harness, controller, snapshot)
+  const next = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(next.focusCalls ?? 0, 0, 'the rebuild leaves the focus where the user put it')
+})
+
+test('the save button acts on the press, not only on a completed click', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  const submit = byClass(editorIn(harness), 'dshet-btn-primary')[0]
+  submit.fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '确认执行'], 'the press advanced to the confirmation step')
 })
 
 test('the opt-in confirmation step advances instead of doing nothing', async () => {
@@ -403,14 +709,14 @@ test('the opt-in confirmation step advances instead of doing nothing', async () 
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
 
-  const submit = byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0]
+  const submit = byClass(editorIn(harness), 'dshet-btn-primary')[0]
   assert.equal(submit.textContent, '保存')
   submit.fire('click')
   render(harness, controller, snapshot)
 
   // This is the regression: the editor must be rebuilt for the new state.
-  assert.deepEqual(editorText(row).buttons, ['取消', '确认执行'])
-  const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
+  assert.deepEqual(editorText(harness).buttons, ['取消', '确认执行'])
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(area.disabled, true, 'the draft is frozen during confirmation')
 })
 
@@ -424,21 +730,24 @@ test('the confirmation click posts the revised text and closes on success', asyn
 
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click') // 确认回退
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click') // 确认回退
   await new Promise((resolve) => setTimeout(resolve, 0))
   render(harness, controller, snapshot)
 
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].url, '/dsh-edit-turn/apply')
-  assert.equal(calls[0].init.method, 'POST')
-  const body = JSON.parse(calls[0].init.body)
+  const applies = calls.filter((call) => call.url.includes('/apply'))
+  const states = calls.filter((call) => call.url.includes('/state'))
+  assert.equal(applies.length, 1, 'one save')
+  assert.equal(states.length >= 1, true, 'and the save re-reads the host state')
+  assert.equal(applies[0].url, '/dsh-edit-turn/apply')
+  assert.equal(applies[0].init.method, 'POST')
+  const body = JSON.parse(applies[0].init.body)
   assert.equal(body.sessionId, SESSION_ID)
   assert.equal(body.seq, 2)
   assert.equal(body.messageId, 'm-u1')
   assert.equal(body.text, 'original')
-  assert.equal(row.querySelector('.dshet-editor'), null, 'the editor closes on success')
+  assert.equal(editorIn(harness), null, 'the editor closes on success')
   assert.equal(controller.getSnapshot().pending, false)
 })
 
@@ -457,10 +766,10 @@ test('a revised draft is what gets posted', async () => {
 
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
   area.value = 'revised text'
   area.fire('input')
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   await new Promise((resolve) => setTimeout(resolve, 0))
   render(harness, controller, snapshot)
 
@@ -481,7 +790,7 @@ test('one click applies directly on the default configuration', async () => {
   await controller.load(true)
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   await new Promise((resolve) => setTimeout(resolve, 0))
   assert.equal(bodies.length, 1, 'no confirmation step was configured')
 })
@@ -495,14 +804,14 @@ test('an empty draft is refused with a message, not silently', async () => {
   }
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  const area = walk(row.querySelector('.dshet-editor')).find((node) => node.tagName === 'TEXTAREA')
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
   area.value = '   '
   area.fire('input')
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   render(harness, controller, snapshot)
 
   assert.equal(posted, 0, 'nothing is posted')
-  const errors = byClass(row.querySelector('.dshet-editor'), 'dshet-error')
+  const errors = byClass(editorIn(harness), 'dshet-error')
   assert.equal(errors.length, 1)
   assert.equal(errors[0].textContent, '改写后的内容不能为空。')
 })
@@ -512,16 +821,16 @@ test('a host failure is shown in the editor and the button recovers', async () =
   globalThis.fetch = async () => ({ ok: false, status: 409, json: async () => ({ ok: false, code: 'busy', error: 'the session is still working' }) })
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   await new Promise((resolve) => setTimeout(resolve, 0))
   render(harness, controller, snapshot)
 
-  const errors = byClass(row.querySelector('.dshet-editor'), 'dshet-error')
+  const errors = byClass(editorIn(harness), 'dshet-error')
   assert.equal(errors.length, 1)
   assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。')
-  const submit = byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0]
+  const submit = byClass(editorIn(harness), 'dshet-btn-primary')[0]
   assert.equal(submit.disabled, false, 'the user can retry')
   assert.equal(controller.getSnapshot().pending, false)
 })
@@ -531,13 +840,13 @@ test('an unknown host code falls back instead of printing the raw key', async ()
   globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({ ok: false, code: 'something-new' }) })
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   await new Promise((resolve) => setTimeout(resolve, 0))
   render(harness, controller, snapshot)
 
-  const errors = byClass(row.querySelector('.dshet-editor'), 'dshet-error')
+  const errors = byClass(editorIn(harness), 'dshet-error')
   assert.equal(errors[0].textContent, '编辑失败，请重试。')
   assert.ok(!errors[0].textContent.includes('error.'))
 })
@@ -547,9 +856,9 @@ test('a rollback whose re-run did not start reaches the user', async () => {
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, shadowed: [2], applied: false, applyError: 'the revised prompt was refused' }) })
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn-primary')[0].fire('click')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
   await new Promise((resolve) => setTimeout(resolve, 0))
 
   const tree = harness.component({ useChat: () => snapshot, useEditTurn: () => controller.getSnapshot(), controller, t: harness.t })
@@ -558,7 +867,7 @@ test('a rollback whose re-run did not start reaches the user', async () => {
   const snapshotNow = controller.getSnapshot()
   assert.equal(snapshotNow.notice, 'prompt')
   assert.equal(snapshotNow.editing, null)
-  assert.equal(row.querySelector('.dshet-editor'), null)
+  assert.equal(editorIn(harness), null)
 })
 
 test('a prompt created by a re-run becomes editable without a page reload', async () => {
@@ -649,6 +958,8 @@ test('the reply entry draws a pencil only for an editable reply', async () => {
   const button = entry.component({ ...props, messageId: 'm-a1', useEditTurn, t: harness.t })
   assert.equal(button.type, 'button')
   assert.match(button.props.className, /dshet-action/)
+  assert.match(button.props.className, /dshet-reply-action/,
+    'the class whose flex order pulls the pencil ahead of the copy button')
   assert.equal(button.props['aria-label'], '编辑这条回答')
 
   button.props.onClick({ preventDefault() {}, stopPropagation() {} })
@@ -677,11 +988,12 @@ test('the editor still anchors under the reply, not under its action strip', asy
   controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 })
   render(harness, controller, snapshot)
 
-  const box = row.querySelector('.dshet-editor')
+  const box = editorIn(harness)
   assert.ok(box, 'the editor appears in the row holding the reply text')
-  assert.deepEqual(byClass(box, 'dshet-editor-title').map((node) => node.textContent), ['编辑这条回答'])
-  assert.equal(walk(box).find((node) => node.tagName === 'TEXTAREA').value, 'the original answer')
-  assert.deepEqual(editorText(row).buttons, ['取消', '保存替换'])
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.getAttribute('aria-label'), '编辑这条回答', 'the box names itself for assistive tech')
+  assert.equal(area.value, 'the original answer')
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'])
 })
 
 test('a reply that carries tool calls warns before being replaced', async () => {
@@ -703,7 +1015,7 @@ test('a reply that carries tool calls warns before being replaced', async () => 
   await controller.load(true)
   controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: '我来查一下', attachments: 1 })
   render(harness, controller, snapshot)
-  assert.match(byClass(row.querySelector('.dshet-editor'), 'dshet-warn')[0].textContent, /工具调用或思考过程/)
+  assert.match(byClass(editorIn(harness), 'dshet-warn')[0].textContent, /工具调用或思考过程/)
 })
 
 test('a row the host does not report as editable gets no action', async () => {
@@ -761,9 +1073,292 @@ test('cancel closes the editor without posting', async () => {
   }
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
-  byClass(row.querySelector('.dshet-editor'), 'dshet-btn')[0].fire('click') // 取消
+  byClass(editorIn(harness), 'dshet-btn')[0].fire('click') // 取消
   render(harness, controller, snapshot)
-  assert.equal(row.querySelector('.dshet-editor'), null)
+  assert.equal(editorIn(harness), null)
   assert.equal(controller.getSnapshot().editing, null)
   assert.equal(posted, 0)
+})
+
+// --- what the platform's own row looks like ----------------------------------
+
+/** The /state a rolled-back prompt answers with: seq 2 hidden, seq 7 in its place. */
+const revisedState = () => ({
+  ok: true,
+  hidden: [{ seq: 2, turn: 1, replacement: 7 }],
+  turns: [{ seq: 7, turn: 1, messageId: 'm-u1', text: 'revised prompt', attachments: 0 }],
+  replies: [],
+  config: { confirm: false },
+})
+
+const plainState = () => ({
+  ok: true,
+  hidden: [],
+  turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'original', attachments: 0 }],
+  replies: [],
+  config: { confirm: false },
+})
+
+test('the pencil joins the platform action bar and leaves its buttons alone', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-host')
+  const snapshot = { nodes: new Map([['row-host', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.bar.children.length, 3, 'time, copy, pencil - nothing displaced')
+  assert.equal(host.time.parentElement, host.bar, 'the timestamp stays in the bar')
+  assert.equal(host.copy.parentElement, host.bar, 'the copy button stays in the bar')
+  assert.equal(host.bar.children[2].className, 'dshet-action-host', 'the pencil sits after the last platform action')
+  assert.ok(byClass(host.bar, 'dshet-action').length === 1, 'and it is inside the bar, not floating over the row')
+  assert.equal(host.row._classes.has('dshet-row'), false, 'no floating overlay fallback was used')
+})
+
+test('a rolled-back row loses its message but keeps its action bar', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-revised')
+  const snapshot = { nodes: new Map([['row-revised', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.row.dataset.dshetHidden, '1', 'the original row is marked hidden')
+  assert.equal(host.row.dataset.dshetKeepActions, '1', 'and told the stylesheet its bar survives')
+  assert.notEqual(host.row.style.display, 'none', 'the row itself is not displayed away')
+  assert.equal(host.stack.style.display, 'none', 'the superseded message is gone')
+  assert.notEqual(host.bar.style.display, 'none', 'time / copy / delete stay reachable')
+  assert.equal(host.copy.parentElement, host.bar, 'the platform buttons never move')
+
+  // The rewrite goes back: the row has to come back with it. Let the refresh the
+  // first render asked for finish first, or `load` short-circuits onto it.
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'the marker is cleared')
+  assert.equal(host.stack.style.display, '', 'the message is shown again')
+  assert.equal(byClass(harness.document.body, 'dshet-revision').length, 0,
+    'the revision bubble is gone with it')
+})
+
+// The collapsed row keeps its bar, so the rewrite stays editable from exactly
+// where the user reads "this message's actions": after the clock and the copy
+// button. Parking the pencil inside the bubble instead hid it behind a hover
+// and put an action on top of the message text.
+test('the revision pencil joins the bar that survived, at its right end', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-gutter')
+  const snapshot = { nodes: new Map([['row-gutter', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  const bubble = revisionBubble(host.row)
+  assert.ok(bubble, 'the rewritten prompt renders in its own bubble')
+  assert.equal(bubble.textContent, 'revised prompt', 'the text is intact')
+  assert.equal(byClass(bubble, 'dshet-floating').length, 0,
+    'no floating overlay inside the bubble - that is what covered the text')
+  assert.equal(byClass(bubble, 'dshet-action').length, 0, 'the bubble carries the text, not the action')
+  assert.equal(bubble._classes.has('dshet-revision-action'), false, 'so it reserves no gutter')
+
+  assert.equal(host.bar.children.length, 3, 'time, copy, pencil')
+  assert.equal(host.time.parentElement, host.bar, 'the timestamp stays where it was')
+  assert.equal(host.copy.parentElement, host.bar, 'and so does the copy button')
+  assert.equal(host.bar.children[2].className, 'dshet-action-host', 'the pencil sits after them, at the right end')
+  assert.equal(byClass(host.bar, 'dshet-action').length, 1, 'one pencil, and it is in the bar')
+
+  // Order, as the platform draws a message: text above, time and copy below it.
+  // Planting the bubble after the row put the bar on top of the message, which
+  // read as though the timestamp belonged to the next line.
+  assert.equal(bubble.parentElement, host.row, 'the rewritten prompt stands inside the row it replaced')
+  assert.equal(host.row.children[0], bubble, 'and ahead of the bar, not under it')
+  assert.equal(bubble.dataset.dshetCollapsed, undefined, 'the collapse did not collapse the bubble itself')
+  assert.notEqual(host.bar.style.display, 'none', 'while the bar it sits above still shows')
+})
+
+// The row is displayed away entirely when it has no action bar to keep, so a
+// bubble planted inside it would go with it - the same hole the collapse fix
+// closed for the bar, one layer down. The bubble then stands before the row.
+test('a row with no bar to keep still shows the rewritten prompt', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = harness.document.createElement('div')
+  row.dataset = {}
+  row.setAttribute('data-chat-flow-key', 'row-nobar')
+  row.setAttribute('data-chat-flow-kind', 'user')
+  const slot = harness.document.createElement('div')
+  const stack = harness.document.createElement('div')
+  stack.className = 'Sixlwa_userStack'
+  slot.appendChild(stack)
+  row.appendChild(slot)
+  harness.document.body.appendChild(row)
+
+  const snapshot = { nodes: new Map([['row-nobar', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(row.style.display, 'none', 'with no bar to keep, the whole row goes away')
+  const bubble = revisionBubble(row)
+  assert.ok(bubble, 'the rewritten prompt is still there, outside the row')
+  assert.equal(bubble.textContent, 'revised prompt')
+  assert.equal(bubble.dataset.dshetCollapsed, undefined, 'and hiding the row did not take it')
+  assert.equal(bubble.parentElement, harness.document.body, 'it is planted before the row')
+  assert.equal(bubble.nextElementSibling, row, 'so it stays on screen above where the row was')
+  // No bar to join, so the pencil falls back to the bubble's own gutter - the
+  // one place left where it can sit without covering the text.
+  assert.equal(byClass(bubble, 'dshet-action').length, 1, 'the rewrite is still editable')
+  assert.equal(bubble._classes.has('dshet-revision-action'), true, 'and the bubble reserves its gutter')
+})
+
+/** Open the pencil on `host`, type `text` and save it in one click. */
+async function editAndSave(harness, controller, host, snapshot, text) {
+  byClass(host.row, 'dshet-action')[0].fire('click')
+  render(harness, controller, snapshot)
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  area.value = text
+  area.fire('input')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+}
+
+// Saving has to leave the rewritten text on screen in the same pass that takes
+// the old one down. It did not: the optimistic view recorded the rollback but
+// never the message standing in for it, so the row collapsed with nothing to
+// show - the transcript simply lost the message the user had just edited.
+test('a save shows the rewritten prompt at once, before the host answers', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-immediate')
+  const snapshot = { nodes: new Map([['row-immediate', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  let stateCalls = 0
+  let posted = null
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/apply')) {
+      posted = JSON.parse(init.body)
+      return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'prompt', replacementSeq: 7, shadowed: [2], applied: true }) }
+    }
+    stateCalls += 1
+    // The refresh the save asks for never comes back inside this test: the
+    // message has to be readable on the strength of the save response alone.
+    if (stateCalls > 1) return new Promise(() => {})
+    return { ok: true, status: 200, json: async () => plainState() }
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  await editAndSave(harness, controller, host, snapshot, 'revised text')
+
+  assert.equal(posted.text, 'revised text', 'the draft was posted')
+  assert.equal(host.stack.style.display, 'none', 'the superseded message is gone')
+  const bubble = revisionBubble(host.row)
+  assert.ok(bubble, 'the rewritten prompt stands in for it')
+  assert.equal(bubble.textContent, 'revised text', 'with the text that was saved')
+  assert.equal(bubble.parentElement, host.row, 'inside the row, so the bar does not sit on top of it')
+  assert.equal(host.row.children[0], bubble, 'above the time and the copy, in reading order')
+  assert.notEqual(host.bar.style.display, 'none', 'the platform buttons stay')
+  assert.equal(host.copy.parentElement, host.bar, 'and they are still in the bar')
+})
+
+test('a save re-reads the state it just changed', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-refresh')
+  const snapshot = { nodes: new Map([['row-refresh', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const asked = []
+  globalThis.fetch = async (url) => {
+    const isState = String(url).includes('/state')
+    if (isState) asked.push(String(url))
+    return {
+      ok: true,
+      status: 200,
+      json: async () => (isState ? plainState() : { ok: true, kind: 'prompt', replacementSeq: 7, shadowed: [2], applied: true }),
+    }
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  const before = asked.length
+
+  await editAndSave(harness, controller, host, snapshot, 'revised text')
+
+  assert.equal(asked.length, before + 1,
+    'only the host knows how many rows the platform drew for the new text')
+})
+
+// A rollback and the carrier that stands in for it are two events, and a view
+// can hold one without the other. Hiding the row in that window is what turned
+// the defect into a message the user could not read at all.
+test('a replacement that has not arrived yet leaves the message on screen', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-lagging')
+  const snapshot = { nodes: new Map([['row-lagging', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [{ seq: 2, turn: 1, replacement: 7 }],
+      turns: [],
+      replies: [],
+      config: { confirm: false },
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'the row is not marked as collapsed')
+  assert.notEqual(host.stack.style.display, 'none', 'the message stays readable')
+  assert.equal(byClass(harness.document.body, 'dshet-revision').length, 0,
+    'nothing stands in for it yet')
+})
+
+test('the reply entry cannot take the assistant-actions strip down with it', async () => {
+  const harness = await loadBundle()
+  const entry = harness.registrations.find((item) => item.definition.name === 'conversation.chat.assistant-actions')
+  assert.ok(entry, 'an assistant-actions entry is registered')
+  const t = harness.t
+
+  // Every way the runtime could under-supply the component. An entry that
+  // throws is retired for the life of the page - the cell renders an empty
+  // placeholder and the pencil never comes back - so none of these may throw.
+  const cases = [
+    undefined,
+    null,
+    {},
+    { messageId: 'm-a1' },
+    { messageId: 'm-a1', controller: {} },
+    { messageId: 'm-a1', controller: null, t },
+    { messageId: 'm-a1', controller: { getSnapshot: () => null }, t },
+    { messageId: 'm-a1', controller: { getSnapshot: () => ({}) }, t },
+    { messageId: 'm-a1', controller: { getSnapshot: () => ({ repliesByMessage: new Map() }) }, t },
+    { messageId: 'm-a1', controller: { getSnapshot: () => ({ repliesByMessage: null, hidden: new Map() }) }, t },
+    { messageId: 'm-a1', controller: { getSnapshot: () => { throw new Error('boom') } }, t },
+  ]
+  for (const props of cases) {
+    assert.equal(entry.component(props), null, `renders nothing instead of throwing: ${JSON.stringify(props)}`)
+  }
+
+  // And the happy path still draws the pencil - with a config object, because
+  // this runtime reads `config.key` without a null check.
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [],
+      turns: [],
+      replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }],
+      config: { confirm: false },
+    }),
+  })
+  await harness.controller.load(true)
+  const button = entry.component({ ...entry.definition.inject(SESSION_ID), messageId: 'm-a1', t })
+  assert.equal(button.type, 'button')
+  assert.equal(typeof button.props.children.type, 'function', 'the icon is rendered with a config object, not null')
 })

@@ -57,11 +57,37 @@ fi
 LOG_DIR="$(mktemp -d)"
 mkdir -p "$HOME_DIR" || fail "无法创建沙箱 DSH_HOME: $HOME_DIR"
 
-cleanup() {
-  if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
+# Stop the sandbox and PROVE it stopped.
+#
+# `dsh web` can fork its listener out from under $!: the pid we started takes
+# the SIGTERM and `wait` returns immediately, while the process holding the
+# socket was re-parented to init and keeps answering for hours. Killing $! and
+# printing "stopped" then reports something that is not true - the next run
+# would hit a busy port, and anyone opening that port would find an empty
+# throwaway DSH and think their sessions were gone.
+#
+# So: kill by pid, then check OUR port, and kill whoever still holds it - still
+# by pid, never by pattern, and only ever on the port this script picked.
+stop_sandbox() {
+  if [ -n "${PID:-}" ]; then
     kill "$PID" 2>/dev/null
     wait "$PID" 2>/dev/null
+    PID=""
   fi
+  [ -n "${PORT:-}" ] || return 0
+  local holder tries=0
+  holder="$(lsof -nP -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  while [ -n "$holder" ] && [ "$tries" -lt 5 ]; do
+    for pid in $holder; do kill "$pid" 2>/dev/null; done
+    sleep 1
+    tries=$((tries + 1))
+    holder="$(lsof -nP -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  done
+  for pid in $holder; do kill -KILL "$pid" 2>/dev/null; done
+}
+
+cleanup() {
+  stop_sandbox
   rm -rf "$LOG_DIR"
   if [ "${KEEP:-0}" = "1" ]; then
     echo "沙箱保留在 $HOME_DIR"
@@ -187,10 +213,11 @@ ok "宿主半部已挂载并走通自己的会话查询与守卫"
 
 # --- 6. teardown ------------------------------------------------------------
 step "6/6 清理"
-kill "$PID" 2>/dev/null
-wait "$PID" 2>/dev/null
-PID=""
-ok "沙箱实例已停止（只按 pid，未使用任何宽泛匹配）"
+stop_sandbox
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  fail "端口 $PORT 上仍有监听进程（已按 pid 收尾仍未退出）"
+fi
+ok "沙箱实例已停止（按 pid 收尾 + 端口 $PORT 已无监听；未使用任何宽泛匹配）"
 
 echo
 echo "插件已在真实 DSH profile 中通过加载与路由验证。"
