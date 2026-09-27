@@ -362,13 +362,21 @@ test('rollbackLedger ignores a replacement another producer landed', () => {
 
 // --- carrier ----------------------------------------------------------------
 
-test('the default carrier is an empty dormant system message', () => {
+test('the default carrier is an empty dormant developer message', () => {
   const log = twoTurnLog()
   const plan = planRollback(log, foldSurface(log).nodes, { seq: 2 })
   const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'system/message' })
-  assert.equal(carrier.type, 'system/message')
+  // Not a system/message: the format admits only system-prompt sources there,
+  // and an empty plugin-owned system node makes every session that contains one
+  // unreadable (SessionFormatError on load, after an accepted append).
+  assert.equal(carrier.type, 'developer/message')
+  assert.equal(carrier.data.message.role, 'developer')
   assert.deepEqual(carrier.data.message.content, [])
   assert.equal(carrier.data.message.source.kind, `plugin:${PLUGIN_ID}`)
+  // Every replacement this plugin lands says who wrote it; a sibling plugin
+  // that recognises replacements by `editedBy` must find this one too, even
+  // when it carries no text at all.
+  assert.equal(carrier.data.message.source.editedBy, PLUGIN_ID)
   assert.equal(carrier.data.turn, 2)
 })
 
@@ -387,10 +395,13 @@ test('the fallback carrier is a non-empty plugin-sourced user message', () => {
 test('the correction is an assistant message the model will treat as its own', () => {
   const log = twoTurnLog()
   const plan = planRollback(log, foldSurface(log).nodes, { seq: 3 })
-  const correction = buildCorrection(plan, '改写后的回答')
+  const correction = buildCorrection(plan, '改写后的回答', 3, 1)
   assert.equal(correction.type, 'assistant/message')
-  assert.equal(correction.data.turn, plan.turn)
-  assert.equal(correction.data.step, plan.step)
+  // The correction lands in the freshly opened turn, not in the original one:
+  // by the time it is written, the original turn is closed, and the read path
+  // refuses a step message outside an open turn and step.
+  assert.equal(correction.data.turn, 3)
+  assert.equal(correction.data.step, 1)
   assert.equal(correction.data.message.role, 'assistant')
   assert.deepEqual(correction.data.message.content, [{ type: 'text', text: '改写后的回答' }])
   assert.equal(typeof correction.data.message.id, 'string')

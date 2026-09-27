@@ -1,6 +1,6 @@
 {
   "name": "dsh-edit-turn",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "Edit any user turn in DeepSeek Harness and re-run it: an inline editor on the message row rolls the conversation back to just before that turn through the official surface-replace contract, then re-prompts the agent with the revised text. The append-only session log is never rewritten.",
   "type": "module",
   "main": "lib/index.js",
@@ -40,7 +40,8 @@
     "verify:live": "node tools/verify-live-client.mjs",
     "verify:profile": "bash tools/verify-dsh-plugin.sh",
     "probe:loaded": "node tools/probe-loaded.mjs",
-    "check": "npm run test && npm run verify:contract && npm run verify:client"
+    "check": "npm run test && npm run verify:contract && npm run verify:client",
+    "verify:ui": "node tools/verify-live-ui.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"

@@ -238,7 +238,6 @@ const REQUIRED_CLASSES = [
   'dshet-floating',
   'dshet-collapsing',
   'dshet-editor',
-  'dshet-editor-title',
   'dshet-note',
   'dshet-warn',
   'dshet-error',
@@ -257,6 +256,187 @@ const hiddenSelector = '[data-dshet-hidden="1"]'
 check('the row-hiding selector is present', css.includes(hiddenSelector))
 check('the code sets the matching data attribute', clientSource.includes('dshetHidden'))
 
+// A rolled-back row gives up its message, not its action bar: the platform's
+// time / copy / delete buttons live in the same row, and displaying the row
+// away took them with it. These two rules are what keep them, and neither can
+// be seen by the DOM tests (they assert markers, not layout).
+console.log('\n  — a hidden row keeps its action bar —')
+check(
+  'the stylesheet exempts rows that keep their bar',
+  css.includes('[data-dshet-hidden="1"]:not([data-dshet-keep-actions])'),
+  'the exemption is what stops the bar going away with the message',
+)
+check('the code marks the rows that keep their bar', clientSource.includes('dshetKeepActions'))
+console.log('\n  — the fallback gutter keeps the pencil off the text —')
+check(
+  'the code reserves the gutter on the revision bubble',
+  clientSource.includes('dshet-revision-action') && css.includes('.dshet-revision.dshet-revision-action'),
+)
+const revisionHost = /\.dshet-revision \.dshet-action-host\{[^}]*\}/.exec(css)?.[0] ?? ''
+check('the revision action is pinned in that gutter', revisionHost.includes('inset-inline-end') && revisionHost.includes('top:6px'), revisionHost)
+check(
+  'the revision action is not centred over the bubble text',
+  !revisionHost.includes('top:50%'),
+  revisionHost,
+)
+// The bubble used to sit in a flex column, where `align-self` shrank it to its
+// text; inside the row it is a block-level child, and without this it stretched
+// into a pill as wide as the transcript.
+const revisionRule = /\.dshet-revision\{[^}]*\}/.exec(css)?.[0] ?? ''
+check(
+  'the bubble is sized to its text, not to the row',
+  revisionRule.includes('width:fit-content'),
+  revisionRule,
+)
+
+// Where the two edit entries sit. Both belong to the row's own action group:
+// the prompt pencil at the right end of the user bar, behind the clock and the
+// copy button; the reply pencil at the left end of the reply strip, ahead of the
+// copy button - which the host draws before the slot this entry is rendered
+// into, so DOM position alone can never get it there.
+console.log('\n  — each pencil sits where its row’s own actions sit —')
+check(
+  "the collapsed row's pencil joins the bar that survived",
+  clientSource.includes('injectRowAction(row, editTarget, controller, t)'),
+  'the rewritten prompt has to stay editable from its row, not from inside its own text',
+)
+check(
+  'the collapsed row drops the pencil parked in its bubble',
+  clientSource.includes('removeRowAction(bubble)'),
+  'otherwise a roll back leaves two pencils for one message',
+)
+// A sibling plugin (dsh-delete-turn) appends its own button into the same bar
+// whenever its pass runs, so DOM insertion order cannot hold the right end;
+// this is what keeps the pencil last anyway.
+check(
+  'the row pencil sorts to the right end of its bar',
+  /\.dshet-action-host\{[^}]*order:9/.test(css),
+  'flex order, not DOM position - a sibling can append after us at any time',
+)
+// The pencil stands among the platform's own icons; our ink is a blue-grey and
+// read as a different, "active" icon beside them. It has to take the platform
+// label colours instead, on the same variable the platform's own actions use.
+check(
+  'the pencil borrows the platform icon colour',
+  /\.dshet-action\{[^}]*color:var\(--dsw-alias-label-tertiary/.test(css),
+  'otherwise it looks like a different kind of control than the copy next to it',
+)
+check(
+  'the pencil darkens to the platform label colour on hover',
+  /\.dshet-action:hover[^{]*\{[^}]*color:var\(--dsw-alias-label-primary/.test(css),
+)
+// The host can rebuild the row between mousedown and mouseup (it does so
+// constantly while a turn streams), and then no click event ever fires - the
+// button reads as dead. The actions ride on pointerdown so the press itself
+// counts; the click path stays for the keyboard.
+console.log('\n  — a press counts, even when the row is rebuilt under it —')
+check(
+  'the editor buttons are wired through the press helper',
+  clientSource.includes('pressable(cancel,') && clientSource.includes('pressable(submit,'),
+  'a click split across a re-render otherwise evaporates',
+)
+check(
+  'the injected pencils are wired through the press helper too',
+  clientSource.includes('pressable(button, () => controller.open(entry.target))'),
+)
+check(
+  'the helper is wired once per button, not once per pass',
+  clientSource.indexOf('pressable(button,') < clientSource.indexOf('entry.target = target'),
+  're-wiring resets the guard between the press and the click it swallows',
+)
+
+// The host re-renders the row freely; taking focus whenever the box is rebuilt
+// is what pulled the caret out of the composer, so typing anywhere else stopped
+// working while an editor was open.
+console.log('\n  — the editor takes focus only when it should —')
+check(
+  'a rebuild refocuses only a fresh box or one that was being typed in',
+  clientSource.includes('(fresh || wasFocused)'),
+  'an unconditional focus() steals the caret from the composer on every re-render',
+)
+check(
+  'the caret intent is released by pressing outside, not by blur',
+  clientSource.includes("document.addEventListener('pointerdown'") &&
+    clientSource.includes('controller.editorFocus = false'),
+  'a host rebuild or a temporary disable also blurs, and treating that as "the user left" dropped the caret for good',
+)
+check(
+  'the rebuilt box restores the caret, not the end of the text',
+  clientSource.includes('const [start, stop] = caret === null ? [end, end] : caret'),
+)
+
+// The editor must not live inside the React-managed row: an input in a subtree
+// the host rebuilds loses drag selection, IME composition and clicks piece by
+// piece. It is hosted on a body-level layer instead.
+console.log('\n  — the editor is hosted above the host tree —')
+check(
+  'the box lives on a layer pinned to the body',
+  clientSource.includes("editorLayer.className = 'dshet-layer'") &&
+    clientSource.includes('document.body.appendChild(editorLayer)'),
+)
+check(
+  'the layer is inert, only the box takes pointer events',
+  /\.dshet-layer\{[^}]*pointer-events:none/.test(css) &&
+    /\.dshet-layer \.dshet-editor\{[^}]*pointer-events:auto/.test(css),
+)
+check(
+  'the row check consults the controller, not the row',
+  clientSource.includes('controller.editorBox !== null && controller.editorBox.isConnected === true'),
+  'querying the row would rebuild the editor every time the host wipes it',
+)
+check(
+  'the box is repositioned when the page scrolls or resizes',
+  clientSource.includes("document.addEventListener('scroll', keepPlaced") &&
+    clientSource.includes("window.addEventListener('resize', keepPlaced)"),
+)
+
+// The editor is an input box, not a fixed five-line slab: it grows with the
+// text, and the keyboard habits from every other editor work.
+console.log('\n  — the editor behaves like an input box —')
+check(
+  'the textarea grows with its content',
+  clientSource.includes('function fitEditorHeight') && clientSource.includes('fitEditorHeight(area)'),
+  'a fixed rows height leaves a two-line edit floating in half an empty box',
+)
+check(
+  'the manual resize grip is gone and the box is block-level',
+  /\.dshet-editor textarea\{[^}]*display:block[^}]*resize:none/.test(css),
+  'the grip fights the auto-fit, and inline-block leaves a baseline gap',
+)
+check(
+  'Enter acts, Shift+Enter breaks the line, Escape leaves',
+  clientSource.includes("event.key === 'Enter' && event.shiftKey !== true") &&
+    clientSource.includes("event.key === 'Escape'"),
+)
+check(
+  'a composition owns its Enter, in both shapes the engines send it',
+  clientSource.includes('event.isComposing === true || event.keyCode === 229'),
+  'the commit-Enter of an IME can arrive with isComposing false and keyCode 229 - the platform guards both, and missing the second half saved on every 拼音 candidate pick',
+)
+check(
+  'the box is not relaid out mid-composition',
+  clientSource.includes("if (event.isComposing === true) return") &&
+    clientSource.includes("area.addEventListener('compositionend'"),
+  'moving the field under the candidate window is how a box eats pinyin',
+)
+// The box is the platform composer's shape: one rounded container, a bare
+// transparent input inside it, focus shown on the container, actions bottom-right.
+const editorAreaRule = /\.dshet-editor textarea\{[^}]*\}/.exec(css)?.[0] ?? ''
+check(
+  'the container is the composer shape',
+  /\.dshet-editor\{[^}]*border-radius:16px/.test(css) &&
+    /\.dshet-editor:focus-within\{/.test(css) &&
+    editorAreaRule.includes('background:transparent') &&
+    editorAreaRule.includes('border:0') &&
+    /\.dshet-footer\{[^}]*justify-content:flex-end/.test(css),
+  editorAreaRule,
+)
+check(
+  'the reply pencil is pulled ahead of the strip',
+  clientSource.includes('dshet-reply-action') && css.includes('.dshet-reply-action{order:-1}'),
+  'the host renders the copy button before the slot this entry lands in',
+)
+
 // A skin is free to make the theme's surface colours translucent - that is what
 // it is for - and it only compensates for its own elements. A plugin panel that
 // borrows those variables can therefore end up painted with a fully transparent
@@ -267,7 +447,17 @@ check('the panel defines its own surface variables', css.includes('--dshet-panel
 check('a dark-theme branch exists', css.includes('body[data-ds-dark-theme]'))
 const borrowedSurfaces = [...css.matchAll(/background:\s*var\(--dsw-alias-bg-[a-z0-9-]+/g)].map((match) => match[0])
 check('no surface is borrowed from a skin-mutable theme variable', borrowedSurfaces.length === 0, borrowedSurfaces.join(', '))
-check('the textarea is never left transparent', !/textarea\{[^}]*background:[^;}]*transparent/.test(css))
+// The textarea itself is transparent now - that is the composer shape - so the
+// surface that has to stay opaque moved one level out, to the container that
+// paints behind it. A transparent input on top of a transparent container is
+// what made the text sit straight on the skin's artwork.
+const editorContainerRule = [...css.matchAll(/\.dshet-editor\{[^}]*\}/g)].map((match) => match[0]).find((rule) => rule.includes('background:var(--dshet-panel)')) ?? ''
+check(
+  'the box behind the transparent textarea paints its own surface',
+  editorContainerRule.includes('background:var(--dshet-panel)') &&
+    !/\.dshet-editor\{[^}]*background:[^;}]*transparent/.test(css),
+  editorContainerRule,
+)
 check('the panel blurs what is behind it', css.includes('backdrop-filter'))
 const definedVars = new Set([...css.matchAll(/(--dshet-[a-z0-9-]+)\s*:/g)].map((match) => match[1]))
 const usedVars = new Set([...css.matchAll(/var\((--dshet-[a-z0-9-]+)/g)].map((match) => match[1]))
@@ -297,6 +487,69 @@ check('the client calls the apply route', clientSource.includes('${ROUTE_PREFIX}
 for (const field of ['sessionId', 'shadowed', 'applied', 'turns', 'replies', 'kind', 'hidden', 'config']) {
   check(`the host returns "${field}"`, hostSource.includes(field))
 }
+// The mapping a sibling plugin follows to a rewritten message's live node, in
+// the same field names the apply response already published.
+check(
+  'the state route publishes the replacement ledger',
+  hostSource.includes('revisions: ledger.edits') && hostSource.includes('replacementSeq: replacement.seq'),
+)
+// A sibling plugin warned that the marker must land on EVERY replacement, so it
+// can recognise them without inferring from the window shape alone.
+check(
+  'every replacement event carries source.editedBy',
+  (hostSource.match(/editedBy: PLUGIN_ID/g) ?? []).length >= 3,
+  String((hostSource.match(/editedBy: PLUGIN_ID/g) ?? []).length),
+)
+// "The button does nothing" is undiagnosable without knowing whether the click
+// ever reached the host; the request ring now records apply attempts too.
+check(
+  'the apply route records what it was asked for',
+  hostSource.includes("kind: 'apply'") && hostSource.includes('kind: \'state\''),
+)
+
+// Nothing in the contract above says what the client does with the answer to a
+// save, and what it did was leave the rewritten message off the screen: the
+// row collapsed, the standing-in bubble was never built, and no later request
+// corrected the view. These pin the three things that keep it there.
+console.log('\n  — a save never leaves the transcript without its message —')
+check(
+  'the save records which message stands in for the old one',
+  /revisions\.set\(\s*seq,\s*data\.replacementSeq\s*\)/.test(clientSource),
+  'without the mapping renderRevision has nothing to look up',
+)
+check(
+  'the save re-reads the host state',
+  clientSource.includes('await this.load(true)'),
+  'the optimistic view is not allowed to outlive the request that produced it',
+)
+check(
+  'a refresh waits for the one already running',
+  clientSource.includes('this.inflight.then(() => this.load(force))'),
+  'or it can be answered by a snapshot taken before the save',
+)
+check(
+  'a hidden message keeps its row until its replacement is drawn',
+  clientSource.includes('hidden && canHide'),
+  'the row must not collapse with nothing standing in for it',
+)
+
+// The bubble used to be planted after the row, so the collapsed row's own
+// timestamp and copy button ended up above the message that replaced it - the
+// rewrite read as though the bar belonged to the next line. It now goes inside
+// the row, ahead of the node that carries the bar.
+console.log('\n  — the rewritten prompt sits where the message it replaced sat —')
+check(
+  'the bubble is planted inside the row, ahead of its action bar',
+  clientSource.includes('placeRevisionBubble') &&
+    /insertBefore\(\s*bubble,\s*before\s*\)/.test(clientSource) &&
+    !clientSource.includes('row.after(bubble)'),
+  'planting it after the row puts the time and the copy above the message',
+)
+check(
+  'the collapse cannot take the standing-in bubble down with it',
+  clientSource.includes("child.classList.contains('dshet-revision')"),
+  'once the bubble is inside the row, the walk that empties the row must skip it',
+)
 
 console.log(failures === 0 ? '\n全部通过：客户端半部静态检查通过。' : `\n${failures} 项失败。`)
 process.exit(failures === 0 ? 0 : 1)

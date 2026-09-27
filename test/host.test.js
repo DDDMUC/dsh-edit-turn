@@ -302,6 +302,13 @@ test('after the rollback the state hides the discarded rows', async () => {
     assert.deepEqual(res.json.hidden.map((entry) => entry.turn), [1])
     assert.deepEqual(res.json.surface, (await getState(h.port)).json.surface)
     assert.equal(res.json.edits, 1)
+    // The mapping a sibling plugin needs to follow the rewritten message to its
+    // live node: same field names the apply response uses.
+    assert.equal(res.json.revisions.length, 1)
+    assert.deepEqual(res.json.revisions[0].shadowed, [2])
+    assert.equal(res.json.revisions[0].startSeq, 2)
+    assert.equal(res.json.revisions[0].endSeq, 2)
+    assert.equal(typeof res.json.revisions[0].replacementSeq, 'number')
     // The revision stands where the old prompt did, and stays editable; the later
     // prompt was never touched, so it is offered too (listed by sequence, which is
     // why the revision - the newer event - comes last).
@@ -396,15 +403,19 @@ test('editing a reply replaces it without re-running the model', async () => {
     // everything that was built on top of it.
     assert.deepEqual(res.json.shadowed, [3, 6, 7, 8])
 
-    // Four appends: the invisible rollback carrier, the corrected reply, and the
-    // two events that close the turn again behind it.
-    assert.equal(h.session.seq, before + 4)
+    // Six appends: the turn and step the correction lands in (the read path only
+    // admits a step message inside an open turn and step), the invisible
+    // rollback carrier, the corrected reply, and the two events that close the
+    // turn again behind it.
+    assert.equal(h.session.seq, before + 6)
     const lastTwo = h.session.snapshotEvents().slice(-2).map((event) => event.type)
     // Without this the correction lands outside the turn and the host renders
     // the turn's tail - duration and action strip - above the corrected text.
     assert.deepEqual(lastTwo, ['step/end', 'turn/end'])
     const tail = h.session.snapshotEvents().at(-1)
-    assert.equal(tail.data.turn, 1, "the turn that was edited")
+    // The correction gets the next turn in the log, not the edited reply's own
+    // (that one is closed by the time the correction is written).
+    assert.equal(tail.data.turn, 3, 'the freshly opened turn')
     assert.equal(tail.data.reason.kind, 'completed')
     const derived = h.session.deriveMessages()
     assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant'])
@@ -425,7 +436,10 @@ test('the appended correction is a normal reply that says who wrote it', async (
     const appended = h.session.snapshotEvents().find((event) => event.seq === res.json.appendedSeq)
     assert.equal(appended.type, 'assistant/message')
     assert.equal(appended.surfaceOp, 'append')
-    assert.equal(appended.data.turn, 1)
+    // The correction lands in a turn of its own: the original turn is closed by
+    // the time it is written, and the read path only admits a step message
+    // inside an open turn and step.
+    assert.equal(appended.data.turn, 3)
     assert.equal(appended.data.step, 1)
     assert.equal(appended.data.message.role, 'assistant')
     // `model` so it renders as an ordinary reply, plus an honest marker.

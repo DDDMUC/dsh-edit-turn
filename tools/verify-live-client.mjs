@@ -34,7 +34,16 @@ const MARKERS = [
   { needle: "typeof view.notice !== 'string'", what: 'the guarded notice render' },
   { needle: 'editorMarker', what: 'the editor re-render marker that tracks every field' },
   { needle: 'syncEditableSet', what: 'the transcript-change refresh of the editable set' },
+  { needle: 'collapseRowContent', what: 'the row collapse that leaves the platform action bar standing' },
+  { needle: 'dshet-revision-action', what: 'the revision gutter that keeps the pencil off the text' },
+  { needle: 'readReplyView', what: 'the reply entry that cannot take its strip down with it' },
   { needle: '--dshet-panel', what: 'the self-contained panel surface that survives a skin' },
+  { needle: 'hidden && canHide', what: 'the guard that keeps a message up until its replacement is drawn' },
+  { needle: 'await this.load(true)', what: 'the refresh that hands the optimistic view back to the host' },
+  { needle: 'placeRevisionBubble', what: 'the bubble planted above the action bar, not after the row' },
+  { needle: 'dshet-reply-action', what: 'the reply pencil pulled ahead of its action strip' },
+  { needle: 'injectRowAction(row, editTarget', what: "the collapsed row's pencil placed in the bar that survived" },
+  { needle: 'fitEditorHeight', what: 'the editor box that grows with its text' },
 ]
 
 function arg(name) {
@@ -77,7 +86,10 @@ const html = (await page.text()).replace(/&amp;/g, '&')
 check('the boot page was served', page.status === 200 && html.length > 1000, `HTTP ${page.status}, ${html.length} bytes`)
 
 console.log('\n2. find this plugin in the client module graph')
-const groups = [...new Set([...html.matchAll(/href="(\/plugins\/[^"]+)"/g)].map((match) => match[1]))]
+// The boot page writes these hrefs relative to itself: `plugins/??...`.
+const groups = [...new Set([...html.matchAll(/href="((?:\/|\.{1,2}\/)?plugins\/[^"]+)"/g)]
+  .map((match) => match[1]))]
+  .map((href) => `/${href.replace(/^(\.\/|\/)+/, '')}`)
 check('the boot page lists client module groups', groups.length > 0, `${groups.length} groups`)
 const group = groups.find((href) => href.includes(`${PLUGIN_ID}/client.js`))
 check(`"${PLUGIN_ID}/client.js" is in the module graph`, group !== undefined,
@@ -94,27 +106,50 @@ const bundle = await fetch(`${base}${group}`, { headers: withCookie })
 const code = await bundle.text()
 check('the bundle was served', bundle.status === 200 && code.includes(PLUGIN_ID), `HTTP ${bundle.status}, ${code.length} bytes`)
 // The group is the concatenation of many plugins, so markers must be checked in
-// this plugin's own slice; otherwise another plugin's copy could satisfy them.
-const hits = [...code.matchAll(new RegExp(PLUGIN_ID, 'g'))].map((match) => match.index)
-const slice = code.slice(Math.max(0, Math.min(...hits) - 4000), Math.max(...hits) + 4000)
+// this plugin's own module; otherwise another plugin's copy could satisfy them -
+// and another plugin's code could fail the negative check below. Anchoring on
+// the module registration and cutting at the next one is exact; a fixed window
+// around the first and last mention of the id is not, because the id also turns
+// up in other plugins' comments and in the group's source-map hint.
+const idAt = code.lastIndexOf(`id: '${PLUGIN_ID}'`)
+check(`the module registers under "${PLUGIN_ID}"`, idAt !== -1)
+const loadAt = idAt === -1 ? -1 : code.lastIndexOf('__ModuleLoader__.load({', idAt)
+const nextLoad = idAt === -1 ? -1 : code.indexOf('__ModuleLoader__.load({', idAt)
+const fallback = Math.max(0, Math.min(...[...code.matchAll(new RegExp(PLUGIN_ID, 'g'))].map((match) => match.index)) - 4000)
+const slice = code.slice(
+  loadAt === -1 ? fallback : loadAt,
+  nextLoad === -1 ? code.length : nextLoad,
+)
 for (const marker of MARKERS) {
   check(`the served code carries ${marker.what}`, slice.includes(marker.needle))
 }
 check('no stale naive error lookup survives in this plugin slice', !slice.includes('t(`error.${'))
 
 // The browser half does not only depend on its own code: it reads node shapes
-// that the host UI produces. If a DSH update renames those, actions silently
-// stop appearing on model replies - nothing throws, the feature just vanishes.
-// These needles are the exact shapes the client's targetFor() relies on, checked
-// against the whole served group because they come from other plugins' code.
+// that the chat-flow state produces. If a DSH update renames those, actions
+// silently stop appearing on model replies - nothing throws, the feature just
+// vanishes. They are built by another module (the flow state lives outside this
+// plugin's own group) and the bundler quotes them however it likes, so these
+// are matched across every group the boot page loads, without quotes.
 const hostShapes = [
-  { needle: '"assistant-step"', what: 'the node kind that assistant rows use' },
-  { needle: 'data.finalNode', what: 'where a reply seq lives on that node' },
-  { needle: 'kind: "user"', what: 'the node kind that prompt rows use' },
+  { pattern: /["']assistant-step["']/, what: 'the node kind that assistant rows use' },
+  { pattern: /data\.finalNode/, what: 'where a reply seq lives on that node' },
+  { pattern: /kind\s*===?\s*["']user["']/, what: 'the node kind that prompt rows use' },
 ]
-for (const shape of hostShapes) {
-  check(`the served group still produces ${shape.what}`, code.includes(shape.needle))
+console.log('\n4. the node shapes this client reads still exist')
+const pending = [...hostShapes]
+for (const href of groups) {
+  if (pending.length === 0) break
+  const response = await fetch(`${base}${href}`, { headers: withCookie })
+  const groupCode = await response.text()
+  for (const shape of [...pending]) {
+    if (shape.pattern.test(groupCode)) {
+      check(`the served modules still produce ${shape.what}`, true)
+      pending.splice(pending.indexOf(shape), 1)
+    }
+  }
 }
+for (const shape of pending) check(`the served modules still produce ${shape.what}`, false, 'not found in any module group')
 
 console.log(failures === 0
   ? '\n全部通过：运行中的实例正在下发本插件的当前代码（浏览器刷新即可生效）。'
