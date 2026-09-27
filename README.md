@@ -1,6 +1,6 @@
 # dsh-edit-turn
 
-**DeepSeek Harness 的「编辑某一轮」插件 —— 点用户消息旁的编辑按钮，就地改写，确认后把会话回退到这条消息之前，用新内容重新跑这一轮。** 回退走官方 surface-replace 契约（追加一条替换事件，被丢弃的内容从模型上下文里消失），重跑走官方 `sessionController.prompt()`。会话日志是 append-only 的，**原始字节一个都不改写**。
+**DeepSeek Harness 的「编辑某一轮」插件 —— 点用户消息旁的编辑按钮，就地改写那一句。保存即生效：改后的内容成为模型后续读到的版本，这一条消息下面的对话原样不动。** 改写走官方 surface-replace 契约（一条替换事件同时完成"删旧 + 立新"，被替换的内容从模型上下文里消失），**默认不重跑模型**。会话日志是 append-only 的，**原始字节一个都不改写**。
 
 [中文](#中文) · [English](#english)
 
@@ -16,16 +16,18 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 
 - 悬停任意一条**你自己发过的消息**，右侧出现编辑按钮；
 - 点击后在该消息下方就地展开编辑器，预填原文；
-- 确认后：会话回退到这条消息之前，**这条消息之后的全部内容（含当轮助手回复、思考、工具调用与结果）从模型上下文中移除**；
-- 然后立刻用改写后的内容**重新跑这一轮**，新回复照常流式出现。
+- 保存后：**只有这一条消息被替换**——旧措辞从模型上下文里消失，改后的内容占住它的位置（因此后续每一轮读到的都是改后的版本）；
+- **它下面的助手回复、以及之后的全部对话，原样保留**，不重跑、不清空；
+- 想让它立刻按改后的内容重新回答，把 `rerun` 打开即可。
 
 ### 特性
 
 - **官方 seam，不改日志** —— 回退 = 追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的替换事件。原始事件全部留在会话文件里，只是不再进入 `deriveMessages()`。与官方 `/compact` 用的是同一套契约。
-- **默认零上下文污染** —— 替换事件的载体是一个**空的 `system/message`**。官方格式文档里空的后置 system 节点是「dormant，不投影成任何消息」，所以回退后模型看到的上下文，和「对话真的停在那一点」完全一致，不会多出任何标记文本。
-- **轮边界安全** —— 遮蔽窗口右端固定为日志最后一个 surface 节点，左端固定为目标消息节点，因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
-- **重跑走官方准入路径** —— `ctx.sessionController.prompt()` 是唯一的口径：它会自己 resume 冷会话，并恰好开一个新轮次。
+- **改写内容就是载体本身** —— 提示词编辑落下的是一条 `user/message` 替换事件，内容就是你改后的那句话。它既让模型读到你改后的版本，也在转录里显示成你自己的气泡；平台不会把它当成新输入去回答（这一点踩过坑：**追加**一条 user 消息会触发平台自动回答，越改越多）。
+- **窗口最小化** —— 提示词编辑只遮蔽目标那一格（`shadowed = [target.seq]`）；回复编辑才需要"到末尾"的窗口（回答变了，建立在它之上的一切都不再成立），因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
+- **默认不重跑模型** —— 保存只写上下文，不产生任何模型调用。想"改完立刻重答"，配置 `rerun: true`：那会走官方准入路径 `ctx.sessionController.prompt()`（它会自己 resume 冷会话，并恰好开一个新轮次）。
 - **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，再**追加**一条带改写文本的助手消息——模型会把改写后的内容当成自己说过的话，对话可以继续。`source.editedBy` 会如实记录这段文字由插件写入。
+- **改过的那条还能再改** —— 它仍然显示在原来的位置（由插件渲染成气泡），悬停就有编辑按钮。
 - **一次点击即执行** —— 保存后不再有二次确认。编辑器本身已经是用户主动打开的动作，面板里也写明了保存会丢弃哪些内容；想恢复两步确认可在 profile 里一行开启（`confirm: true`）。
 - **中英双语 UI**，跟随 DSH 当前语言。
 - **皮肤友好** —— 编辑器面板自带不透明表面（`--dshet-panel`）而不是借用主题的表面色变量。皮肤的本意就是让表面半透明、把插画透出来，而它只会给**自己的**元素补可读背景，插件类名不在其中；借用皮肤变量的面板会变成全透明，文字直接压在插画上。暗色分支走官方属性 `body[data-ds-dark-theme]`（与 `dsh-client-ui-theme` 及多个官方 UI 包一致），并用 `backdrop-filter` 与皮肤融合。
@@ -49,8 +51,8 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 ### 使用
 
 1. 把鼠标移到你想改的那条**用户消息**上，点右侧的编辑图标（铅笔）。
-2. 消息下方展开编辑器，原文已预填。改完点「保存并重跑」——**一次点击即执行**：这条消息之后的一切从模型上下文中移除，并立刻重新跑这一轮。
-3. 编辑器与该轮之后的转录行一起消失，新提示词与新回复出现在下方。
+2. 消息下方展开编辑器，原文已预填。改完点「**保存**」——**一次点击即执行**：旧措辞从模型上下文里移除，改后的内容占住它的位置，**不叫模型**。（配置 `rerun: true` 时按钮为「保存并重跑」。）
+3. 编辑器收起，那条消息就地变成你改后的内容；它下面的回复与之后的对话**原样不动**。
 
 编辑器里如果提示「这条消息包含图片或文件附件」，说明改写只保留文字，附件会被丢弃。
 
@@ -67,7 +69,8 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
   config:
     carrier: 'system/message'   # 默认：空 system 节点，模型不可见
     markerText: '...'           # 仅当 carrier 为 user/message 时使用的标记文本
-    confirm: true               # 默认 true：确认后才执行回退
+    confirm: false              # 默认 false：一次点击即执行；置 true 才要求二次确认
+    rerun: false                # 默认 false：保存只写上下文；置 true 则同时重跑该轮
 ```
 
 | 字段 | 默认 | 含义 |
@@ -75,12 +78,16 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 | `carrier` | `system/message` | 替换事件的载体类型。`system/message` = 空节点，不投影成模型消息；`user/message` = 短标记文本，会作为一条用户消息进入上下文（等价插件在生产中用的是这种形状，作为兜底）。 |
 | `markerText` | 一段说明文字 | `carrier: user/message` 时的载体文本。 |
 | `confirm` | `false` | 客户端保存后是否先要求一次确认。默认**关闭**（一次点击即执行：编辑器本身已是用户主动打开的动作，面板里也写明了保存的后果）；设为 `true` 可恢复两步确认。 |
+| `rerun` | `false` | 保存后是否立刻重跑该轮。默认**关闭**：改后的内容进上下文即可，等你下次发消息时模型才读到它。设为 `true` 则保存即重跑（走官方 `sessionController.prompt()`）。 |
 
 ### 工作原理
 
-一次编辑是两步官方操作：
+一次编辑就是**一条官方替换事件**。读事件流（`sessionQuery.readSession`，回退到活动会话的 `snapshotEvents()`），用官方折叠规则算出当前 surface 顺序，定位目标消息的节点，然后：
 
-**第一步：回退。** 读事件流（`sessionQuery.readSession`，回退到活动会话的 `snapshotEvents()`），用官方折叠规则算出当前 surface 顺序，定位目标消息的节点，然后遮蔽窗口 = `surface[目标下标 .. 末尾]`。追加一条：
+- 提示词编辑：窗口 = **仅那一格**（`[target.seq]`），载体就是改后的文本；
+- 回复编辑：窗口 = `surface[目标下标 .. 末尾]`（回答变了，建立在它之上的一切都不再成立），载体是空 `system/message`，随后另追加一条助手消息承载改写文本。
+
+追加一条：
 
 ```js
 session.append('system/message', { turn, step, message: { role: 'system', content: [] } }, {
@@ -91,7 +98,7 @@ session.append('system/message', { turn, step, message: { role: 'system', conten
 
 落盘后等一次持久化检查点（`sessions.flush`），保证重启也能看到。
 
-**第二步：重跑。**
+**第二步（可选）：重跑。** 默认不做。`rerun: true` 时：
 
 ```js
 await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: 新内容 }] })
@@ -103,10 +110,23 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 
 | 类型 | 名称 | 说明 |
 |---|---|---|
-| 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本、surface、忙碌状态 |
-| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 执行回退 + 重跑 |
+| 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本（`hidden` + `revisions`）、surface、忙碌状态 |
+| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容（`rerun: true` 时另加重跑）；响应含 `applied` / `reran` / `shadowed` / `replacementSeq` |
 | 工具 | `edit_turn_targets` | 只读：列出该会话当前可编辑的轮次与原文（供 agent 自查） |
 | 前端 | `conversation.input.overlay` | 每会话控制器：编辑入口、就地编辑器、被遮蔽行的隐藏账本 |
+
+### 跨插件契约（给兄弟插件）
+
+转录只为 **append surface 事件**建行（ui-chat 的 user/assistant 定义都以 `isAppendSurfaceEvent` 为 match 条件），所以一次就地编辑之后，**那一行永远锚在原来的 seq / messageId 上**——行里没有任何字段告诉别的插件"我现在在 seq N"，而模型上下文里的活节点是替换事件。任何按 surface 校验的入口（例如兄弟插件 `dsh-delete-turn` 的删除按钮）只看原 seq 就已经死了，是否继续提供入口需要沿替换链找到活节点。为此外部消费者可以依赖：
+
+1. **prompt 编辑保持单节点窗口**：`planRollback` 的 `mode === 'prompt'` 只遮蔽目标那一格（`shadowed = [target.seq]`），不会顺手回退到末尾；
+2. **替换事件与目标同事件类型**：改 `user/message` 落下的就是 `user/message`（回复编辑不换类型就换不了位，见第 5 条）；
+3. **`sourceEventSeqs` 永远列全窗口**：官方校验要求完整覆盖，缺一个节点事件会被拒；
+4. **每个替换都带语义标记**：`source.kind === 'plugin:dsh-edit-turn'` 且 `source.editedBy === 'dsh-edit-turn'`——包括那个不含文本的空 `system/message` 载体，兄弟插件按 `editedBy` 识别即可，不必靠推断窗口形状；
+5. **回复编辑 = 多节点回退 + 追加新回复**，不是就地替换：旧回复行没有入口是**设计如此**（新行自带入口）。不要为了保住旧行的入口往 `assistant/message` 上加 `sourceEventSeqs`——官方校验会直接拒；
+6. **映射已公开**：`GET /dsh-edit-turn/state` 的 `revisions[]` 给出 `{ replacementSeq, startSeq, endSeq, shadowed }`（字段名与 `POST /apply` 响应一致），`hidden[]` 每题一格列出 `{ seq, turn, replacement }`。跨插件不必再从事件流自行推导。
+
+**`source.kind` 的行为（有意为之）**：prompt 编辑落地的那条 `user/message` 的 `source.kind` 是 `plugin:dsh-edit-turn`，**不是 `user`**。因此凡是以 `source.kind === 'user'` 识别"人类提问"的消费者（例如按人类提问划分回复删除窗口的逻辑），会把这条改写后的提问当作**普通内容**。这是刻意的：它是一段插件写入的文本，不是新的用户发话，平台也就不该再回答它；需要识别它的消费者请用上面的 `revisions`/`editedBy`，不要放宽 `source.kind === 'user'` 的判定。
 
 ### 验证状态
 
@@ -116,14 +136,17 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 |---|---|---|
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
-| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 61 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 83 项通过 |
+| 官方 append 契约（真实校验器，进程内） | `npm run verify:contract` | 73 项通过：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 system 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 95 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
+| **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
 | **真实浏览器端到端**（agent-browser 驱动 Chrome 打开运行实例） | 手动 | 已完成：模型回答行出现「编辑这条回答」、点开编辑器预填真实回复原文、取消后网络层 0 个 apply 请求。截图见 `docs/reply-editor-in-browser.png` |
 
 `verify:live` 针对**正在运行的实例**：用 DSH 启动时打印的 token 换取鉴权 cookie，读启动页里的客户端模块组，把含本插件的那一组下载下来，断言插件自己的标记确实在其中。它证明的是「浏览器刷新后会拿到当前代码」，而不是「源码看起来没问题」——前端改动后这是唯一能确认已生效的自动手段。
+
+`verify:ui` 直接驱动一个**已经开着**的 Chrome 标签页（`--remote-debugging-port`，默认 9333）：先缓存击穿地重载，断言浏览器此刻拿到的字节就是刚改的字节，再读 DOM 与 console——每个 assistant 单元格都渲染出了东西（没有被 `abdicate` 留下的空占位）、回复铅笔落在平台自己的动作条里、被回滚的行丢掉消息但保住时间/复制/删除、**并且每一条被折叠的用户消息都立着本插件的替代气泡**（这条正是「保存后消息不见了」的现场判据：行可以折叠，但不能折叠到无处显示替代文本）、**而且这颗气泡排在时间/复制的上方**（顺序与平台画一条正常消息时一致，否则时间戳看起来像属于下一条）、**改写后那颗铅笔排在还活着的那条动作条的末尾、气泡里不再留笔**（把 message 文本那一层留给文字，铅笔跟着行本身走）、**回复铅笔排在动作条最左、压在平台自己画的复制按钮之前**（那一格是 `display:contents`，DOM 序只能排第二，靠 flex `order` 才能争到第一位，现场按布局算 x 而不是数节点）、气泡上没有 `.dshet-floating` 压着文字、切走再切回会话入口仍在。它**只读**：从不打开编辑器、从不点保存、从不发 `/apply`。（这两条铅笔落位的断言已在真机重载后跑通，三处视图——原始会话、切走的会话、切回后——都确认了。）
 
 `verify:profile` 会另起独立端口 + 独立 `DSH_HOME` 的沙箱实例，**只按 pid 结束自己启动的进程**，绝不触碰你正在用的 DSH。也可以手动指定：
 
@@ -131,7 +154,13 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**尚未验证的一环（诚实说明）**：与**真实 DSH 界面**的耦合——真实 DOM 结构、真实 CSS 布局、以及 React 调和器在重渲染行时是否会移除注入的节点——只能由真实浏览器验证（本机 React 与 Playwright 均不可用）。但纯点击路径本身已被自动覆盖：`test/client.dom.test.js` 用一个可读的 DOM 实现把真实的 `OverlayEntry` 跑起来，断言「点动作 → 编辑器出现并预填 → 点保存 → 进入确认步骤 → 点确认 → 发出正确请求 → 编辑器关闭」以及各失败分支的文案。这个测试是有意义的：把重绘标记改回旧写法时，其中 6 项会失败。
+**尚未验证的一环（诚实说明）**：`verify:ui` 覆盖的是「渲染成什么样」（只读），**真正按下保存**会发 `/apply` 并回退会话——这一步刻意留给手动端到端（见上表最后一行与 `docs/reply-editor-in-browser.png`），冒烟脚本永远不碰。另外本机没有 React / Playwright，所以 `verify:ui` 走的是裸 CDP 而不是框架。但纯点击路径本身已被自动覆盖：`test/client.dom.test.js` 用一个可读的 DOM 实现把真实的 `OverlayEntry` 跑起来，断言「点动作 → 编辑器出现并预填 → 点保存 → 进入确认步骤 → 点确认 → 发出正确请求 → 编辑器关闭」以及各失败分支的文案。这个测试是有意义的：把重绘标记改回旧写法时，其中 6 项会失败。
+
+**「按下保存之后那一屏」同样已被覆盖**，因为这里出过一次真事故：保存成功后旧消息行被折叠，而替身气泡从未建起，整条消息在界面上消失（截图见 `docs/`，服务端状态其实早已回退成功）。三个用例分别钉住它的一半成因——①保存响应一到，替代气泡必须立刻出现（把紧随其后的 `/state` 卡住不返回也得过，证明不靠刷新兜底）②保存必须重新向宿主要一次 `/state` ③有替换记录却还没有替换文本时，行不得折叠。把 `lib/client.js` 里对应的三处修复逐一还原，这三个用例各自**恰好失败一次**，恢复后当时 94 项全绿（现 95 项）。
+
+**「气泡排在时间/复制上面」同样已被覆盖**：替代气泡原先插在被折叠行的**后面**，行里剩下的时间戳与复制按钮于是排到了改写文本的上方，看起来像属于下一条消息。现在气泡插进行内、动作条**之前**（`placeRevisionBubble`），同时 `collapseRowContent` 的豁免名单加上它自己——气泡一旦进到行里，清空行内容的那一步就必须放过它；而没有动作条可留的行会整行消失，此时气泡改插到行**前面**，否则会跟着行一起被藏起来。两个用例分别钉住这两种情形（94 → 95 项）：把定位那一处改回「插在行后」，恰好 4 个用例同时失败。`verify:ui` 加了现场断言「气泡必须在动作条之上」，静态检查加 2 条，`verify:live` 加 1 个下发标记。
+
+**「两支铅笔该落在哪儿」同样已被覆盖**，这是按你给的规范改的：用户行那颗笔排在**动作条的最右边**（时间、复制、以及兄弟插件后插进来的按钮之后），回复行那颗笔排在**动作条的最左边**（复制按钮之前）。两处都不是"换个插入点"能办到的，各自卡在一个宿主限制上：折叠行原先把笔塞进替代气泡的字外留白里（要悬停改写文本才看得见，也够不着"复制"）；回复笔受宿主注册的 slot 约束，DOM 上必然排在平台自己画的复制按钮之后。现在的做法是：①`renderRevision` 把改写后的笔**交给那条活下来的动作条**（`injectRowAction(row, editTarget, …)`），同时把它从气泡里摘掉，只有行彻底没有条可留时才退回气泡字外留白；`applyDom` 在行可见时**只在没有替代气泡站位时**才拆掉行上的笔——否则会把上一行刚放进去的笔拆走。②回复笔靠新增的 `.dshet-reply-action` 加 flex `order:-1` 冲到最左，因为那一格宿主是 `display:contents`，DOM 序永远只能第二，只有顺序属性改得动；用户笔同理——兄弟插件（`dsh-delete-turn`）会在任意时刻把垃圾桶**追加**进同一条动作条，DOM 插入序保不住右端，所以 `.dshet-action-host` 带 `order:9`，无论谁后插都在它左边。颜色也一并对齐平台：`.dshet-action` 改用平台的 `--dsw-alias-label-tertiary`（悬停 `--dsw-alias-label-primary`，留一个等于默认主题取值的兜底），不再用自己的蓝灰墨色——此前它比旁边的复制/垃圾桶更蓝，看起来像另一个控件；实测两者计算色都是 `rgb(129, 133, 140)`。测试上：原"铅笔在字外留白"的用例改写为「铅笔并进那条活下来的条的末尾、气泡里不再留笔」，无条用例补上"留白里仍有笔"，回复 entry 用例补 class 断言；静态检查加 5 条钉住这一批写法（含「气泡按内容收窄」与「铅笔按 flex order 排最右」），`verify:live` 加 2 个下发标记；`verify:ui` 的「行末尾的笔」断言改成**按布局量右边缘**（DOM 序不算数）并已在真机重载后跑通——现场那个用户条是 `时间 → 复制 → 垃圾桶 → 笔`，笔在最右（原始会话/切走的会话/切回后三处确认）。三处新写法各做过反向复现：把「笔交给动作条」「`.dshet-reply-action` class」「`applyDom` 的站位守卫」逐一还原，各有一个用例失败（守卫那处失败在「笔并进条末尾」用例上——它恰好也钉住了"刚放好又被拆走"这条回归）。当前 `npm run check` 95 项 + 契约 + 静态全绿。
 
 **开发前置**：`npm test` 与两个 `verify:*` 需要 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-tools` 可解析。本插件自身不依赖它们（宿主半部只 import `schemastery` 与 `dsh-tools`），测试需要一个装了 DSH 的 `node_modules`：
 
@@ -143,8 +172,8 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 - 可以编辑**你自己输入的消息**与**模型的回答**；注入的上下文行与系统提示词没有编辑入口。
 - 编辑一条回答会把它替换为**纯文本**：该回答里的工具调用与思考过程会被移除（编辑器会提示），因为它们的结果已不再成立。
-- 编辑一条用户消息会重跑那一轮；编辑一条模型回答只替换内容，**不会**重新问模型。
-- **编辑会丢弃该消息之后的全部轮次**（MVP 语义，和 ChatGPT 的编辑一致）。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
+- 编辑一条用户消息**只替换那一条**，**默认不重跑模型**（`rerun: true` 才会保存后立刻重跑）；编辑一条模型回答只替换内容，同样不问模型。
+- **提示词编辑只动那一条**：它下面的回复与之后的对话**原样保留**。**回复编辑**才会移除该回答及其后的内容——回答变了，建立在它之上的一切都不再成立。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
 - **只改写文本**。消息里含图片/文件附件时，改写后只保留文字（编辑器会提示）。
 - **会话必须当前在 DSH 中打开**，否则返回 `409 session-not-active`。
 - **进行中拒绝编辑**：未闭合的轮次或正在压缩时返回 `409 busy`。
@@ -180,10 +209,27 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
-**未发布（下一版）**
+**0.2.3** —— 修浏览器半部的一批界面缺陷，并让它们以后能被自动验证。
 
+- **修复：保存改写后整条消息从界面上消失（最严重的一处）**。保存成功的乐观更新只记下了「哪些行被回退」，既没记「替代文本现在哪一条 seq 上」，也没把它放进可编辑集合，替身气泡因取不到文本而从未建起；紧接着的折叠照常执行，行就空了——而行数没变，客户端又不会重新拉 `/state`，于是这一屏永远卡在乐观态（服务端其实早已回退成功）。现在保存响应里的 `replacementSeq` / `shadowed` 会补齐映射与条目、保存后必定重新拉一次 `/state`（在途请求排队而非被复用），并加了一条不变量：**替代文本没画出来之前，用户消息那行不许折叠**（最坏情况是多显示一会儿旧原文，而不是什么都不显示）。
+
+- **修复：回复编辑笔根本不渲染**。条目用 `jsx(PencilIcon, null)` 交给宿主，而这个宿主的 `jsx` 读 `config.key` 前不判空——一抛错，槽位就把这条记录 `abdicate`（本页生命周期内永久除名），该 assistant 单元格渲染成一个空的 `data-slot-error` 占位，界面上只是"没有笔"，没有任何报错。现在组件对缺失/为 `null` 的 props 全程防御（缺什么就只是不出这一颗笔），图标带配置对象渲染；崩溃现场与"条目被除名"的推断都写进了 `tools/verify-live-ui.mjs` 与 `test/client.dom.test.js`。
+- **修复：被回滚的那行把平台自己的动作栏一起藏了**。此前 `setRowHidden` 对整行 `display:none`，时间戳、复制、删除（以及姊妹插件的入口）随之消失。现在行只收起消息内容，动作栏照常保留（`data-dshet-keep-actions`），样式表用 `:not([data-dshet-keep-actions])` 排除这类行。
+- **修复：改写气泡里的编辑笔压住文字**。笔原本绝对定位在 60×40 的气泡内部并 `top:50%` 居中。现在笔移到字外的 gutter（`top:6px`），气泡用 `padding-inline-end` 把位置留出来。**（0.2.3 后期：这条留白退成兜底——行还有动作条时，笔改并进那条条里，见下一条。）**
+- **修复：时间与复制条跑到了替代气泡头上**。替代气泡原先插在被折叠行的**后面**，行里剩下的时间戳与复制于是排在了改写文本的上方，读起来像属于下一条消息。现在气泡插进行内、动作条**之前**（`placeRevisionBubble`：幂等，仅在位置不对时才移动），并把 `collapseRowContent` 的豁免名单加上 `.dshet-revision`——气泡进了行，清空行内容的那一步就必须放过它；没有动作条可留的行会整行消失，此时气泡改插到行**前面**，消息照样可见（新增用例钉住这条）。气泡与动作条的间距对齐平台自己的 `gap:6px`。
+- **修复：两支编辑笔不在该在的地方**。按规范——用户行那颗笔要排在**动作条最右**（时间、复制之后），回复行那颗笔要排在**动作条最左**（复制之前）。旧实现两处都不满足，且各卡在一个宿主限制上：折叠行把改写后的笔塞进替代气泡的字外留白（要悬停改写文本才可见，也够不着"复制"）；回复笔走宿主插槽注册，DOM 序必然排在平台自己画的复制按钮之后。现在 ①`renderRevision` 把笔交给那条活下来的动作条（`injectRowAction(row, editTarget, …)`）并同时从气泡里摘掉（`removeRowAction(bubble)`），无条可留才退回留白（`.dshet-revision-action` 成为纯兜底）；`applyDom` 在行可见时**只有行前没有替代气泡站位**才拆行上的笔，否则会把刚放进去的笔拆走。②回复笔加 `.dshet-reply-action` + flex `order:-1` 冲到最左——那一格宿主是 `display:contents`，DOM 序只能第二，只有顺序属性改得动。另修替代气泡被撑成整行宽的药丸（挪进行内后 `align-self` 失效，补 `width:fit-content`）。
+- **修复：用户笔被兄弟插件的按钮挤下最右**。`dsh-delete-turn` 的垃圾桶会在它自己的 pass 里 `appendChild` 到同一条动作条，落点在我们的笔之后（现场：`时间 → 复制 → 笔 → 垃圾桶`），而两边都不会再移动已有的节点，DOM 插入序永远保不住右端。现在 `.dshet-action-host` 带 flex `order:9`（该条是 `display:flex`，平台项都是 `order:0`；留白/浮动两处不是 flex 项，不受影响）——现场已确认变成 `时间 → 复制 → 垃圾桶 → 笔`。真机断言同步改成**按布局量右边缘**，不再数节点顺序；静态检查加 1 条钉住 `order:9`。
+- **修复：笔的颜色和平台的图标不一样**。`.dshet-action` 原用本插件自己的蓝灰墨色（`--dshet-ink-dim`，`#4b5872`），在平台的中性灰图标（`--dsw-alias-label-tertiary`，`#81858c`）旁边显得像「选中/可用」状态。现在改用平台同一个变量（悬停用 `--dsw-alias-label-primary`，兜底值取默认主题的实测值），实测铅笔与复制按钮的计算色完全一致；静态检查加 2 条钉住这两个变量。
 - **修复：插件依赖解析失败会让功能整体消失**。插件目录的 `node_modules` 若是指向某处 npx 缓存的软链，缓存被清理后静态 `import` 抛错，宿主只打印一行 `failed to import`，界面上毫无痕迹。现在解析失败会降级为"没有设置表单"，插件照样加载。
-- **修复：编辑笔的位置**。回复行的编辑笔此前排在时间戳之后（行的收尾信息之后），现在落在平台动作图标里、时间与用量之前。
+- **修复：编辑笔的位置**。回复行的编辑笔此前排在时间戳之后（行的收尾信息之后），随后改为落在平台动作图标里；最终按规范定在**回复动作条最左**（见上一条），用户行的笔则落在**其动作条最右**。
+- 新增：`npm run verify:ui`——真机渲染冒烟（裸 CDP 驱动已开的标签页，只读）：缓存击穿重载、断言下发字节即当前代码、读 DOM 与 console 断言四个缺陷的表现，切走再切回会话验证入口还在。
+- 补强：`test/client.dom.test.js` 的 `jsx` 桩复刻宿主契约（`config` 为 `null` 直接抛），并新增平台真实行结构 fixture；`verify:live` 修好启动页模块组 href 的相对路径解析，锚点改为在**所有**模块组里找宿主节点形状；静态检查加了隐藏规则与 gutter 的断言。
+- 补强：新增三个「按完保存那一屏」用例（替代气泡立即出现 / 保存后重拉 `/state` / 缺替代文本时不得折叠，91 → 94 项），并把 `lib/client.js` 的三处修复逐一还原做过反向复现——每个用例在没有自己那处修复时恰好失败一次；`verify:ui` 加断言「被折叠的用户行旁边必须有替代气泡」，静态检查加 4 条（映射、刷新、在途排队、折叠不变量），`verify:live` 加 2 个下发标记。
+- 加固：`verify:ui` 读宿主 `/state` 的那一步自带 8 秒兜底——大会话（数千事件）会让宿主答上十几秒，此前这会把整轮冒烟拖成 `evaluate timed out`；现在降级为「分母未知」并继续跑。往返断言的分母也统一成别处一直在用的 `turns - 回退数`：替换载体在宿主侧算可编辑，但平台不为它渲染行，本就没有行内铅笔可言。
+- 补强：两支笔的落位各配了真宿主 DOM 用例——原「铅笔在字外留白」的用例改写为「铅笔并进那条活下来的条的末尾、气泡里不再留笔」，无条用例补上「留白里仍有笔」，回复 entry 用例补 `.dshet-reply-action` class 断言；静态检查加 4 条（`injectRowAction(row, editTarget, …)`、气泡笔的摘除、`order:-1` 规则与按钮上的 class、气泡按内容收窄），`verify:live` 加 2 个下发标记，`verify:ui` 加 2 条现场断言（行末尾的笔、回复笔按布局算 x 是否最左）与气泡「零支笔」的改写断言——**已在真机重载后跑通**；三处新写法也各做过反向复现（还原后各有一个用例失败，其中 `applyDom` 守卫那处失败在「笔并进条末尾」用例上，它同时钉住"刚放好又被拆走"这条回归）。当前 `npm run check` 95 项 + 契约 + 静态全绿。
+- 新增（跨插件契约）：按兄弟插件 `dsh-delete-turn` 回传的核对结果，把它声明依赖的形状钉进真实校验器并公开——①prompt 编辑保持**单节点窗口**（只遮蔽目标那一格，不回退到末尾）②替换事件与目标**同事件类型**③`sourceEventSeqs` **全窗口**覆盖④**每一个**替换都带语义标记（`source.kind = plugin:dsh-edit-turn` + `source.editedBy`），包括不含文本的空 `system/message` 载体⑤回复编辑仍是**多节点回退 + 追加修正**，不往 `assistant/message` 挂 `sourceEventSeqs`（官方校验会拒）。契约测试新增 7 条（6 节 +1、新 8b 节 +5、9 节 +1，共 73 项）；`GET /state` 新增 `revisions[]`（`{ replacementSeq, startSeq, endSeq, shadowed }`，与 apply 响应同名）并扩了 host 用例；README 增「跨插件契约」一节，明确改写后那条 `user/message` 的 `source.kind` 是 `plugin:dsh-edit-turn` 而不是 `user`（**有意为之**：它是插件写入的文本、平台不该再回答；按 `source.kind === 'user'` 识别"人类提问"的消费者请改用 `revisions`/`editedBy`，别放宽这个判定）。
+- 修复（工具自身）：`verify:live` 的「本插件切片」原先取 id 首次/末次出现位置的 ±4000 字窗口。插件重新启用后，同一模块组里别的插件在注释里提到本插件、组尾的 source-map 提示又列出 `dsh-edit-turn/client.js.map`，窗口于是膨胀到几乎吞下整个组，把隔壁插件（`dsh-delete-turn`）的 `t(\`error.${...}\`)` 当成"残留的朴素查错"误报。现在改为**锚定模块注册本身**（`id: 'dsh-edit-turn'` 往前找 `__ModuleLoader__.load({`，往后截到下一个模块），并新增一条「模块以该 id 注册」的正向断言。切片从此只含本模块，正反两类断言都不再受邻居影响。
+- 补强：`verify:live` 加 2 个下发标记与 1 条模块注册断言；真机重载后 `verify:ui` 全部通过（新增「回复笔最左」「行末尾的笔」在三个视图确认），`verify:live` 全部通过。
 
 **0.2.1** —— 修 0.1.7 上的两处界面问题，并补上让问题可自证的诊断手段。
 
@@ -231,14 +277,16 @@ This plugin adds it:
 - hover any message **you** sent and an edit action appears on the row;
 - clicking it opens an in-place editor below that message, pre-filled with the original text;
 - confirming rolls the conversation back to just before that message: **everything after it (that turn's reply, reasoning, tool calls and their results) leaves the model context**;
-- the revised text then **re-runs the turn immediately**, and the new reply streams in as usual.
+- the revised text **takes the old message's place**: the old wording leaves the model context and every later turn is answered against the new one;
+- **the reply under it and the whole conversation after it stay exactly as they were** - nothing is re-run and nothing is cleared;
+- turn `rerun` on if you do want it answered again right away.
 
 ### Features
 
 - **Official seam, log untouched.** A rollback appends one replacement event carrying `surfaceOp: { op: 'replace', startSeq, endSeq }`. Every original event stays in the session file; it simply stops entering `deriveMessages()`. This is the same contract `/compact` uses.
 - **Zero context pollution by default.** The replacement carrier is an **empty `system/message`**. The official format documents empty later system nodes as dormant, projecting to no message, so the context after an edit is exactly what it would be had the conversation really stopped there - no marker text is added.
 - **Turn-boundary safe.** The shadow window always ends at the last surface node and always opens at the addressed message, so an assistant message (which carries its own tool_use blocks) and the tool/result it produced are shadowed together. A dangling call/result pair is impossible.
-- **Official re-run.** `ctx.sessionController.prompt()` is the only prompt admission path; it resumes a cold Session itself and opens exactly one new turn.
+- **No model call by default.** Saving only writes the context. `rerun: true` restores the old behaviour and goes through the one official prompt admission path, `ctx.sessionController.prompt()`.
 - **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The answer is rolled back together with everything after it, and the corrected text is **appended** as a fresh reply - the model goes on treating it as its own. `source.editedBy` records honestly that the plugin wrote those words.
 - **One click applies** - no second confirmation. The editor is already an explicit action the user opened, and the panel states what saving discards; a profile can restore the two-step flow with `confirm: true`.
 - **Bilingual UI** that follows the current DSH locale.
@@ -263,7 +311,7 @@ Restart the DSH process that serves that profile to pick it up.
 ### Usage
 
 1. Hover the **user message** you want to change and click the pencil action.
-2. An editor opens below it with the original text pre-filled. Click "Save and re-run" - **one click applies**: everything after this message leaves the model context and the turn runs again immediately.
+2. An editor opens below it with the original text pre-filled. Click "**Save**" - **one click applies**: the old wording leaves the model context and the revised text takes its place. **No model call.** (`rerun: true` shows "Save and re-run" instead.)
 3. The editor disappears together with the discarded rows; the new prompt and its reply appear below.
 
 If the editor warns that the message carries attachments, the rewrite keeps the
@@ -313,7 +361,7 @@ session.append('system/message', { turn, step, message: { role: 'system', conten
 The append then waits for the official durability checkpoint (`sessions.flush`)
 so a reload or a DSH restart still sees the rollback.
 
-**Step two, the re-run.**
+**Step two (optional): the re-run.** Off by default; `rerun: true` turns it on.
 
 ```js
 await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] })
@@ -332,10 +380,23 @@ for exactly this.
 
 | Kind | Name | Purpose |
 |---|---|---|
-| Route | `GET /dsh-edit-turn/state?sessionId=` | Editable turns, the hidden-row ledger, the surface, busy state |
-| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → rollback + re-run |
+| Route | `GET /dsh-edit-turn/state?sessionId=` | Editable turns, the hidden-row ledger (`hidden` + `revisions`), the surface, busy state |
+| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → write the revised text (`rerun: true` re-runs too); the response carries `applied` / `reran` / `shadowed` / `replacementSeq` |
 | Tool | `edit_turn_targets` | Read-only: list the session's editable turns and their text |
 | Client | `conversation.input.overlay` | Per-session controller: edit entry, in-place editor, hidden-row ledger |
+
+### Cross-plugin contract (for sibling plugins)
+
+The transcript only builds rows for **append surface events** (ui-chat's user and assistant definitions both match on `isAppendSurfaceEvent`), so after an in-place edit **that row stays anchored to the original seq / messageId** — nothing in the row tells another plugin "I am now at seq N", while the live node in the model context is the replacement event. Any entry that validates by surface (say `dsh-delete-turn`'s delete action) finds the original seq dead and has to follow the replacement chain to the live node to stay useful. External consumers can rely on:
+
+1. **A prompt edit keeps a single-node window**: `planRollback` for `mode === 'prompt'` shadows exactly the message itself (`shadowed = [target.seq]`) and never rolls back to the tail;
+2. **The replacement event has the type of the target**: a `user/message` edit lands a `user/message` (a reply cannot be swapped in place — see 5);
+3. **`sourceEventSeqs` always lists the whole window**: the official validator demands complete coverage; one missing node and the append is refused;
+4. **Every replacement carries the semantic marker**: `source.kind === 'plugin:dsh-edit-turn'` and `source.editedBy === 'dsh-edit-turn'` — including the empty text-free `system/message` carrier, so siblings can recognise rewrites by `editedBy` alone instead of inferring from the window shape;
+5. **A reply edit is a multi-node rollback plus an appended correction**, not an in-place swap: the old reply row keeping no entry is **by design** (the new row carries it). Do not add `sourceEventSeqs` to an `assistant/message` to keep the old row's entry — the official validator refuses it outright;
+6. **The mapping is published**: `revisions[]` on `GET /dsh-edit-turn/state` gives `{ replacementSeq, startSeq, endSeq, shadowed }` (the field names the `POST /apply` response already used), and `hidden[]` lists `{ seq, turn, replacement }` per shadowed row. No sibling has to re-derive the ledger from the event stream.
+
+**The `source.kind` behaviour, intentionally:** after a prompt edit the landed `user/message` has `source.kind === 'plugin:dsh-edit-turn'`, **not `user`**. Any consumer that detects human prompts by `source.kind === 'user'` (for example, partitioning reply-deletion windows by human turns) will classify the revision as ordinary content. That is deliberate: the text was written by a plugin, it is not a fresh human turn, and the platform must not answer it. Consumers that need to find it should use `revisions`/`editedBy` above rather than loosening the `source.kind === 'user'` test.
 
 ### Verification status
 
@@ -344,10 +405,11 @@ Verified against DSH `0.1.6-alpha.2`, entirely **without model calls**:
 | Check | Command | Result |
 |---|---|---|
 | Is the plugin actually mounted in a running instance? (read-only route-guard probe, no token needed) | `npm run probe:loaded [port]` | pass: `/state` answers 400 and `/apply` answers 405 - status codes only this plugin produces |
-| Official append contract against the real validator, in process | `npm run verify:contract` | 61 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted** |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 83 tests pass |
+| Official append contract against the real validator, in process | `npm run verify:contract` | 73 checks pass: the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty system carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted**, **the invariants siblings depend on (single-node window, same event type, full `sourceEventSeqs` coverage, an `editedBy` marker on every replacement, a rewritten prompt whose `source.kind` is not `user`, a correction that carries no `sourceEventSeqs`)** |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 95 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass, **including anchors on the host's node shapes** |
+| **Real browser rendering smoke** (CDP drives an already-open tab, read-only) | `npm run verify:ui` | all pass: the served bytes are the edited bytes, no empty placeholder left by a retired entry, the reply pencil sits in the platform action bar, a rolled-back row keeps its action bar, **every collapsed user message still shows the text that replaced it**, **that bubble sits above the time and the copy, in the order the platform draws a message**, **the rewriting pencil sits at the end of the surviving bar (confirmed live in the original session, the other session, and back again)**, **the reply pencil leads its bar, ahead of the copy (confirmed live)**, no `.dshet-floating` covers the revision text, and the entries survive a session round trip |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
 | **Real browser, end to end** (agent-browser drives Chrome at a running instance) | manual | done: an edit action appears on model reply rows, the editor opens pre-filled with the real reply, and cancelling leaves zero `apply` requests. See `docs/reply-editor-in-browser.png` |
 
@@ -358,6 +420,28 @@ plugin's own markers are inside it. That proves "a browser reload gets the
 current code", which is stronger than "the source looks right" - and after a
 front-end edit it is the only automatic way to confirm the change took effect.
 
+`verify:ui` drives a tab that is **already open** (Chrome started with
+`--remote-debugging-port`, 9333 by default): it reloads with the cache bypassed,
+asserts the bytes the browser just got are the edited bytes, then reads the DOM
+and the console - every assistant cell rendered something (no empty placeholder
+from a retired entry), the reply pencil sits in the platform's own action bar, a
+rolled-back row lost its message but kept time / copy / delete, every collapsed
+user message still has this plugin's replacement bubble - the live signature of
+the "message vanished after saving" defect, since a row may collapse but never
+with nowhere to show the replaced text - and that bubble sits **above** the time
+and the copy, in the order the platform draws a message in (planted after the
+row it would have left the bar on top of the message), **that the pencil
+rewriting a prompt sits at the end of the bar that survived, behind the clock
+and the copy, with no pencil left inside the bubble** (the bubble's own gutter
+is only a fallback for a row with no bar at all), **and that the reply pencil
+leads its strip, ahead of the copy button the host draws before the slot this
+entry lands in** (that cell is `display:contents`, so DOM order can only ever be
+second; the check reads the laid-out x positions, not the tree), no
+`.dshet-floating` covers the revision text, and the entries survive switching
+away and back. It is **read-only**: it never opens the editor, never clicks save,
+never posts to `/apply`. (The two pencil-placement assertions have since been
+run against a live reload and pass.)
+
 `verify:profile` boots a sandbox instance on its own port with its own
 `DSH_HOME`, and terminates only the process it started, **by pid**. It never
 touches the DSH you are using:
@@ -366,16 +450,101 @@ touches the DSH you are using:
 DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash tools/verify-dsh-plugin.sh
 ```
 
-**The one link that is NOT verified, stated plainly:** the coupling to the **real
-DSH interface** - the real DOM structure, real CSS layout, and whether React's
-reconciler drops an injected node when it re-renders a row - needs a real browser
-(React and Playwright are both unavailable on this machine). The click path
+**The one link that is NOT verified, stated plainly:** `verify:ui` covers *how it
+renders* (read-only). **Actually pressing save** posts `/apply` and rolls the
+session back - that step stays manual (last row of the table above, plus
+`docs/reply-editor-in-browser.png`); the smoke tool never touches it. And there
+is no React or Playwright on this machine, so `verify:ui` talks raw CDP instead
+of a framework. The click path
 itself is now covered: `test/client.dom.test.js` runs the real `OverlayEntry`
 against a readable DOM implementation and asserts "click the action -> the editor
 appears pre-filled -> click save -> the confirmation step appears -> click
 confirm -> the right request is posted -> the editor closes", plus every failure
 branch's message. That test is meaningful: reverting the re-render marker to its
 old form makes 6 of its cases fail.
+
+**The screen right after pressing save is covered too**, because it went wrong
+for real once: the save succeeded, the old row collapsed, the replacement bubble
+was never built, and the message simply left the interface (the server-side
+rollback had landed all along; only the view was wrong). Three cases pin one
+cause each - (1) the replacement bubble must be on screen the moment the save
+response arrives, even if the `/state` refresh that follows never returns,
+(2) a save must ask the host for the state it just changed, (3) a row with a
+recorded replacement but no replacement text yet may not collapse. Reverting the
+three fixes in `lib/client.js` one at a time makes exactly those three cases
+fail, one each; restore them and all pass (94 at the time, 95 now).
+
+**"the bubble sits above the time and the copy" is covered too**: the standing-in
+bubble was planted *after* the collapsed row, so the timestamp and the copy
+button that the row had left stood above the rewritten text and read as if they
+belonged to the next line. The bubble now goes inside the row, ahead of the node
+carrying the action bar (`placeRevisionBubble`, idempotent - it only moves when
+the position is wrong), and `collapseRowContent`'s exemption list gained the
+bubble itself, since a bubble inside the row would otherwise be emptied away with
+it; a row with no bar to keep is displayed away entirely, and then the bubble is
+parked *before* the row so it stays on screen. Two cases pin the two positions
+(94 -> 95); putting the planting back the old way fails exactly four cases at
+once. `verify:ui` gained the live assertion "the bubble sits above the action
+bar", the static checks two more, and `verify:live` one more served marker.
+
+**"Where each of the two pencils sits" is covered too**, changed to the spec you
+gave: the prompt pencil belongs at the **right end** of the action bar (behind
+the clock, the copy, and any button a sibling plugin appends after us), and the
+reply pencil at the **left end** (ahead of the
+copy button). Neither is reachable by moving an insertion point; each was stuck
+against a host constraint: the collapsed row parked its pencil in the revision
+bubble's own gutter (visible only while hovering the rewritten text, and nowhere
+near the copy), and the reply pencil is rendered through a host slot, so in DOM
+order it can only sit after the copy button the platform draws. Now (1)
+`renderRevision` hands the rewriting pencil to the bar that survived
+(`injectRowAction(row, editTarget, ...)`) and takes it out of the bubble at the
+same time (`removeRowAction(bubble)`) - the bubble's gutter is a fallback only,
+for a row with no bar left at all; and `applyDom`, while a row is visible, tears
+the row's pencil down only when **nothing of ours is standing in for it** -
+otherwise it would remove what that call has just placed. (2) the reply pencil
+gained `.dshet-reply-action` plus flex `order:-1` to get to the left end - that
+cell is `display:contents`, so DOM order can only ever be second, and only an
+order property can move it. The row pencil uses the same tool at the other end:
+`dsh-delete-turn` appends its bin into the same bar on its own pass (live DOM:
+`time -> copy -> pencil -> bin`), and neither plugin re-positions a node already
+in the bar, so no insertion order can hold the right end - `.dshet-action-host`
+carries flex `order:9` (every platform item in that `display:flex` bar is
+`order:0`; the gutter and floating placements are not flex items and ignore it). The colour is matched to the platform's too: `.dshet-action` now
+takes `var(--dsw-alias-label-tertiary)` (hover: `--dsw-alias-label-primary`,
+with the default theme's value as the fallback) instead of our own blue-grey
+ink, which read as a different, "active" icon beside the neutral grey ones -
+the pencil and the copy button now measure the same computed colour
+(`rgb(129, 133, 140)`).
+The bubble also stopped stretching into a
+full-width pill (moved inside the row, `align-self` no longer applies, so it
+sets `width:fit-content`). The rewritten test asserts the pencil joins the end
+of the surviving bar with none left in the bubble, the barless case asserts the
+gutter fallback still holds a pencil, the reply-entry test asserts the class;
+the static checks gained seven (including "the bubble is sized to its text, not
+to the row", the pill defect, "the row pencil sorts to the right end of its
+bar", and the two platform-colour checks), `verify:live` two served markers, and `verify:ui`
+two live assertions plus the "zero pencils in the bubble" rewrite - **those two
+live assertions have since been run against a real reload and pass** (the pencil
+at the end of the bar was confirmed in the original session, in the other
+session, and after switching back; the reply pencil was confirmed leftmost; and
+the "end of the bar" check now measures the laid-out right edge instead of
+counting children, because with flex order the DOM position no longer says where
+a button is drawn - the live bar reads `time -> copy -> bin -> pencil`).
+Each of the
+three new placements was also checked in reverse: restoring the old "hand the
+pencil to the bar", dropping the `.dshet-reply-action` class, or dropping
+`applyDom`'s placement guard each makes exactly one case fail (the guard's
+revert fails the "pencil joins the end of the bar" case, which pins the
+"placed then torn down" regression too). One tool bug surfaced while re-running
+`verify:live` with the plugin re-enabled: the "own slice" was a fixed window
+around the first and last mention of the plugin id, and once another plugin's
+comment and the group's source-map hint mentioned the id, that window swelled to
+swallow nearly the whole group - reporting the neighbour's `t(\`error.${...}\`)` as
+a stale lookup of ours. The slice is now anchored on the module registration
+itself (`id: 'dsh-edit-turn'` back to `__ModuleLoader__.load({`, cut at the next
+module), with a positive assertion that the module registers under that id.
+`npm run check` is green: 95 tests, contract, static; `verify:live` and
+`verify:ui` both pass against the running instance.
 
 **Development prerequisite:** `npm test` and both `verify:*` commands need
 `@deepseek-ai/dsh-session` and `@deepseek-ai/dsh-tools` to resolve. The plugin
@@ -390,8 +559,8 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 - **Human prompts and model replies** are both editable; injected context rows and the system prompt offer no edit entry.
 - **Editing a reply replaces it with plain text**: the tool calls and reasoning inside it are removed (the editor warns first), because their results are no longer valid.
-- **Editing a user message re-runs that turn; editing a model reply does not ask the model again** - it only replaces the text.
-- **An edit discards every later turn** (the MVP semantic, matching ChatGPT's edit). Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
+- **Editing a user message replaces that one message and leaves the rest of the conversation untouched - no re-run unless `rerun: true`**; editing a model reply only replaces the text and never asks the model again.
+- **A prompt edit touches only that message.** The reply under it and the whole conversation after it are kept - no re-run unless `rerun: true`. A **reply edit** removes that answer and everything built on it, because a changed answer invalidates what followed. Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
 - **Text only.** A message carrying image or file attachments keeps its text and drops them (the editor warns first).
 - **The session must be open in DSH**, otherwise the route answers `409 session-not-active`.
 - **Running work is refused**: an unclosed turn or an in-flight compaction answers `409 busy`.
