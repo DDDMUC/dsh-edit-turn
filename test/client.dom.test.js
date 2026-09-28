@@ -642,6 +642,28 @@ test('pressing the pencil again keeps what was typed', async () => {
   assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
 })
 
+test('the pencil on a rewritten prompt still opens its editor', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-rev')
+  // revisedState: the prompt is rewritten, so the row is collapsed and its
+  // pencil points at the revision - a replacement event, which no row covers.
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, { nodes: new Map([['row-rev', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+  const pencil = byClass(host.row, 'dshet-action')[0]
+  assert.ok(pencil, 'the collapsed row still carries the pencil')
+  pencil.fire('pointerdown')
+  render(harness, controller, { nodes: new Map([['row-rev', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+  const box = editorIn(harness)
+  assert.ok(box, 'pressing it opens the editor')
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, 'revised prompt', 'prefilled with the wording that stands in for it')
+  assert.equal(box.parentElement.className, 'dshet-layer', 'and it is hosted on the layer')
+})
+
 test('a rolled-back turn tail disappears instead of stacking an empty strip', async () => {
   const harness = await loadBundle()
   const controller = harness.controller

@@ -345,6 +345,17 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// A rewritten prompt is covered by no row: its revision is a replacement event
+// and the platform draws no row for those. The collapsed row that stands for it
+// covers it through the revision mapping, and pressing its pencil must open the
+// editor - it silently did nothing before.
+console.log('\n  — a collapsed rewritten prompt still opens its editor —')
+check(
+  'the editor anchors to the row that stands in for the revision',
+  clientSource.includes('view.revisions.get(seq) === editing.seq'),
+  'without this the editing seq is covered by no node at all and the pencil is dead',
+)
+
 // A rolled-back turn leaves its tail (duration, usage, actions) behind. The
 // tail is not a message row: keeping its strip, right for a message, stacked
 // one empty strip per edit and pushed the conversation down the page.
