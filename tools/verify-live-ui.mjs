@@ -319,6 +319,27 @@ function reportRolledBack(label, view, editable) {
     return
   }
   for (const [index, row] of view.hidden.entries()) {
+    // A turn tail is not a message row: the turn behind it was rolled back, so
+    // the whole strip goes. Keeping it (right for a message row) stacked one
+    // empty strip per edit and pushed the conversation down the page.
+    if (row.kind === 'turn-tail') {
+      check(
+        `${label} row ${index + 1} drops the orphan turn tail`,
+        row.keep === false && row.display === 'none',
+        JSON.stringify(row),
+      )
+      continue
+    }
+    // A row with no action bar of its own has nothing to keep: hiding it whole
+    // is the only option, and it is not a failure.
+    if (row.barDisplay === null) {
+      check(
+        `${label} row ${index + 1} goes away with no bar to keep`,
+        row.display === 'none',
+        JSON.stringify(row),
+      )
+      continue
+    }
     check(
       `${label} row ${index + 1} keeps its action bar`,
       row.keep && row.display !== 'none' && row.barDisplay !== 'none' && row.buttons > 0,
