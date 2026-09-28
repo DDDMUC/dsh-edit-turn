@@ -642,6 +642,40 @@ test('pressing the pencil again keeps what was typed', async () => {
   assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
 })
 
+test('rewriting the same prompt twice keeps the bubble and the pencil', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-chain')
+  // Two rewrites of one message: 2 -> 7, then 7 -> 9. The row stands for 2, so
+  // a single hop lands on 7 - shadowed, no entry left - and the bubble and the
+  // pencil used to disappear after the second save.
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [{ seq: 2, turn: 1, replacement: 7 }, { seq: 7, turn: 1, replacement: 9 }],
+      turns: [{ seq: 9, turn: 1, messageId: 'm-u1', text: '改了两遍', attachments: 0 }],
+      replies: [],
+      config: { confirm: false },
+    }),
+  })
+  await controller.load(true)
+  const snapshot = { nodes: new Map([['row-chain', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  render(harness, controller, snapshot)
+
+  const bubbles = byClass(harness.document.body, 'dshet-revision')
+  assert.equal(bubbles.length, 1, 'the bubble is still drawn')
+  assert.equal(bubbles[0].textContent, '改了两遍', 'showing the wording of the LAST rewrite')
+  const pencil = byClass(host.row, 'dshet-action')[0]
+  assert.ok(pencil, 'and the pencil is still there')
+
+  pencil.fire('pointerdown')
+  render(harness, controller, snapshot)
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, '改了两遍', 'editing the head of the chain, not the shadowed one')
+})
+
 test('the pencil on a rewritten prompt still opens its editor', async () => {
   const harness = await loadBundle()
   const controller = harness.controller

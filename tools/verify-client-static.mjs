@@ -345,6 +345,16 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// Rewriting the same message twice chains its replacements (8 -> 19 -> 23).
+// Resolving one hop lands on a shadowed seq and the bubble and its pencil
+// vanish after the second save; the chain has to be followed to the head.
+check(
+  'the replacement chain is followed to its head',
+  clientSource.includes('function headRevision') &&
+    clientSource.includes('headRevision(view.revisions.get(revisionSeq), view.revisions)'),
+  'a single hop lands on a shadowed seq: no entry, no bubble, no pencil',
+)
+
 // A rewritten prompt is covered by no row: its revision is a replacement event
 // and the platform draws no row for those. The collapsed row that stands for it
 // covers it through the revision mapping, and pressing its pencil must open the
