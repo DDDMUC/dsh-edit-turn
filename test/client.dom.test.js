@@ -642,6 +642,36 @@ test('pressing the pencil again keeps what was typed', async () => {
   assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
 })
 
+test('a rolled-back turn tail disappears instead of stacking an empty strip', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-keep')
+  const tail = mountTurnTailRow(harness.document, 'row-tail')
+  tail.row.setAttribute('data-chat-flow-kind', 'turn-tail')
+  // The same state the keep-the-bar rule was pinned with: a rewritten prompt
+  // stands in for the message, so the row may collapse.
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  const snapshot = {
+    nodes: new Map([
+      ['row-keep', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
+      ['row-tail', { kind: 'turn-tail', anchorSeq: 2, data: { closing: { finalNode: { seq: 2 } } } }],
+    ]),
+  }
+  render(harness, controller, snapshot)
+
+  // The message row keeps its action bar: that is what the earlier fix pinned.
+  assert.equal(host.row.dataset.dshetHidden, '1')
+  assert.equal(host.row.dataset.dshetKeepActions, '1')
+  assert.notEqual(host.row.style.display, 'none')
+  // The turn tail has no message left to act on, so it goes away entirely.
+  // Keeping it stacked one empty strip per edit and pushed the conversation
+  // down the page on every save.
+  assert.equal(tail.row.dataset.dshetHidden, '1')
+  assert.equal(tail.row.dataset.dshetKeepActions, undefined, 'a tail must not keep its strip')
+  assert.equal(tail.row.style.display, 'none', 'the whole tail row is hidden')
+})
+
 test('a host re-render of the row cannot take the editor with it', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   byClass(row, 'dshet-action')[0].fire('pointerdown')

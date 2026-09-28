@@ -345,6 +345,22 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// A rolled-back turn leaves its tail (duration, usage, actions) behind. The
+// tail is not a message row: keeping its strip, right for a message, stacked
+// one empty strip per edit and pushed the conversation down the page.
+console.log('\n  — a rolled-back turn tail does not stack empty strips —')
+check(
+  'a turn tail is hidden whole, not collapsed around its strip',
+  clientSource.includes("row.getAttribute('data-chat-flow-kind') === 'turn-tail'") &&
+    clientSource.includes('const keepsStrip = isTail ? false : collapseRowContent(row, true)'),
+  'without this every reply edit leaves another orphan strip above the answer',
+)
+check(
+  'a tail hidden with keep-actions by an older pass is cleaned up',
+  clientSource.includes('delete row.dataset.dshetKeepActions'),
+  'the attribute would otherwise keep the row visible forever',
+)
+
 // The host re-renders the row freely; taking focus whenever the box is rebuilt
 // is what pulled the caret out of the composer, so typing anywhere else stopped
 // working while an editor was open.
