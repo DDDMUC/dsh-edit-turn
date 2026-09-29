@@ -71,6 +71,13 @@ class StubElement {
   }
 
   appendChild(child) {
+    // The DOM moves an attached node; a stub that leaves it in its old parent
+    // makes the same object appear twice in the tree and hides real bugs.
+    if (child.parentElement !== null && child.parentElement !== this) {
+      const siblings = child.parentElement.children
+      const index = siblings.indexOf(child)
+      if (index !== -1) siblings.splice(index, 1)
+    }
     child.parentElement = this
     this.children.push(child)
     return child
@@ -78,8 +85,10 @@ class StubElement {
 
   /** DOM semantics: moves an existing child, and appends when the reference is null. */
   insertBefore(child, reference) {
-    const existing = this.children.indexOf(child)
-    if (existing !== -1) this.children.splice(existing, 1)
+    if (child.parentElement !== null) {
+      const index = child.parentElement.children.indexOf(child)
+      if (index !== -1) child.parentElement.children.splice(index, 1)
+    }
     const at = reference === null || reference === undefined ? this.children.length : this.children.indexOf(reference)
     child.parentElement = this
     this.children.splice(at === -1 ? this.children.length : at, 0, child)
@@ -279,6 +288,7 @@ async function loadBundle() {
       const all = walk(document.body)
       if (selector === '[data-chat-flow-key]') return all.filter((node) => 'data-chat-flow-key' in node.attributes)
       if (selector === '.dshet-editor') return all.filter((node) => node._classes.has('dshet-editor'))
+      if (selector === '.dshet-revision') return all.filter((node) => node._classes.has('dshet-revision'))
       return []
     },
   }
@@ -640,6 +650,30 @@ test('pressing the pencil again keeps what was typed', async () => {
   render(harness, controller, snapshot)
   const again = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
+})
+
+test('a strayed revision bubble is reused, not duplicated', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-stray')
+  // A bubble for this row parked where the old lookup could not see it: not a
+  // child of the row, and not its immediate previous sibling. The next pass
+  // used to plant a second bubble next to it - two identical bubbles on screen.
+  const stray = harness.document.createElement('div')
+  stray.className = 'dshet-revision'
+  stray.dataset.dshetRevisionFor = 'row-stray'
+  harness.document.body.appendChild(stray)
+  const spacer = harness.document.createElement('div')
+  harness.document.body.appendChild(spacer)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, { nodes: new Map([['row-stray', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+  const bubbles = byClass(harness.document.body, 'dshet-revision')
+  assert.equal(bubbles.length, 1, 'exactly one bubble for the row')
+  assert.equal(bubbles[0], stray, 'the stray one was adopted rather than a second one planted')
+  assert.equal(bubbles[0].textContent, 'revised prompt', 'and it carries the current wording')
 })
 
 test('rewriting the same prompt twice keeps the bubble and the pencil', async () => {

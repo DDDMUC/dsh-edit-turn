@@ -345,6 +345,27 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// Two identical bubbles on one row had two sources: a bubble the host had
+// shunted out of reach was forgotten and a second one planted; and a stale DOM
+// pass (old view, no hidden rows) un-collapsed the row so the original bubble
+// came back beside the revision one. Both are pinned here.
+console.log('\n  — one bubble per row, whatever the host does —')
+check(
+  'a bubble carries the key of the row it stands in for',
+  clientSource.includes("const REVISION_FOR = 'dshetRevisionFor'") &&
+    clientSource.includes('bubble.dataset[REVISION_FOR] = key'),
+  'unlabelled, a shunted bubble is forgotten and a second one gets planted',
+)
+check(
+  'a stray bubble that claims the row is removed',
+  clientSource.includes('candidate.dataset[REVISION_FOR] === key'),
+)
+check(
+  'the DOM pass reads the current view, not the one it closed over',
+  clientSource.includes("typeof controller.getSnapshot === 'function' ? controller.getSnapshot() : view"),
+  'a stale pass un-hid a collapsed row and the original bubble reappeared',
+)
+
 // Rewriting the same message twice chains its replacements (8 -> 19 -> 23).
 // Resolving one hop lands on a shadowed seq and the bubble and its pencil
 // vanish after the second save; the chain has to be followed to the head.
