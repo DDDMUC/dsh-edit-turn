@@ -443,7 +443,15 @@ async function run() {
     note('editable', `the state endpoint did not answer in time: ${editable.error}`)
   }
   const before = await probe(PROBE)
-  const crashed = bootLines().filter((line) => /slot entry crashed|dsh-edit-turn|reading 'key'/.test(line))
+  // A session open in ANOTHER DSH instance (the desktop app, say) cannot be
+  // read from this one: /state answers 404 and the plugin correctly shows no
+  // entries. That is an environment fact, not a crash - note it, do not fail.
+  // The line reads "status of 404 (Not Found) http://.../dsh-edit-turn/state?...":
+  // the code comes before the URL, so both halves are matched separately.
+  const stateRefused = (line) => /dsh-edit-turn\/state/.test(line) && /404|Not Found/.test(line)
+  const stateForbidden = bootLines().some(stateRefused)
+  const crashed = bootLines().filter((line) => /slot entry crashed|dsh-edit-turn|reading 'key'/.test(line) && !stateRefused(line))
+  if (stateForbidden) note('state', 'this instance cannot read the selected session (404) - another DSH instance holds it; entries are correctly absent')
 
   console.log('\n  — what the transcript shows —')
   check('no entry crashed into a retired strip', crashed.length === 0, crashed.slice(0, 3).join(' | '))
@@ -538,7 +546,15 @@ async function run() {
         const candidate = await probe(PROBE)
         if (candidate.session === originalSession && candidate.assistantCells > 0) restored = candidate
       }
-      check('the original session is back', restored !== null)
+      if (restored === null && stateForbidden) {
+        // The tab is back on it, but this instance cannot read the session at
+        // all (another DSH instance holds it), so there is nothing of ours to
+        // judge. The plugin correctly shows no entries.
+        note('the original session is back', 'skipped: this instance cannot read it (404, held elsewhere)')
+        note('its pencils survived the round trip', 'skipped with the session above')
+      } else {
+        check('the original session is back', restored !== null)
+      }
       if (restored !== null) {
         // The transcript comes back before the plugin's own state does: the
         // pencils are injected from /state, which the client asks for again on
@@ -583,7 +599,8 @@ async function run() {
 
   console.log('\n  — console —')
   const ours = bootLines().filter((line) => /error|exception/i.test(line))
-  check('no errors mentioning this plugin', ours.filter((line) => /dsh-edit-turn|reading 'key'/.test(line)).length === 0, ours.filter((line) => /dsh-edit-turn/.test(line)).slice(0, 3).join(' | '))
+  const pluginErrors = ours.filter((line) => /dsh-edit-turn|reading 'key'/.test(line) && !stateRefused(line))
+  check('no errors mentioning this plugin', pluginErrors.length === 0, pluginErrors.slice(0, 3).join(' | '))
   note('console', `${consoleLines.length} lines, ${ours.length} errors`)
   if (failures > 0 && ours.length > 0) {
     for (const line of ours.slice(0, 8)) console.log(`      ${line.slice(0, 200)}`)

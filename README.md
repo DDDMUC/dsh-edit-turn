@@ -205,7 +205,8 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
    记录里有 `state` 且 `replies` 大于 0 → 数据到了客户端，问题在渲染；**一条记录都没有** → 客户端半部没跑起来（看浏览器控制台）。
 
-4. **「历史加载失败 / 某个会话读不出来」**（`session-not-found`，控制台里出现 `SessionFormatError`）：这可能是 0.2.0–0.2.3 的回复编辑留下的坏日志。用仓库里的修复工具扫描并用官方加载器验证、备份后截断：
+4. **「某个会话里完全看不到编辑入口，控制台里 `/dsh-edit-turn/state` 返回 404」**：这个会话**正被另一个 DSH 实例使用**（例如桌面版开着它，网页版就读不到；反之亦然）。同一会话同一时间只能被一个实例持有，这是宿主的行为，不是插件的问题——在那个实例里用，或先在另一个实例里放开它。`verify:ui` 遇到这种情况会注记并跳过该项，不会误报。
+5. **「历史加载失败 / 某个会话读不出来」**（`session-not-found`，控制台里出现 `SessionFormatError`）：这可能是 0.2.0–0.2.3 的回复编辑留下的坏日志。用仓库里的修复工具扫描并用官方加载器验证、备份后截断：
 
    ```sh
    node tools/repair-session.mjs ~/.dsh/sessions/<项目目录> --dry-run
@@ -217,6 +218,12 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.9** —— 修「同一条消息出现两个一样的气泡」。
+
+- **修复：一行两个替代气泡，两个来源都堵掉**。①气泡此前只认「行的直系子节点 / 紧邻前一个兄弟」，一旦被宿主挪开就认不出，下一趟又种一个；现在气泡带**行的 key 标记**（`data-dshet-revision-for`），挪到哪都找得回来，且每行只允许一个（多余的按标记清除）。②更隐蔽的一个：MutationObserver 的回调可能**晚于它所属的那次渲染**，带着**过期视图**（`hidden` 为空）跑一遍，把已折叠的行重新展开——原气泡就回到了替代气泡旁边；现在这趟 pass 从 `controller.getSnapshot()` 现取当前视图，过期视图再也不可能把行展开。
+- 测试桩补上真实 DOM 语义（`appendChild`/`insertBefore` 会先把节点从旧父节点摘除）——正是这条语义缺失让"同一个对象同时挂两处"在桩里被当成正常，掩盖了第一类问题。
+- 新增用例「被挪走的替代气泡会被复用而不是再种一个」+ 3 条静态检查；109 单测 / 80 契约 / 静态 / verify:live / verify:ui 全绿。
 
 **0.2.8** —— 安装元数据：peer 接受 DSH `0.2.0`。
 
@@ -712,7 +719,8 @@ Separate "the plugin never loaded" from "it loaded but nothing rendered" - the t
    ```
 
    Mind the two kinds of dependency: **peers** provided by the host (`dsh-tools`, `dsh-settings`) are resolved by the DSH loader and need no install; **regular dependencies** (like `schemastery`) must resolve on their own - the loader will not find them for you.
-3. **"The history fails to load / one session is unreadable"** (`session-not-found`,
+3. **"One session shows no edit entries at all while `/dsh-edit-turn/state` answers 404 in its console"**: that session is being **held by another DSH instance** (the desktop app has it open, or vice versa). A session can only belong to one instance at a time - host behaviour, not a plugin problem. Use it from that instance, or release it in the other one first. `verify:ui` notes and skips this case instead of failing.
+4. **"The history fails to load / one session is unreadable"** (`session-not-found`,
 with `SessionFormatError` in the console): this can be a log broken by the reply
 edits of 0.2.0-0.2.3. The repository ships a repair tool that scans a sessions
 directory, validates every log through the official loader, and - after a
