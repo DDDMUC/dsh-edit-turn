@@ -671,5 +671,46 @@ check(
   'once the bubble is inside the row, the walk that empties the row must skip it',
 )
 
+// Hiding a row is an attribution question, not a visibility one (contract I4):
+// three plugins write their own marker on a row they displayed away, and only
+// the plugin that wrote a marker may clear the \`display\` behind it. This plugin
+// used to reset it on every restore, so a row delete-turn or rerun-turn was
+// keeping away came back the moment an edit of ours was rolled forward again.
+console.log('\n  — hiding is attributed to the plugin that wrote it (I4) —')
+check(
+  'the client knows every hide owner',
+  clientSource.includes("['dshdt', 'data-dshdt-hidden', 'dshdtHidden']") &&
+    clientSource.includes("['dshet', 'data-dshet-hidden', 'dshetHidden']") &&
+    clientSource.includes("['dsrr', 'data-dsrr-hidden', 'dsrrHidden']"),
+  'dshdt = delete-turn, dshet = edit-turn, dsrr = rerun-turn',
+)
+check(
+  'the row is only re-shown when no other plugin claims its hide',
+  clientSource.includes("row.style.display = foreignHideOn(row, 'dshet') ? 'none' : ''"),
+  'clearing it unconditionally is what un-hid another plugin\u2019s row',
+)
+check(
+  'a child another plugin had already hidden is not claimed as this plugin\u2019s own',
+  clientSource.includes("            if (child.style.display !== 'none') {\n              child.style.display = 'none'"),
+  'the collapse marker is what the restore pass trusts, so it may only mark our own write',
+)
+
+// The sibling probe may fail in three ways (404, rejected fetch, timeout) and
+// none of them is an error (I5). It also used to let an older answer land last
+// and take the re-run button back out.
+console.log('\n  — the sibling probe is silent, and the newest answer wins —')
+const probeIndex = clientSource.indexOf('async probeSiblingRerun()')
+const probeSource = probeIndex === -1 ? '' : clientSource.slice(probeIndex, probeIndex + 900)
+check(
+  'an absent sibling is not logged as an error',
+  probeSource.includes('catch {') && !probeSource.includes('console.'),
+  'a sibling that is not mounted is not a failure',
+)
+check(
+  'an answer older than the newest probe is ignored',
+  probeSource.includes('if (token !== this.probeToken) return'),
+  'two opens before the first answer used to let the slower probe win',
+)
+
 console.log(failures === 0 ? '\n全部通过：客户端半部静态检查通过。' : `\n${failures} 项失败。`)
 process.exit(failures === 0 ? 0 : 1)

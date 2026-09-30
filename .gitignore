@@ -2,4 +2,8 @@ node_modules
 *.log
 .DS_Store
 .verify-sandbox/
+# Manual pre-change copies (e.g. lib/index.js.orig-backup): kept on disk for
+# diffing during a migration, never tracked and never published (package.json
+# "files" lists the two bundles only). Verified 2025-10-01: git ls-files does
+# not contain it.
 *.orig-backup
