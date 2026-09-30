@@ -168,9 +168,9 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'pending',
   'replies',
   'repliesByMessage',
-  'rerun',
   'revision',
   'revisions',
+  'siblingRerun',
   'surfaceReady',
 ]
 const actualSnapshotKeys = Object.keys(snapshot).sort()
@@ -345,6 +345,38 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// The re-run button is the sibling's job (dsh-rerun-turn): it exists only when
+// that plugin is mounted, only for a prompt edit, and the chain is always save
+// first, re-run second - the sibling regenerates from the prompt the surface
+// NOW shows, so the revised wording has to be there before it is asked.
+console.log('\n  — the re-run button belongs to the sibling —')
+check(
+  'the sibling is probed the way its own loader is',
+  clientSource.includes("const RERUN_PREFIX = '/dsh-rerun-turn'") &&
+    clientSource.includes('status === 400 || status === 405'),
+  '400 without a sessionId means mounted; 404 means the route is not there',
+)
+check(
+  'the button is offered for prompt edits only, outside the confirmation step',
+  clientSource.includes("target.mode === 'prompt' && view.siblingRerun === 'present' && view.confirming !== true"),
+  'a reply edit has the sibling’s own button in its action strip',
+)
+check(
+  'the intent travels through the confirmation step',
+  clientSource.includes('reviewRerun()') &&
+    clientSource.includes('if (rerunIntent) this.startSiblingRerun(target.turn)'),
+  'with confirm: true the chain must run after the confirmed save, not before',
+)
+check(
+  'the chain asks the sibling for the turn’s newest reply',
+  clientSource.includes('entry.turn === turn') && clientSource.includes('entry.seq > best.seq'),
+)
+check(
+  'nothing prompts from here any more',
+  !clientSource.includes('sessionController') && !hostSource.includes('sessionController.prompt'),
+  'regenerating is the sibling’s operation entirely',
+)
+
 // The rewritten text and the editor used to disagree with the platform about
 // font size: `font:inherit` picked up the row's 16px for the bubble while the
 // editor hardcoded 15px, so a reader with a different content font setting saw
@@ -413,7 +445,7 @@ check(
 console.log('\n  — a collapsed rewritten prompt still opens its editor —')
 check(
   'the editor anchors to the row that stands in for the revision',
-  clientSource.includes('view.revisions.get(seq) === editing.seq'),
+  clientSource.includes('headRevision(seq, view.revisions) === editing.seq'),
   'without this the editing seq is covered by no node at all and the pencil is dead',
 )
 

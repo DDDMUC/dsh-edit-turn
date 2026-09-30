@@ -44,6 +44,7 @@ const MARKERS = [
   { needle: 'dshet-reply-action', what: 'the reply pencil pulled ahead of its action strip' },
   { needle: 'injectRowAction(row, editTarget', what: "the collapsed row's pencil placed in the bar that survived" },
   { needle: 'fitEditorHeight', what: 'the editor box that grows with its text' },
+  { needle: "'/dsh-rerun-turn'", what: 'the re-run button that belongs to the sibling plugin' },
 ]
 
 function arg(name) {

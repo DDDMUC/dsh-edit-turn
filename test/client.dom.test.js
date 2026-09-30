@@ -933,9 +933,10 @@ test('one click applies directly on the default configuration', async () => {
 test('an empty draft is refused with a message, not silently', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   let posted = 0
-  globalThis.fetch = async () => {
-    posted += 1
-    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/dsh-edit-turn/apply')) posted += 1
+    // The sibling probe must answer 404: no re-run button, and it is not a save.
+    return { ok: false, status: 404, json: async () => ({ ok: false }) }
   }
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
@@ -1199,12 +1200,164 @@ const replyState = () => ({
   config: { confirm: false },
 })
 
+// --- the re-run button (owned by dsh-rerun-turn) -----------------------------
+
+const pluginState = () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    ok: true,
+    hidden: [],
+    turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'original', attachments: 0 }],
+    replies: [],
+    config: { confirm: false },
+  }),
+})
+
+test('the re-run button appears only when dsh-rerun-turn is mounted', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  let sibling = { ok: false, status: 404, json: async () => ({ ok: false }) }
+  globalThis.fetch = async (url) => (String(url) === '/dsh-rerun-turn/state' ? sibling : pluginState())
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'no sibling, no re-run button')
+
+  // Mounted: its state route answers 400 without a sessionId, the way our own
+  // loader probe does. The button shows up on the next pass.
+  sibling = { ok: false, status: 400, json: async () => ({ ok: false }) }
+  await controller.probeSiblingRerun()
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '重跑', '保存'])
+})
+
+test('re-run saves first, then re-runs that turn through the sibling', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-rerun')
+  const snapshot = { nodes: new Map([['row-rerun', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push({ url: target, body: init && init.body })
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    if (target.startsWith('/dsh-rerun-turn/state?sessionId=')) {
+      // Two replies belong to the edited turn; the newest one is the target.
+      return { ok: true, status: 200, json: async () => ({ ok: true, replies: [{ seq: 3, turn: 1 }, { seq: 9, turn: 1 }, { seq: 4, turn: 2 }] }) }
+    }
+    if (target === '/dsh-rerun-turn/apply') return { ok: true, status: 200, json: async () => ({ ok: true, started: true }) }
+    if (target.includes('/dsh-edit-turn/apply')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'prompt', replacementSeq: 7, shadowed: [2], applied: true }) }
+    }
+    return pluginState()
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  const rerun = byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '重跑')
+  assert.ok(rerun, 'the re-run button is there')
+
+  rerun.fire('pointerdown')
+  for (let attempt = 0; attempt < 20 && !calls.some((call) => call.url === '/dsh-rerun-turn/apply'); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  const applies = calls.filter((call) => call.url.includes('/apply')).map((call) => call.url)
+  assert.deepEqual(applies, ['/dsh-edit-turn/apply', '/dsh-rerun-turn/apply'], 'save first, re-run second')
+  const chained = calls.find((call) => call.url === '/dsh-rerun-turn/apply')
+  assert.equal(JSON.parse(chained.body).seq, 9, "the turn's newest reply is the target the sibling reruns")
+  assert.equal(JSON.parse(chained.body).sessionId, SESSION_ID)
+})
+
+test('a turn with no reply to re-run is saved with a notice, nothing else', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-norerun')
+  const snapshot = { nodes: new Map([['row-norerun', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push(target)
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    if (target.startsWith('/dsh-rerun-turn/state?sessionId=')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, replies: [{ seq: 4, turn: 2 }] }) }
+    }
+    if (target === '/dsh-rerun-turn/apply') return { ok: true, status: 200, json: async () => ({ ok: true }) }
+    if (target.includes('/dsh-edit-turn/apply')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'prompt', replacementSeq: 7, shadowed: [2], applied: true }) }
+    }
+    return pluginState()
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '重跑').fire('pointerdown')
+  for (let attempt = 0; attempt < 20 && controller.getSnapshot().notice === null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  assert.equal(controller.getSnapshot().notice, 'rerun-nothing', 'the save landed, the re-run did not')
+  assert.equal(calls.includes('/dsh-rerun-turn/apply'), false, 'the sibling is never asked')
+})
+
+test('a failed save never asks the sibling to re-run', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-failsave')
+  const snapshot = { nodes: new Map([['row-failsave', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push(target)
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    if (target.includes('/dsh-edit-turn/apply')) {
+      return { ok: false, status: 409, json: async () => ({ ok: false, code: 'stale' }) }
+    }
+    return pluginState()
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '重跑').fire('pointerdown')
+  for (let attempt = 0; attempt < 10; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.some((target) => target.startsWith('/dsh-rerun-turn/state?sessionId=')), false,
+    'the chain starts from a landed save only')
+  assert.equal(controller.getSnapshot().failure, 'stale', 'and the refusal is shown as usual')
+})
+
+test('a reply edit offers no re-run button', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document, 'row-reply-rerun')
+  const snapshot = { nodes: new Map([['row-reply-rerun', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
+  globalThis.fetch = async (url) => {
+    if (String(url) === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, hidden: [], turns: [], replies: [{ seq: 5, turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 }], config: { confirm: false } }),
+    }
+  }
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'the original answer', attachments: 0 })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'],
+    'the reply bar already carries the sibling’s own button')
+})
+
 test('cancel closes the editor without posting', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   let posted = 0
-  globalThis.fetch = async () => {
-    posted += 1
-    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  globalThis.fetch = async (url) => {
+    // Count our own saves only; the sibling probe is neither a save nor ours.
+    if (String(url).includes('/dsh-edit-turn/apply')) posted += 1
+    return { ok: false, status: 404, json: async () => ({ ok: false }) }
   }
   byClass(row, 'dshet-action')[0].fire('click')
   render(harness, controller, snapshot)
@@ -1407,7 +1560,7 @@ test('a save re-reads the state it just changed', async () => {
   const snapshot = { nodes: new Map([['row-refresh', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
   const asked = []
   globalThis.fetch = async (url) => {
-    const isState = String(url).includes('/state')
+    const isState = String(url).includes('/dsh-edit-turn/state')
     if (isState) asked.push(String(url))
     return {
       ok: true,

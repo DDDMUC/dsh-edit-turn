@@ -1,6 +1,6 @@
 # dsh-edit-turn
 
-**DeepSeek Harness 的「编辑某一轮」插件 —— 点用户消息旁的编辑按钮，就地改写那一句。保存即生效：改后的内容成为模型后续读到的版本，这一条消息下面的对话原样不动。** 改写走官方 surface-replace 契约（一条替换事件同时完成"删旧 + 立新"，被替换的内容从模型上下文里消失），**默认不重跑模型**。会话日志是 append-only 的，**原始字节一个都不改写**。
+**DeepSeek Harness 的「编辑某一轮」插件 —— 点用户消息旁的编辑按钮，就地改写那一句。保存即生效：改后的内容成为模型后续读到的版本，这一条消息下面的对话原样不动。** 改写走官方 surface-replace 契约（一条替换事件同时完成"删旧 + 立新"，被替换的内容从模型上下文里消失），**保存本身永不调用模型**。会话日志是 append-only 的，**原始字节一个都不改写**。
 
 [中文](#中文) · [English](#english)
 
@@ -18,14 +18,14 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 - 点击后在该消息下方就地展开编辑器，预填原文；
 - 保存后：**只有这一条消息被替换**——旧措辞从模型上下文里消失，改后的内容占住它的位置（因此后续每一轮读到的都是改后的版本）；
 - **它下面的助手回复、以及之后的全部对话，原样保留**，不重跑、不清空；
-- 想让它立刻按改后的内容重新回答，把 `rerun` 打开即可。
+- 装了姊妹插件 **dsh-rerun-turn** 时，编辑器里会多一个「**重跑**」：先保存这次修改，再让它用改后的提示词重新生成这一轮（后续轮次逐事件重放回来，不丢）。
 
 ### 特性
 
 - **官方 seam，不改日志** —— 回退 = 追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的替换事件。原始事件全部留在会话文件里，只是不再进入 `deriveMessages()`。与官方 `/compact` 用的是同一套契约。
 - **改写内容就是载体本身** —— 提示词编辑落下的是一条 `user/message` 替换事件，内容就是你改后的那句话。它既让模型读到你改后的版本，也在转录里显示成你自己的气泡；平台不会把它当成新输入去回答（这一点踩过坑：**追加**一条 user 消息会触发平台自动回答，越改越多）。
 - **窗口最小化** —— 提示词编辑只遮蔽目标那一格（`shadowed = [target.seq]`）；回复编辑才需要"到末尾"的窗口（回答变了，建立在它之上的一切都不再成立），因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
-- **默认不重跑模型** —— 保存只写上下文，不产生任何模型调用。想"改完立刻重答"，配置 `rerun: true`：那会走官方准入路径 `ctx.sessionController.prompt()`（它会自己 resume 冷会话，并恰好开一个新轮次）。
+- **保存永不调用模型** —— 保存只写上下文，不产生任何模型调用。"改完立刻重答"是另一件事，交给姊妹插件 **dsh-rerun-turn**（它遮蔽该轮、用表面上的提示词重新生成、再把后续轮次逐事件重放回来）；本插件只在它装着时提供一个「重跑」按钮转发过去。
 - **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，再**追加**一条带改写文本的助手消息——模型会把改写后的内容当成自己说过的话，对话可以继续。`source.editedBy` 会如实记录这段文字由插件写入。
 - **改过的那条还能再改** —— 它仍然显示在原来的位置（由插件渲染成气泡），悬停就有编辑按钮。
 - **一次点击即执行** —— 保存后不再有二次确认（`confirm: true` 可恢复两步确认，确认步里会写明这次保存会丢弃什么）。编辑器本身已经是用户主动打开的动作，保存的后果在 README 与确认步里说明，输入框本身保持干净。
@@ -50,7 +50,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 ### 使用
 
 1. 把鼠标移到你想改的那条**用户消息**上，点右侧的编辑图标（铅笔）。
-2. 消息下方展开编辑器，原文已预填。改完点「**保存**」——**一次点击即执行**：旧措辞从模型上下文里移除，改后的内容占住它的位置，**不叫模型**。（配置 `rerun: true` 时按钮为「保存并重跑」。）
+2. 消息下方展开编辑器，原文已预填。改完点「**保存**」——**一次点击即执行**：旧措辞从模型上下文里移除，改后的内容占住它的位置，**不叫模型**。装了 `dsh-rerun-turn` 时旁边还有一个「**重跑**」：先保存，再让那一轮用改后的内容重新生成（后续轮次不丢）。
 3. 编辑器收起，那条消息就地变成你改后的内容；它下面的回复与之后的对话**原样不动**。
 
 编辑器是**平台输入框那样的一个圆角盒子**：输入区在上、取消与主按钮在右下，聚焦时整圈描边高亮；**随文字长高**（空的时候不留空白），没有标题栏、没有常驻说明、没有拖拽手柄。键盘也和输入框一致：**Enter 保存、Shift+Enter 换行、Esc 取消**（确认步里 Esc 是退回上一步）。**输入法优先**：组合中的 Enter 与"候选选词的 Enter"（`isComposing` 或 `keyCode 229`，平台自己的输入框也是这两条一起挡）都不会被当成保存，组合期间也不重排输入框——此前少挡了 229 那半，拼音选词按回车会直接保存/关闭，看起来就是"打不了中文"。
@@ -69,13 +69,11 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 - id: dsh-edit-turn
   config:
     confirm: false              # 默认 false：一次点击即执行；置 true 才要求二次确认
-    rerun: false                # 默认 false：保存只写上下文；置 true 则同时重跑该轮
 ```
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `confirm` | `false` | 客户端保存后是否先要求一次确认。默认**关闭**（一次点击即执行：编辑器本身已是用户主动打开的动作；设为 `true` 时确认步里会写明这次保存会丢弃什么）； |
-| `rerun` | `false` | 保存后是否立刻重跑该轮。默认**关闭**：改后的内容进上下文即可，等你下次发消息时模型才读到它。设为 `true` 则保存即重跑（走官方 `sessionController.prompt()`）。 |
 
 ### 工作原理
 
@@ -96,11 +94,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 
 落盘后等一次持久化检查点（`sessions.flush`），保证重启也能看到。
 
-**第二步（可选）：重跑。** 默认不做。`rerun: true` 时：
-
-```js
-await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: 新内容 }] })
-```
+**重跑不由本插件做。** "改完立刻重答"是姊妹插件 `dsh-rerun-turn` 的操作：它遮蔽该轮、用表面现在显示的提示词（也就是你改后的文本）重新生成，再把后续轮次逐事件重放回来。本插件只负责把编辑落地；编辑器里的「重跑」按钮仅在检测到它挂载时出现，点击后先保存、再调用它的 `POST /dsh-rerun-turn/apply`。它不在（例如桌面版没装）时，没有这个按钮。
 
 **为什么不做文件截断？** 因为那不是官方能力。`dsh-session-persistence-jsonl` 只暴露残帧崩溃修复用的 `truncateTornTail`，正常路径下「Committed events are never rewritten」；运行中的宿主把会话放在内存 append-only 日志 + 投影缓存里，改磁盘不会让它重新读取。截断还会破坏 `sourceEventSeqs` 的 `[start,end]` 压缩表示与多帧 zstd 结构。surface-replace 是官方为这件事准备的机制。
 
@@ -109,7 +103,7 @@ await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', conten
 | 类型 | 名称 | 说明 |
 |---|---|---|
 | 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本（`hidden` + `revisions`）、surface、忙碌状态 |
-| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容（`rerun: true` 时另加重跑）；响应含 `applied` / `reran` / `shadowed` / `replacementSeq` |
+| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容；响应含 `applied` / `shadowed` / `replacementSeq` |
 | 工具 | `edit_turn_targets` | 只读：列出该会话当前可编辑的轮次与原文（供 agent 自查） |
 | 前端 | `conversation.input.overlay` | 每会话控制器：编辑入口、就地编辑器、被遮蔽行的隐藏账本 |
 
@@ -170,7 +164,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 - 可以编辑**你自己输入的消息**与**模型的回答**；注入的上下文行与系统提示词没有编辑入口。
 - 编辑一条回答会把它替换为**纯文本**：该回答里的工具调用与思考过程会被移除（编辑器会提示），因为它们的结果已不再成立。
-- 编辑一条用户消息**只替换那一条**，**默认不重跑模型**（`rerun: true` 才会保存后立刻重跑）；编辑一条模型回答只替换内容，同样不问模型。
+- 编辑一条用户消息**只替换那一条**，**保存永不调用模型**；编辑一条模型回答只替换内容，同样不问模型。想立刻重答，用 `dsh-rerun-turn` 的「重跑」。
 - **提示词编辑只动那一条**：它下面的回复与之后的对话**原样保留**。**回复编辑**才会移除该回答及其后的内容——回答变了，建立在它之上的一切都不再成立。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
 - **只改写文本**。消息里含图片/文件附件时，改写后只保留文字（编辑器会提示）。
 - **会话必须当前在 DSH 中打开**，否则返回 `409 session-not-active`。
@@ -218,6 +212,12 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.12** —— 编辑器里的「重跑」（转发给 dsh-rerun-turn），并删除旧的 `rerun` 配置。
+
+- **新增：「重跑」按钮（提示词编辑专用）**。装了姊妹插件 **dsh-rerun-turn** 时，取消/保存 旁多一个「重跑」：先走本插件的保存（就地替换、不花模型调用），紧接着调用它的 `POST /dsh-rerun-turn/apply { sessionId, seq: 该轮作答 }`——它按表面现在显示的提示词（你改后的文本）重新生成，并把后续轮次逐事件重放回来。探测方式与它的加载器探针一致（不带 sessionId 请求它的 `/state`：400=装着、404=没装），**没装就没有这个按钮**（例如桌面版没装时）。回答编辑不加这个按钮——回答动作条里本来就有它自己的 ↻。**它的 apply 不接受改写文本，所以顺序永远是先保存、后重跑**；该轮没有可重跑的作答、或它拒绝（`not-rerunnable`/`already-retired`/`busy`/`rerunning`…）时，按错误码提示，不影响已经落地的保存。
+- **删除：旧的 `rerun: true` 配置及其实现**。旧路径在保存后用 `sessionController.prompt()` 在末尾追加一条同文提问——那不是"重跑这一轮"，语义不干净（会在上下文里多出一条重复提问）。现在 `POST /apply` 的响应不再有 `reran` / `rerunError`，`/state` 的 `config` 不再有 `rerun`，i18n 的「保存并重跑」与文档一并移除；**保存永不调用模型**，重跑一律交给 dsh-rerun-turn。
+- **诚实修正（流程问题）**：静态检查里「编辑器锚定到替代行」那条断言自 0.2.7 起写的还是被替换前的旧表达式（`view.revisions.get(seq)`，代码已改为 `headRevision(...)`），**一直红着**；我在那几轮里只 grep「全部通过」而漏看 `✗`，所以 0.2.7–0.2.11 的提交说明里"静态全绿"的说法**有一处不实**（单测、契约、真机冒烟这些当时确实都过，功能未受影响）。本条断言已按现表达式修正，并且从此用**退出码**判定 `npm run check`。本版：114 单测 / 80 契约 / 静态（exit 0）/ verify:live / verify:ui 全绿。
 
 **0.2.11** —— 修「字怎么变大了」。
 
@@ -336,7 +336,7 @@ This plugin adds it:
 - saving **replaces that one message in place**: only the old wording leaves the model context, the revised text takes its place, and every later turn is answered against the new version;
 - **the reply under it and the whole conversation after it stay exactly as they were** - nothing is re-run and nothing is cleared;
 - model replies are editable too: replacing one rolls back that answer and everything built on it (a changed answer invalidates what followed) and appends your text as a fresh reply;
-- turn `rerun` on if you do want the edited turn answered again right away.
+- with the sister plugin **dsh-rerun-turn** installed, the editor also offers a "**Re-run**" button: it saves your change first, then has that plugin regenerate the turn from the revised prompt (replaying what followed, so nothing after it is lost).
 
 ### Features
 
@@ -344,7 +344,7 @@ This plugin adds it:
 - **The revision is the carrier.** A prompt edit lands a `user/message` replacement whose content **is** your revised text: it updates the model context and shows in the transcript in place of the old wording. The platform does not answer it as a new input (that was tried: *appending* a user message makes the platform reply, and the next save added another copy). Reply edits stay silent too: their carrier is an empty `developer/message` - the format admits only system-prompt sources on `system/message`, and an empty plugin-owned system node is exactly what used to make sessions unreadable (see below).
 - **The smallest window that is correct.** A prompt edit shadows exactly one node (`shadowed = [target.seq]`); a reply edit shadows the reply through the end of the surface - a changed answer invalidates everything built on it - which also keeps an assistant message (carrying its own tool_use blocks) and the tool/result it produced together. A dangling call/result pair is impossible.
 - **A rewritten message stays editable.** It still shows where the original stood, and hovering it offers the pencil again.
-- **No model call by default.** Saving only writes the context. `rerun: true` restores the old behaviour and goes through the one official prompt admission path, `ctx.sessionController.prompt()`.
+- **Saving never calls the model.** It only writes the context. Regenerating a turn after the edit is a different operation, owned by the sister plugin **dsh-rerun-turn** (it shadows the turn, regenerates from the prompt the surface now shows, and replays the turns that followed); this plugin only forwards to it, through the "Re-run" button, when it is mounted.
 - **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The answer is rolled back together with everything after it, and the corrected text is **appended** as a fresh reply - the model goes on treating it as its own. `source.editedBy` records honestly that the plugin wrote those words.
 - **One click applies** - no second confirmation by default. The editor is already an explicit action the user opened; with `confirm: true` the confirmation step states what this save will discard, while the input box itself stays clean.
 - **Bilingual UI** that follows the current DSH locale.
@@ -368,7 +368,7 @@ Restart the DSH process that serves that profile to pick it up.
 ### Usage
 
 1. Hover the **user message** you want to change and click the pencil action.
-2. An editor opens below it with the original text pre-filled. Click "**Save**" - **one click applies**: the old wording leaves the model context and the revised text takes its place. **No model call.** (`rerun: true` shows "Save and re-run" instead.)
+2. An editor opens below it with the original text pre-filled. Click "**Save**" - **one click applies**: the old wording leaves the model context and the revised text takes its place. **No model call.** With `dsh-rerun-turn` installed there is also a "**Re-run**" button: save first, then let that turn regenerate from your revised wording (nothing after it is lost).
 3. The editor closes and the message shows your text in place; the reply under it and everything after it stay exactly where they were.
 
 The editor is **shaped like the platform's own input box**: one rounded
@@ -397,13 +397,11 @@ longer valid once you have changed what the model said.
 - id: dsh-edit-turn
   config:
     confirm: false              # default: apply in one click; true restores the two-step flow
-    rerun: false                # default: saving only writes the context; true re-runs the turn
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
 | `confirm` | `false` | Whether the client asks for a second confirmation before applying. Off by default - one click applies, because the editor is already an explicit action the user opened; with `true` the confirmation step states what this save will discard. |
-| `rerun` | `false` | Whether the edited turn is re-run right after saving. Off by default: the revision enters the context and the model reads it on your next message. `true` re-runs through the official `sessionController.prompt()`. |
 
 ### How it works
 
@@ -434,11 +432,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 The append then waits for the official durability checkpoint (`sessions.flush`)
 so a reload or a DSH restart still sees the rollback.
 
-**Step two (optional): the re-run.** Off by default; `rerun: true` turns it on.
-
-```js
-await ctx.sessionController.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] })
-```
+**The re-run is not this plugin's operation.** Regenerating the turn is the sister plugin `dsh-rerun-turn`'s job: it shadows the turn, regenerates from the prompt the surface now shows (your revised text), and replays the turns that followed. This plugin only lands the edit; its editor offers a "Re-run" button when that plugin is detected, and the button chains save-then-`POST /dsh-rerun-turn/apply`. Without it (the desktop profile, say) there is no such button.
 
 **Why not truncate the log?** Because that is not an official capability.
 `dsh-session-persistence-jsonl` exposes only `truncateTornTail`, for crash
@@ -454,7 +448,7 @@ for exactly this.
 | Kind | Name | Purpose |
 |---|---|---|
 | Route | `GET /dsh-edit-turn/state?sessionId=` | Editable turns, the hidden-row ledger (`hidden` + `revisions`), the surface, busy state |
-| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → write the revised text (`rerun: true` re-runs too); the response carries `applied` / `reran` / `shadowed` / `replacementSeq` |
+| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → write the revised text; the response carries `applied` / `shadowed` / `replacementSeq` |
 | Tool | `edit_turn_targets` | Read-only: list the session's editable turns and their text |
 | Client | `conversation.input.overlay` | Per-session controller: edit entry, in-place editor, hidden-row ledger |
 
@@ -703,8 +697,8 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 - **Human prompts and model replies** are both editable; injected context rows and the system prompt offer no edit entry.
 - **Editing a reply replaces it with plain text**: the tool calls and reasoning inside it are removed (the editor warns first), because their results are no longer valid.
-- **Editing a user message replaces that one message and leaves the rest of the conversation untouched - no re-run unless `rerun: true`**; editing a model reply only replaces the text and never asks the model again.
-- **A prompt edit touches only that message.** The reply under it and the whole conversation after it are kept - no re-run unless `rerun: true`. A **reply edit** removes that answer and everything built on it, because a changed answer invalidates what followed. Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
+- **Editing a user message replaces that one message and leaves the rest of the conversation untouched; saving never calls the model.** For an immediate answer, use `dsh-rerun-turn`'s "Re-run"; editing a model reply only replaces the text, too.
+- **A prompt edit touches only that message.** The reply under it and the whole conversation after it are kept; saving never calls the model. A **reply edit** removes that answer and everything built on it, because a changed answer invalidates what followed. Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
 - **Text only.** A message carrying image or file attachments keeps its text and drops them (the editor warns first).
 - **The session must be open in DSH**, otherwise the route answers `409 session-not-active`.
 - **Running work is refused**: an unclosed turn or an in-flight compaction answers `409 busy`.
