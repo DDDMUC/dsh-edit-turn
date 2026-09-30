@@ -652,6 +652,21 @@ test('pressing the pencil again keeps what was typed', async () => {
   assert.equal(again.value, 'half-written', 're-opening the same edit must not reset the draft')
 })
 
+test('the editor leaves when the conversation view does', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.ok(editorIn(harness), 'the editor is open')
+
+  // The composer card - and this entry with it - unmounts: the user switched
+  // to Settings. Nothing re-adds the editor afterwards, so it must clear up
+  // after itself; left behind it floated over whatever came next.
+  harness.fresh()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(editorIn(harness), null, 'the editor did not stay behind')
+  assert.equal(byClass(harness.document.body, 'dshet-layer').length, 0, 'and neither did its layer')
+})
+
 test('a strayed revision bubble is reused, not duplicated', async () => {
   const harness = await loadBundle()
   const controller = harness.controller

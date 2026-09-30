@@ -345,6 +345,21 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// The editor is hosted on the body, where no framework clears up after it.
+// Left behind when the conversation view unmounts (switching to Settings), it
+// floated over whatever came next. The clear is deferred so that a dependency
+// re-run of the effect - which happens on every publish - can cancel it.
+check(
+  'the editor is cleared when its view goes away, not on every re-render',
+  clientSource.includes('controller.clearTimer = window.setTimeout') &&
+    clientSource.includes('clearEditor()\n            controller.editorBox = null'),
+  'clearing eagerly would fight the effect re-running on each view change',
+)
+check(
+  'an empty layer does not stay on the page',
+  /clearEditor[\s\S]{0,400}editorLayer\.remove\(\)/.test(clientSource),
+)
+
 // Two identical bubbles on one row had two sources: a bubble the host had
 // shunted out of reach was forgotten and a second one planted; and a stale DOM
 // pass (old view, no hidden rows) un-collapsed the row so the original bubble
