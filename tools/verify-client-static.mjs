@@ -337,12 +337,20 @@ check(
 )
 check(
   'the injected pencils are wired through the press helper too',
-  clientSource.includes('pressable(button, () => controller.open(entry.target))'),
+  /function wireAction\(button\)\s*\{\s*pressable\(button,/.test(clientSource),
+  'a pencil that only listens for click evaporates when the host rebuilds the row',
+)
+check(
+  'the reused button reads its action off the element, not off a closure',
+  clientSource.includes('const activate = button[ACTIVATE]') &&
+    clientSource.includes('button[ACTIVATE] = () => controller.open(entry.target)'),
+  'a captured controller is the retired one after a reload, which opens nothing',
 )
 check(
   'the helper is wired once per button, not once per pass',
-  clientSource.indexOf('pressable(button,') < clientSource.indexOf('entry.target = target'),
-  're-wiring resets the guard between the press and the click it swallows',
+  clientSource.indexOf('pressable(button,') < clientSource.indexOf('entry.target = target') &&
+    [...clientSource.matchAll(/(?<!function )wireAction\(button\)/g)].length === 2,
+  're-wiring on every pass resets the guard between the press and the click it swallows',
 )
 
 // The re-run button is the sibling's job (dsh-rerun-turn): it exists only when
@@ -710,6 +718,77 @@ check(
   'an answer older than the newest probe is ignored',
   probeSource.includes('if (token !== this.probeToken) return'),
   'two opens before the first answer used to let the slower probe win',
+)
+
+// A reload applies this bundle again over the DOM the previous instance left.
+// That instance is gone - fresh closures, fresh WeakMap, fresh layer - so its
+// nodes can only be found by the namespace attributes they carry. Reuse keeps
+// one host per row; the unload sweep takes everything of ours out. Missing
+// either half, the bar collects one more host per apply, which is what the CDP
+// probe measured on the live page.
+console.log('\n  — a reload neither stacks a second pencil nor forgets its own —')
+const ownSelectorSource = /const OWN_NODE_SELECTOR = \[([\s\S]*?)\]\.join\('([^']*)'\)/.exec(clientSource)?.[1] ?? ''
+check(
+  'every injected host carries its namespace attribute, not only the class',
+  clientSource.includes("host.className = 'dshet-action-host'") &&
+    /host\.dataset\[HOST_ATTR\] = '1'/.test(clientSource),
+  'the attribute is the only handle that survives the module instance (I3)',
+)
+check(
+  'the revision bubble and the editor layer are namespaced too',
+  /bubble\.dataset\.dshetRevision = '1'/.test(clientSource) &&
+    /editorLayer\.dataset\[LAYER_ATTR\] = '1'/.test(clientSource),
+)
+check(
+  'an existing host in the row is adopted instead of a second one being planted',
+  clientSource.includes('function adoptActionHost(row)') && clientSource.includes('adoptActionHost(row)'),
+  'this is the half that stops the pile-up growing',
+)
+check(
+  'a host that no pass of this instance claimed is swept',
+  clientSource.includes('function dropUnclaimedHosts()') &&
+    /hosts = document\.querySelectorAll\(HOST_SELECTOR\)/.test(clientSource) &&
+    /if \(liveHosts\.has\(host\)\) continue/.test(clientSource),
+  'only this plugin’s own namespace is ever a candidate (I3)',
+)
+check(
+  'the sweep runs at the end of a DOM pass',
+  /dropUnclaimedHosts\(\)\n    \}/.test(clientSource),
+  'a ghost is taken out on the first pass after the reload that made it',
+)
+check(
+  'unloading removes every injected node by namespace',
+  clientSource.includes('function releaseInjectedNodes()') &&
+    clientSource.includes("each(OWN_NODE_SELECTOR, (node) => node.remove())"),
+  'the WeakMap dies with the module instance, the attributes on the nodes do not',
+)
+check(
+  'unloading gives back the rows and children this plugin hid',
+  clientSource.includes(`each('[data-dshet-hidden="1"]', (row) => setRowHidden(row, false))`) &&
+    clientSource.includes(`each('[data-dshet-collapsed="1"]', (child) => {`),
+  'a collapsed message must not stay collapsed with no plugin left to restore it',
+)
+check(
+  'the unload runs from the effect the host disposes',
+  /ctx\.effect\(\s*\(\) => \(\) => \{[\s\S]{0,700}releaseInjectedNodes\(\)/.test(clientSource),
+  'the fiber cleanup is the one moment the host tells this plugin it is going away',
+)
+check(
+  'React-owned nodes are kept out of the sweep',
+  ownSelectorSource !== '' &&
+    !ownSelectorSource.includes('dshet-notice') &&
+    !ownSelectorSource.includes('dshet-reply-action'),
+  'the host unmounts those itself, and removing one from under React throws',
+)
+check(
+  'a host that lost its parent is rebuilt rather than repositioned',
+  /if \(entry !== undefined && !hasParent\(entry\.host\)\)/.test(clientSource),
+  'the sweep of an instance being replaced can take the adopted node with it',
+)
+check(
+  'the editor layer is adopted when a previous apply left one',
+  /const existing = ownLayer\(\)/.test(clientSource) && clientSource.includes('function ownLayer()'),
+  'a second fixed layer would sit over the first for the life of the page',
 )
 
 console.log(failures === 0 ? '\n全部通过：客户端半部静态检查通过。' : `\n${failures} 项失败。`)
