@@ -150,6 +150,11 @@ class StubElement {
     return name in this.attributes ? this.attributes[name] : null
   }
 
+  /** Attribute presence: what a hide-attribution guard asks the DOM. */
+  hasAttribute(name) {
+    return name in this.attributes
+  }
+
   addEventListener(type, handler) {
     const list = this.listeners.get(type) ?? []
     list.push(handler)
@@ -1650,3 +1655,218 @@ test('the reply entry cannot take the assistant-actions strip down with it', asy
   assert.equal(button.type, 'button')
   assert.equal(typeof button.props.children.type, 'function', 'the icon is rendered with a config object, not null')
 })
+// --- the sibling probe is allowed to say "I do not know yet" (contract §3) ---
+
+/** A promise the test settles when it decides the network answered. */
+function deferredAnswer() {
+  let settle = null
+  const promise = new Promise((resolve) => {
+    settle = resolve
+  })
+  return { promise, resolve: settle }
+}
+
+test('a probe that cannot reach the sibling is absent, and logs nothing', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const logged = []
+  const original = console.error
+  console.error = (...args) => {
+    logged.push(args)
+  }
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url) === '/dsh-rerun-turn/state') throw new TypeError('Failed to fetch')
+      return pluginState()
+    }
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, controller, snapshot)
+    assert.equal(controller.getSnapshot().siblingRerun, 'absent', 'a thrown fetch is an absent sibling')
+    assert.deepEqual(editorText(harness).buttons, ['取消', '保存'], 'and no button is offered')
+  } finally {
+    console.error = original
+  }
+  assert.deepEqual(logged, [], 'an absent sibling is not an error (I5)')
+})
+
+test('no sibling button is drawn while the probe is still in the air', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const answer = deferredAnswer()
+  globalThis.fetch = async (url) => {
+    if (String(url) === '/dsh-rerun-turn/state') return answer.promise
+    return pluginState()
+  }
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  assert.equal(controller.getSnapshot().siblingRerun, 'unknown', 'the probe has not answered yet')
+  assert.deepEqual(editorText(harness).buttons, ['取消', '保存'],
+    'unknown is not present: the button would only flash once and leave')
+
+  // The answer lands: it has to be published, or a redraw would never come.
+  let published = 0
+  const unsubscribe = controller.subscribe(() => {
+    published += 1
+  })
+  answer.resolve({ ok: false, status: 400, json: async () => ({ ok: false }) })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  unsubscribe()
+  assert.equal(controller.getSnapshot().siblingRerun, 'present')
+  assert.ok(published >= 1, 'the probe publishes its answer, which is what redraws the editor')
+  render(harness, controller, snapshot)
+  assert.deepEqual(editorText(harness).buttons, ['取消', '重跑', '保存'], 'and the button is there now')
+})
+
+test('an older probe that answers late cannot take the sibling button back out', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const first = deferredAnswer()
+  const second = deferredAnswer()
+  const queue = [first.promise, second.promise]
+  let asked = 0
+  globalThis.fetch = async (url) => {
+    if (String(url) === '/dsh-rerun-turn/state') {
+      asked += 1
+      return queue.shift()
+    }
+    return pluginState()
+  }
+  const slow = controller.probeSiblingRerun()
+  const fresh = controller.probeSiblingRerun()
+  assert.equal(asked, 2, 'both probes are in flight')
+  second.resolve({ ok: false, status: 400, json: async () => ({ ok: false }) })
+  await fresh
+  assert.equal(controller.getSnapshot().siblingRerun, 'present', 'the newest answer wins')
+  first.resolve({ ok: false, status: 404, json: async () => ({ ok: false }) })
+  await slow
+  assert.equal(controller.getSnapshot().siblingRerun, 'present', 'the stale 404 is ignored')
+})
+
+// --- hiding is attributed, never assumed (contract I4) -----------------------
+
+test('a row another plugin is keeping away stays away when this plugin restores it', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const byDataset = mountHostUserRow(harness.document, 'row-foreign-dataset')
+  const byAttribute = mountHostUserRow(harness.document, 'row-foreign-attr')
+  // delete-turn and rerun-turn mark a row they displayed away with their own
+  // attribute and their own `display:none` (contract §4). One writes through
+  // dataset, the other through the raw attribute - both have to be seen.
+  byDataset.row.dataset.dshdtHidden = '1'
+  byDataset.row.style.display = 'none'
+  byAttribute.row.attributes['data-dsrr-hidden'] = '1'
+  byAttribute.row.style.display = 'none'
+  const snapshot = {
+    nodes: new Map([
+      ['row-foreign-dataset', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
+      ['row-foreign-attr', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }],
+    ]),
+  }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(byDataset.row.dataset.dshetHidden, '1', 'this plugin marked its own hide')
+  assert.equal(byAttribute.row.dataset.dshetHidden, '1')
+
+  // The rewrite goes back: this plugin may drop its own hide, nothing else.
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(byDataset.row.dataset.dshetHidden, undefined, 'our marker is gone')
+  assert.equal(byAttribute.row.dataset.dshetHidden, undefined)
+  assert.equal(byDataset.row.style.display, 'none', "delete-turn's hide still stands")
+  assert.equal(byAttribute.row.style.display, 'none', "rerun-turn's hide still stands")
+  assert.equal(byAttribute.row.attributes['data-dsrr-hidden'], '1', 'and their marker was left alone')
+  assert.equal(byDataset.row.attributes['data-dshet-hidden'], undefined, 'ours was the only one removed')
+})
+
+test('a child another plugin had already displayed away is not shown again', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-foreign-child')
+  const snapshot = { nodes: new Map([['row-foreign-child', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  // The message stack was already `display:none` when this plugin's pass first
+  // ran - another plugin's doing, with no marker of ours to prove otherwise.
+  host.stack.style.display = 'none'
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.row.dataset.dshetHidden, '1', 'our own collapse landed')
+  assert.equal(host.stack.dataset.dshetCollapsed, undefined,
+    'a `none` this plugin did not write is not claimed as its own')
+  assert.equal(host.stack.style.display, 'none', 'and it is left exactly as it was found')
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'this plugin gave its own hide up')
+  assert.equal(host.stack.style.display, 'none', "the other plugin's hide was not lifted with it")
+})
+
+// --- injection is idempotent and touches nobody else's nodes (contract I3) ---
+
+test('another plugin’s button in the bar survives every pass, and the pencil reuses its node', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-foreign-button')
+  const foreign = harness.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  foreign.textContent = '↻'
+  host.bar.appendChild(foreign)
+  const snapshot = { nodes: new Map([['row-foreign-button', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  const injected = byClass(host.bar, 'dshet-action-host')[0]
+  assert.ok(injected, 'the pencil joined the bar')
+  assert.equal(foreign.parentElement, host.bar, "the other plugin's button was not removed or moved")
+  assert.equal(foreign.attributes['data-dsrr-action'], '1', 'and it kept its own marker')
+  assert.equal(injected.previousElementSibling, foreign, 'the pencil sits after the last platform action')
+  assert.equal(host.copy.parentElement, host.bar, 'the host’s own buttons never move')
+  assert.equal(host.time.parentElement, host.bar)
+
+  // Every later pass works on the nodes that are already there.
+  render(harness, controller, snapshot)
+  render(harness, controller, snapshot)
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'no second pencil was planted')
+  assert.equal(byClass(host.bar, 'dshet-action-host')[0], injected, 'the same node is reused, not replaced')
+  assert.equal(foreign.parentElement, host.bar, 'and the foreign button is still where it was')
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(foreign.parentElement, host.bar, 'the restore pass leaves it alone too')
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1)
+  assert.equal(host.bar.children.length, 4, 'time, copy, the sibling’s button, the pencil - nothing else')
+})
+
+test('opening and closing the editor repeatedly leaves one pencil and one box', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  globalThis.fetch = async () => pluginState()
+  const pencil = byClass(row, 'dshet-action')[0]
+  assert.ok(pencil, 'the row carries its pencil')
+
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    pencil.fire('pointerdown')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, controller, snapshot)
+    assert.equal(byClass(harness.document.body, 'dshet-editor').length, 1, `one box on cycle ${cycle}`)
+    assert.deepEqual(editorText(harness).buttons, ['取消', '保存'])
+    byClass(editorIn(harness), 'dshet-btn')[0].fire('click') // 取消
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, controller, snapshot)
+    assert.equal(byClass(harness.document.body, 'dshet-editor').length, 0, `no box left on cycle ${cycle}`)
+  }
+
+  assert.equal(byClass(harness.document.body, 'dshet-layer').length, 0, 'the empty overlay went with it')
+  assert.equal(byClass(row, 'dshet-action-host').length, 1, 'exactly one pencil')
+  assert.equal(byClass(row, 'dshet-action')[0], pencil, 'the same node, so a host re-render cannot flicker it')
+  assert.equal(byClass(harness.document.body, 'dshet-notice').length, 0, 'and no ghost banner was left behind')
+})
+

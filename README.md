@@ -213,6 +213,13 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
+**0.2.13** —— 隐藏归因（互操作契约 I4）+ 兄弟探测硬化（I5）。只修 Bug，交互语义不变。
+
+- **修复：别人隐藏的行，本插件不再替它显示出来**。回退的「恢复可见」分支无条件把 `row.style.display` 清成 `''`——那一行若正被 **dsh-delete-turn**（`data-dshdt-hidden`）或 **dsh-rerun-turn**（`data-dsrr-hidden`）按归属属性隐藏着，本插件一恢复就把别人的隐藏一并抹掉（行"复活"）。现在按契约 §4 在本地拷入 `foreignHideOn(row,'dshet')`：恢复前先确认没有别的归属属性，有则**保持 `display:none`**，只交还本插件自己那份隐藏。同理，折叠子节点时只有**本插件亲手写下**的 `display:none` 才打 `data-dshet-collapsed` 标记，恢复时也不会把别的插件留下的 `none` 重新显示出来。
+- **修复：兄弟探测的过期答案不再覆盖新答案**（探测令牌，编辑器连开两次时不再闪一下又消失）；`fetch` 抛错仍归入「缺席」且不打印任何日志（I5），探测结果为 `unknown` 时依旧不渲染重跑按钮。
+- **English**: rows another plugin is keeping hidden are no longer un-hidden by this plugin's restore pass (`foreignHideOn(row, 'dshet')`, contract §4), a `display:none` this plugin did not write is no longer claimed by the collapse marker, and a sibling-probe answer older than the newest probe can no longer take the re-run button back out; a failed probe stays silent and absent.
+- 本版：`npm test` 121/121、`npm run verify:contract` 80/80、`npm run verify:client` 145/145 全绿（exit 0）；新增 7 条 DOM 用例与 5 条静态检查，三条新用例已用「改回旧代码」验证必红。
+
 **0.2.12** —— 编辑器里的「重跑」（转发给 dsh-rerun-turn），并删除旧的 `rerun` 配置。
 
 - **新增：「重跑」按钮（提示词编辑专用）**。装了姊妹插件 **dsh-rerun-turn** 时，取消/保存 旁多一个「重跑」：先走本插件的保存（就地替换、不花模型调用），紧接着调用它的 `POST /dsh-rerun-turn/apply { sessionId, seq: 该轮作答 }`——它按表面现在显示的提示词（你改后的文本）重新生成，并把后续轮次逐事件重放回来。探测方式与它的加载器探针一致（不带 sessionId 请求它的 `/state`：400=装着、404=没装），**没装就没有这个按钮**（例如桌面版没装时）。回答编辑不加这个按钮——回答动作条里本来就有它自己的 ↻。**它的 apply 不接受改写文本，所以顺序永远是先保存、后重跑**；该轮没有可重跑的作答、或它拒绝（`not-rerunnable`/`already-retired`/`busy`/`rerunning`…）时，按错误码提示，不影响已经落地的保存。
