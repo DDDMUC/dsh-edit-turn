@@ -345,6 +345,21 @@ check(
   're-wiring resets the guard between the press and the click it swallows',
 )
 
+// The rewritten text and the editor used to disagree with the platform about
+// font size: `font:inherit` picked up the row's 16px for the bubble while the
+// editor hardcoded 15px, so a reader with a different content font setting saw
+// the text change size. Both take the platform's own source now.
+check(
+  'the rewritten bubble uses the platform content font metrics',
+  /\.dshet-revision\{[^}]*font-size:var\(--dsh-content-font-size,14px\)/.test(css) &&
+    /\.dshet-revision\{[^}]*line-height:calc\(22px \+ var\(--dsh-content-font-delta,0px\)\)/.test(css),
+)
+check(
+  'the editor text uses the platform content font metrics',
+  /\.dshet-editor textarea\{[^}]*font-size:var\(--dsh-content-font-size,14px\)/.test(css) &&
+    /\.dshet-editor textarea\{[^}]*line-height:calc\(22px \+ var\(--dsh-content-font-delta,0px\)\)/.test(css),
+)
+
 // The editor is hosted on the body, where no framework clears up after it.
 // Left behind when the conversation view unmounts (switching to Settings), it
 // floated over whatever came next. The clear is deferred so that a dependency
