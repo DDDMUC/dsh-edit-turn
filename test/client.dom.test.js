@@ -16,6 +16,11 @@ import { test } from 'node:test'
 
 // --- a DOM small enough to read, complete enough to run the plugin ----------
 
+/** `dshetRevisionFor` -> `data-dshet-revision-for`: what the DOM does to a dataset key. */
+function attributeName(key) {
+  return `data-${String(key).replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`
+}
+
 class StubElement {
   constructor(tag) {
     this.tagName = String(tag).toUpperCase()
@@ -24,12 +29,20 @@ class StubElement {
     // `dataset.x` and `data-x` are the same thing in the DOM, and the plugin
     // relies on that: it marks a pencil through dataset and finds it again with
     // an attribute selector. Two detached objects here would hide that contract.
+    // Deletion is part of that contract too: `delete el.dataset.x` removes the
+    // attribute, so a sweep that selects by attribute cannot still see a node
+    // the plugin has already given up.
     this.dataset = new Proxy(
       {},
       {
         set: (target, key, value) => {
           target[key] = value
-          this.attributes[`data-${String(key).replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`] = String(value)
+          this.attributes[attributeName(key)] = String(value)
+          return true
+        },
+        deleteProperty: (target, key) => {
+          delete target[key]
+          delete this.attributes[attributeName(key)]
           return true
         },
       },
@@ -193,22 +206,22 @@ class StubElement {
     this.selectionEnd = end
   }
 
-  /** Supports the two selector forms the plugin uses on an element. */
+  /** Every selector form the plugin uses on an element, lists included. */
   querySelector(selector) {
-    const hits = walk(this).filter((node) => matches(node, selector))
+    const hits = walk(this).filter((node) => matchesAny(node, selector))
     return hits[0] ?? null
   }
 
   /** Same matcher, every hit: the fallback path counts the pencils in a bar. */
   querySelectorAll(selector) {
-    return walk(this).filter((node) => matches(node, selector))
+    return walk(this).filter((node) => matchesAny(node, selector))
   }
 
   /** Nearest ancestor (or self) matching the selector. */
   closest(selector) {
     let node = this
     while (node !== null && node !== undefined) {
-      if (matches(node, selector)) return node
+      if (matchesAny(node, selector)) return node
       node = node.parentElement
     }
     return null
@@ -216,7 +229,7 @@ class StubElement {
 
   /** Element.matches, so the plugin can test the row element itself. */
   matches(selector) {
-    return matches(this, selector)
+    return matchesAny(this, selector)
   }
 }
 
@@ -231,6 +244,22 @@ function walk(root) {
   }
   visit(root)
   return out
+}
+
+/**
+ * A selector list is the union of its parts.
+ *
+ * The plugin namespaces its injected nodes with `[data-dshet-action-host="1"]`
+ * and probes for them with an exact-value selector, plus a class fallback a
+ * bundle older than this one left behind - one comma-separated query in the
+ * browser, and therefore one here.
+ */
+function matchesAny(node, selector) {
+  const parts = String(selector)
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+  return parts.some((part) => matches(node, part))
 }
 
 function matches(node, selector) {
@@ -248,6 +277,9 @@ function matches(node, selector) {
     const value = attr === 'class' ? node.className : node.attributes[attr]
     return typeof value === 'string' && value.includes(needle)
   }
+  // `[data-x="1"]` - the namespace attribute of an injected node.
+  const valued = /^\[([a-z-]+)="([^"]*)"\]$/.exec(selector)
+  if (valued !== null) return node.attributes[valued[1]] === valued[2]
   const exact = /^\[([a-z-]+)\]$/.exec(selector)
   if (exact !== null) return exact[1] in node.attributes
   return false
@@ -266,11 +298,19 @@ const ROW_KEY = 'row-1'
  */
 let bundleFactory = null
 
-/** Load the bundle and return the registered overlay component plus its deps. */
-async function loadBundle() {
+/**
+ * Load the bundle and return the registered overlay component plus its deps.
+ *
+ * `shared.document` reuses the page an earlier call built. That is the reload
+ * case: the factory runs again - a genuinely new module instance with its own
+ * closures, its own WeakMap and its own layer - over the DOM the previous
+ * instance had already injected into, which is where the pencils used to stack.
+ */
+async function loadBundle(shared = null) {
+  const reused = shared !== null && shared !== undefined && shared.document !== undefined
   const rows = []
   const documentListeners = new Map()
-  const document = {
+  const document = reused ? shared.document : {
     body: new StubElement('body'),
     head: new StubElement('head'),
     createElement: (tag) => new StubElement(tag),
@@ -288,13 +328,11 @@ async function loadBundle() {
     fireDocument(type, event) {
       for (const handler of documentListeners.get(type) ?? []) handler(event)
     },
-    querySelector: (selector) => (rows.length > 0 ? matches(rows[0], selector) ? rows[0] : null : null),
+    querySelector: (selector) => walk(document.body).find((node) => matchesAny(node, selector)) ?? null,
     querySelectorAll(selector) {
       const all = walk(document.body)
       if (selector === '[data-chat-flow-key]') return all.filter((node) => 'data-chat-flow-key' in node.attributes)
-      if (selector === '.dshet-editor') return all.filter((node) => node._classes.has('dshet-editor'))
-      if (selector === '.dshet-revision') return all.filter((node) => node._classes.has('dshet-revision'))
-      return []
+      return all.filter((node) => matchesAny(node, selector))
     },
   }
   globalThis.document = document
@@ -360,9 +398,14 @@ async function loadBundle() {
 
   const dictionaries = []
   const registrations = []
+  // What the plugin asked to be cleaned up when it goes away. The host keeps
+  // these and runs them when the fiber is disposed (a reload, a toggle), and the
+  // harness does the same, so a test can play that unload.
+  const effectDisposers = []
   const ctx = {
     effect: (fn) => {
-      fn()
+      const cleanup = fn()
+      if (typeof cleanup === 'function') effectDisposers.push(cleanup)
       return () => {}
     },
     locale: { register: (namespace, dict) => dictionaries.push({ namespace, dict }) },
@@ -389,6 +432,9 @@ async function loadBundle() {
     cleanups,
     rows,
     fresh: () => cleanups.splice(0).forEach((fn) => fn()),
+    // The plugin fiber going away: every disposer it registered runs, newest
+    // first, the way the host disposes a fiber.
+    dispose: () => effectDisposers.splice(0).reverse().forEach((fn) => fn()),
     registrations,
   }
 }
@@ -396,7 +442,11 @@ async function loadBundle() {
 /** One user row whose only editable target is seq 2. */
 function mountRow(document, key = ROW_KEY) {
   const row = document.createElement('div')
-  row.dataset = {}
+  // `row.dataset` is left as the element's own (proxied) dataset: the plugin
+  // marks a row it hides through `dataset`, and the sweep that takes that hide
+  // back selects the row by the attribute that write produces. A fixture with a
+  // plain object for a dataset would make that marker invisible to the query and
+  // hide exactly the behaviour under test.
   row.setAttribute('data-chat-flow-key', key)
   const actions = document.createElement('span')
   actions.className = 'message_actions'
@@ -417,7 +467,6 @@ function mountRow(document, key = ROW_KEY) {
  */
 function mountHostUserRow(document, key = ROW_KEY) {
   const row = document.createElement('div')
-  row.dataset = {}
   row.setAttribute('data-chat-flow-key', key)
   row.setAttribute('data-chat-flow-kind', 'user')
 
@@ -1480,7 +1529,6 @@ test('a row with no bar to keep still shows the rewritten prompt', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
   const row = harness.document.createElement('div')
-  row.dataset = {}
   row.setAttribute('data-chat-flow-key', 'row-nobar')
   row.setAttribute('data-chat-flow-kind', 'user')
   const slot = harness.document.createElement('div')
@@ -1868,5 +1916,217 @@ test('opening and closing the editor repeatedly leaves one pencil and one box', 
   assert.equal(byClass(row, 'dshet-action-host').length, 1, 'exactly one pencil')
   assert.equal(byClass(row, 'dshet-action')[0], pencil, 'the same node, so a host re-render cannot flicker it')
   assert.equal(byClass(harness.document.body, 'dshet-notice').length, 0, 'and no ghost banner was left behind')
+})
+
+// --- a reload neither stacks nor forgets (contract I3, §5) --------------------
+//
+// The host applies this bundle more than once over the same page: an HMR
+// reload, a plugin toggle, a bundle-group swap. Every apply is a NEW module
+// instance - fresh closures, fresh WeakMap, fresh layer - and the DOM it finds
+// was left behind by the one before it. Node identities cannot bridge that, so
+// the namespace attributes have to: an injected host is found again and reused,
+// and an unload takes everything of ours out. Without both halves the bar keeps
+// collecting hosts - the probe counted seven of them and seventeen children in
+// a single strip, and the user sees "three re-run buttons on one row".
+
+test('unloading the plugin takes out everything it injected and gives the row back', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-unload')
+  const snapshot = { nodes: new Map([['row-unload', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  // A sibling plugin's button shares the bar: it belongs to that plugin and has
+  // to survive this one's unload untouched (I3).
+  const foreign = harness.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  host.bar.appendChild(foreign)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.ok(byClass(host.bar, 'dshet-action-host')[0], 'the pencil was injected')
+  assert.equal(byClass(host.row, 'dshet-revision').length, 1, 'so was the bubble for the rewritten prompt')
+  assert.equal(host.stack.style.display, 'none', 'the message this plugin rolled back is collapsed')
+
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.ok(editorIn(harness), 'the editor is open')
+  assert.equal(byClass(harness.document.body, 'dshet-layer').length, 1, 'on a layer of its own')
+
+  // The plugin is unloaded: the host disposes the fiber and runs every cleanup
+  // it registered.
+  harness.dispose()
+
+  assert.equal(byClass(host.row, 'dshet-action-host').length, 0, 'the injected host is gone')
+  assert.equal(byClass(harness.document.body, 'dshet-layer').length, 0, 'and the layer it was hosted on')
+  assert.equal(byClass(harness.document.body, 'dshet-editor').length, 0, 'and the open editor')
+  assert.equal(byClass(harness.document.body, 'dshet-revision').length, 0, 'and its revision bubble')
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'the hide this plugin wrote is given back')
+  assert.equal(host.row.dataset.dshetKeepActions, undefined, 'and the marker that kept the bar')
+  assert.equal(host.stack.dataset.dshetCollapsed, undefined, 'and the collapse marker')
+  assert.equal(host.stack.style.display, '', 'so the message it had collapsed is readable again')
+  assert.equal(foreign.parentElement, host.bar, "the sibling's button was not removed or moved")
+  assert.equal(foreign.attributes['data-dsrr-action'], '1', 'nor changed')
+  assert.equal(host.copy.parentElement, host.bar, "nor the host's own copy button")
+  assert.equal(host.time.parentElement, host.bar, 'nor its timestamp')
+  assert.equal(host.bar.children.length, 3, 'time, copy, the sibling button - nothing of ours left')
+})
+
+test('an apply over the same page adopts the host a previous apply injected', async () => {
+  const first = await loadBundle()
+  const host = mountHostUserRow(first.document, 'row-adopt')
+  const snapshot = { nodes: new Map([['row-adopt', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const foreign = first.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  host.bar.appendChild(foreign)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await first.controller.load(true)
+  render(first, first.controller, snapshot)
+  const injected = byClass(host.bar, 'dshet-action-host')[0]
+  assert.ok(injected, 'the first apply injected its host')
+  assert.equal(injected.attributes['data-dshet-action-host'], '1', 'and namespaced it (I3)')
+
+  // The reload, in its worst ordering: a new module instance over the same DOM
+  // while the previous one has not been disposed yet.
+  const second = await loadBundle({ document: first.document })
+  await second.controller.load(true)
+  render(second, second.controller, snapshot)
+
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'one host in the bar, not two')
+  assert.equal(byClass(first.document.body, 'dshet-action-host').length, 1, 'and one on the whole page')
+  assert.equal(byClass(host.bar, 'dshet-action-host')[0], injected, 'the very node the first apply injected')
+  assert.equal(byClass(first.document.body, 'dshet-action').length, 1, 'one pencil, not a pile of them')
+  assert.equal(byClass(first.document.body, 'dshet-revision').length, 1, 'and one bubble, not a second one')
+  assert.equal(host.bar.children.length, 4, 'time, copy, the sibling button, one pencil - nothing else')
+  assert.equal(foreign.parentElement, host.bar, "the sibling's button is still where it was")
+  assert.equal(host.copy.parentElement, host.bar, "and so is the host's own")
+
+  // The reused button must open the editor of the instance that is mounted NOW:
+  // the one that wired it first is retired, and a captured closure would leave
+  // the user with a pencil that does nothing at all.
+  const reusedButton = byClass(injected, 'dshet-action')[0]
+  assert.ok(reusedButton, 'the reused host still carries its button')
+  reusedButton.fire('pointerdown')
+  render(second, second.controller, snapshot)
+  assert.ok(editorIn(second), 'the adopted pencil opened the editor of the live instance')
+  assert.deepEqual(editorText(second).buttons, ['取消', '保存'])
+})
+
+test('apply, dispose, apply again leaves exactly one pencil on the row', async () => {
+  const first = await loadBundle()
+  const host = mountHostUserRow(first.document, 'row-cycle')
+  const snapshot = { nodes: new Map([['row-cycle', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const foreign = first.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  host.bar.appendChild(foreign)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await first.controller.load(true)
+  render(first, first.controller, snapshot)
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'the first apply injected one host')
+
+  first.dispose()
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 0, 'the unload took its host out')
+  assert.equal(byClass(first.document.body, 'dshet-revision').length, 0, 'and its bubble')
+
+  const second = await loadBundle({ document: first.document })
+  await second.controller.load(true)
+  render(second, second.controller, snapshot)
+  // The pass runs again on the next snapshot, as it does in the browser.
+  render(second, second.controller, snapshot)
+
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'exactly one pencil after the reload')
+  assert.equal(byClass(first.document.body, 'dshet-action-host').length, 1, 'and exactly one on the page')
+  assert.equal(byClass(first.document.body, 'dshet-revision').length, 1, 'with exactly one bubble for the row')
+  assert.equal(host.bar.children.length, 4, 'time, copy, the sibling button, one pencil')
+  assert.equal(foreign.parentElement, host.bar, "the sibling's button was never touched")
+  assert.equal(host.copy.parentElement, host.bar, "nor the host's own")
+  assert.deepEqual(
+    byClass(host.bar, 'dshet-action-host').map((node) => node.children.length),
+    [1],
+    'the reused host carries one button, not a second one stacked inside it',
+  )
+
+  byClass(host.bar, 'dshet-action')[0].fire('pointerdown')
+  render(second, second.controller, snapshot)
+  assert.ok(editorIn(second), 'and the pencil still opens the editor')
+})
+
+test('the pile-up the probe found: stray hosts of earlier applies are swept', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-ghosts')
+  const snapshot = { nodes: new Map([['row-ghosts', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  // What the CDP probe counted on the live page: several action hosts in one
+  // strip, left by applies that are gone. The oldest predate the namespace
+  // attribute, so they carry the class alone.
+  const ghosts = []
+  for (let index = 0; index < 6; index += 1) {
+    const ghost = harness.document.createElement('span')
+    ghost.className = 'dshet-action-host'
+    if (index > 0) ghost.dataset.dshetActionHost = '1'
+    const ghostButton = harness.document.createElement('button')
+    ghostButton.className = 'dshet-action dshet-row-action'
+    ghost.appendChild(ghostButton)
+    host.bar.appendChild(ghost)
+    ghosts.push(ghost)
+  }
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'the bar is down to one host')
+  assert.equal(byClass(host.bar, 'dshet-action').length, 1, 'and to one pencil')
+  assert.equal(host.bar.children.length, 3, 'time, copy, the one pencil that was adopted')
+  assert.equal(ghosts.filter((ghost) => ghost.parentElement !== null).length, 1,
+    'every stray host but the reused one is out of the document')
+  const kept = ghosts.find((ghost) => ghost.parentElement !== null)
+  assert.equal(kept, byClass(host.bar, 'dshet-action-host')[0], 'and the one kept is the one that was adopted')
+  // Adopted means usable: it carries the current wording and the live action.
+  kept.children[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.ok(editorIn(harness), 'the adopted pencil opens the editor')
+})
+
+test('a late dispose from the replaced instance does not leave the row without a pencil', async () => {
+  const first = await loadBundle()
+  const host = mountHostUserRow(first.document, 'row-late')
+  const snapshot = { nodes: new Map([['row-late', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const foreign = first.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  host.bar.appendChild(foreign)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await first.controller.load(true)
+  render(first, first.controller, snapshot)
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1)
+
+  // The other ordering a reload can take: the new instance is already running
+  // (and has adopted the host) when the old fiber is finally disposed.
+  const second = await loadBundle({ document: first.document })
+  await second.controller.load(true)
+  render(second, second.controller, snapshot)
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'the new instance reused the host')
+
+  first.dispose()
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 0,
+    'the sweep works by namespace, so it takes out the adopted node too')
+
+  // The sweep itself is a DOM change, so the observer runs the pass again - and
+  // that pass must put a working pencil back instead of repositioning a node
+  // that is no longer in the document.
+  render(second, second.controller, snapshot)
+  assert.equal(byClass(host.bar, 'dshet-action-host').length, 1, 'the live instance rebuilt its pencil')
+  assert.equal(byClass(first.document.body, 'dshet-action-host').length, 1, 'exactly one, not two')
+  assert.equal(host.bar.children.length, 4, 'time, copy, the sibling button, one pencil')
+  assert.equal(foreign.parentElement, host.bar, "the sibling's button is untouched")
+  byClass(host.bar, 'dshet-action')[0].fire('pointerdown')
+  render(second, second.controller, snapshot)
+  assert.ok(editorIn(second), 'and the rebuilt pencil opens the editor')
 })
 

@@ -213,6 +213,13 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
+**0.2.14** —— 修「重新 apply 时上一次注入的节点不清理 → 同一条消息行上堆出多个宿主」（互操作契约 I3 / §5）。只修 Bug，交互语义不变。
+
+- **修复：重新 apply（HMR / 现场重载 / 插件开关 / bundle 组重载）会在同一行里再种一个编辑宿主，而不是复用上一次那个**。旧宿主的身份记在模块实例的 WeakMap 里，实例一换就认不出；于是每 apply 一次，那条操作条里就多一个「编辑这条消息」的笔。真机 CDP 探针实测同一 strip 里 `dshet-action-host` 多达 **7 个**、children 一度到 17（页面重载后回到 1、stripKids = 5），用户看到的是「一行上出现 3 个重跑按钮」。现在**每个注入节点都带命名空间属性**（宿主 `data-dshet-action-host="1"`、浮层根 `data-dshet-layer="1"`、编辑框 `data-dshet-editor="1"`、替代气泡 `data-dshet-revision="1"`），注入前先按属性在行内查一次、查到就**复用**——并且把它重新指到**当前**控制器（激活函数挂在按钮元素上、按下时才读，不再是上次那份捕获了旧闭包的监听；否则复用的笔点开的是已退休的控制器，表现就是「点了没反应」）。每趟 DOM pass 结束还会清掉「本次实例没有认领的」同命名空间宿主，正是那 7 个的直接来源；扫描只认自己的命名空间，兄弟插件的按钮永远不在候选里（I3）。
+- **修复：卸载时不再把自己的注入节点留在页面上**。fiber dispose（`ctx.effect` 的清理）现在按属性选择器**全局**扫掉本插件的注入节点（宿主 / 替代气泡 / 编辑框 / 浮层根），并把**只属于自己**的隐藏交还给宿主行（`data-dshet-hidden` / `data-dshet-collapsed` / 折叠中途的内联样式），恢复可见前照旧先问归属（I4）；React 自己渲染的节点（提示条、回答动作条里那支笔）**不扫**——从 React 手里抽走节点会让它在卸载时抛错。
+- **English**: re-applying the bundle (HMR, a live reload, a plugin toggle) over the same page no longer plants a second edit-action host on the row - every injected node now carries a namespace attribute, an existing host is looked up in the row and reused (with its activation re-pointed at the controller that is mounted now, read off the button at press time), any host this apply instance did not claim is swept at the end of the pass, and disposing the fiber removes every node this plugin injected (hosts, revision bubbles, the editor and its layer root) while handing back only its own row/child hiding - React-owned nodes are deliberately left to the reconciler.
+- 本版：`npm test` 126/126、`npm run verify:contract` 80/80、`npm run verify:client` 157/157 全绿（exit 0，`npm run check` 连跑两次同结果）；新增 5 条 DOM 用例与 12 条静态检查；5 条新用例已用「把三处修复改回旧写法」验证必红——旧代码下那条 strip 里的宿主数正好是 **7**（与探针一致），卸载后宿主数仍是 1（等于不清理）。
+
 **0.2.13** —— 隐藏归因（互操作契约 I4）+ 兄弟探测硬化（I5）。只修 Bug，交互语义不变。
 
 - **修复：别人隐藏的行，本插件不再替它显示出来**。回退的「恢复可见」分支无条件把 `row.style.display` 清成 `''`——那一行若正被 **dsh-delete-turn**（`data-dshdt-hidden`）或 **dsh-rerun-turn**（`data-dsrr-hidden`）按归属属性隐藏着，本插件一恢复就把别人的隐藏一并抹掉（行"复活"）。现在按契约 §4 在本地拷入 `foreignHideOn(row,'dshet')`：恢复前先确认没有别的归属属性，有则**保持 `display:none`**，只交还本插件自己那份隐藏。同理，折叠子节点时只有**本插件亲手写下**的 `display:none` 才打 `data-dshet-collapsed` 标记，恢复时也不会把别的插件留下的 `none` 重新显示出来。
