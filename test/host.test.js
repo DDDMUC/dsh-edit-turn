@@ -249,7 +249,6 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
     assert.equal(res.json.ok, true)
     assert.equal(res.json.kind, 'prompt')
     assert.equal(res.json.applied, true)
-    assert.equal(res.json.reran, false)
     assert.equal(res.json.flushed, true)
     // In place: only the edited message leaves the surface.
     assert.deepEqual(res.json.shadowed, [2])
@@ -554,29 +553,6 @@ test('an unknown session id is a 404 and a malformed one a 400', async () => {
   }
 })
 
-test('a failed re-run is reported without pretending the rollback failed', async () => {
-  const services = {
-    sessionController: {
-      resolveAgent: async () => undefined,
-      prompt: async () => {
-        throw new Error('inbox closed')
-      },
-    },
-  }
-  const session = Session.create(SESSION_ID)
-  buildTwoTurnLog(session)
-  const h = await harness({ session, services })
-  try {
-    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
-    assert.equal(res.status, 200)
-    assert.equal(res.json.applied, true, 'the revision landed without touching the prompt path')
-    assert.equal(res.json.reran, false)
-    assert.equal(session.deriveMessages().length, 6)
-  } finally {
-    await h.close()
-  }
-})
-
 test('a session with no live writer is refused', async () => {
   const h = await harness({ services: { sessions: { get: () => undefined, flush: async () => {} }, sessionController: { resolveAgent: async () => undefined } } })
   try {
@@ -708,7 +684,7 @@ test('the tool lists the editable turns and changes nothing', async () => {
     assert.match(text, /original prompt/)
     assert.match(text, /reply \(seq 3/)
     assert.match(text, /first answer/)
-    assert.match(text, /editing a turn re-runs it; editing a reply replaces its text/)
+    assert.match(text, /editing a turn replaces its wording in place/)
     assert.equal(h.session.seq, before)
   } finally {
     await h.close()
