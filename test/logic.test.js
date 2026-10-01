@@ -24,6 +24,7 @@ import {
   messageIdOf,
   noteRequest,
   openTurn,
+  syncLoopTurn,
   planRollback,
   readMessageText,
   recentRequests,
@@ -358,6 +359,23 @@ test('rollbackLedger ignores a replacement another producer landed', () => {
     }),
   )
   assert.deepEqual(rollbackLedger(log).hidden, [])
+})
+
+// --- the loop counter ---------------------------------------------------------
+
+test('syncLoopTurn moves an idle loop forward, and nothing else', () => {
+  const idle = { phase: { kind: 'idle', lastTurn: 2 } }
+  assert.equal(syncLoopTurn(idle, 5), 'synced')
+  assert.equal(idle.phase.lastTurn, 5, 'the loop opens the turn after the one we consumed')
+
+  assert.equal(syncLoopTurn(idle, 5), 'already-current', 'never moves it backwards')
+  assert.equal(idle.phase.lastTurn, 5)
+
+  // Not our shape, or not idle: leave it alone rather than guessing.
+  assert.equal(syncLoopTurn({ phase: { kind: 'running', lastTurn: 2 } }, 9), 'unavailable')
+  assert.equal(syncLoopTurn({ phase: { kind: 'idle' } }, 9), 'unavailable')
+  assert.equal(syncLoopTurn(null, 9), 'unavailable')
+  assert.equal(syncLoopTurn(undefined, 9), 'unavailable')
 })
 
 // --- carrier ----------------------------------------------------------------

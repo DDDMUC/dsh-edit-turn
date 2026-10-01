@@ -428,6 +428,52 @@ test('editing a reply replaces it without re-running the model', async () => {
   }
 })
 
+test('a reply edit pushes the live loop past the turn it consumed', async () => {
+  // The loop's own counter lives in an idle-phase field seeded when the loop was
+  // built, so the turn a reply edit opens is invisible to it: the next prompt
+  // would open the same number and the whole session would stop loading.
+  const agent = { session: undefined, phase: { kind: 'idle', lastTurn: 2 } }
+  const services = {
+    sessionController: {
+      resolveAgent: async () => ({ agent }),
+      prompt: async () => ({ accepted: true }),
+    },
+  }
+  const h = await harness({ services })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 8, text: 'corrected answer' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.kind, 'reply')
+    assert.equal(res.json.loopTurn, 'synced', 'the loop counter moved with the edit')
+    assert.equal(agent.phase.lastTurn, 3, 'and it names the turn just opened, not the one before')
+
+    // A second edit - of a different reply, the first turn's (seq 3) - pushes
+    // the same counter forward again, never backwards.
+    const second = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'colder' })
+    assert.equal(second.json.applied, true, second.payload)
+    assert.equal(second.json.loopTurn, 'synced')
+    assert.equal(agent.phase.lastTurn, 4, 'the next turn in the log')
+  } finally {
+    await h.close()
+  }
+})
+
+test('a reply edit leaves a loop it cannot reach alone', async () => {
+  // Cold session, or the loop running: the edit lands either way, the counter
+  // stays untouched, and the ring says so instead of the client guessing.
+  const h = await harness({ services: { sessionController: { resolveAgent: async () => undefined } } })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'corrected answer' })
+    assert.equal(res.json.applied, true, res.payload)
+    assert.equal(res.json.loopTurn, 'unavailable')
+    const ring = (await raw(h.port, { path: '/dsh-edit-turn/debug' })).json.requests
+    const note = ring.filter((entry) => entry.kind === 'reply' && entry.loopTurn === 'unavailable')
+    assert.equal(note.length >= 1, true, 'the unsynced attempt is recorded for diagnosis')
+  } finally {
+    await h.close()
+  }
+})
+
 test('the appended correction is a normal reply that says who wrote it', async () => {
   const h = await harness()
   try {
