@@ -213,6 +213,12 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
+**0.2.15** —— 修一个自己埋的隐患：回复编辑开的合成轮次会让下一次提问撞号。
+
+- **发现**：回复编辑必须在日志里开一个轮次（读路径只在"打开的轮次+步骤"里认 `assistant/message`，修正消息就是 assistant），但 **agent 循环的轮号计数器在 `phase.lastTurn`，是循环构造时播种、只由它自己开的轮推进的**——它看不见我们追加的 `turn/start`。于是下一次提问在同一个会话里会开出**同一个轮号**，两条 `turn/start` 撞号，整份日志在下次加载时报 `turn/start does not open the expected turn`，这正是我们 0.2.4 修掉的那类事故的另一个入口。兄弟插件 dsh-rerun-turn 早踩过并解决了同一问题（其 0.1.1：改用不占轮次的载体 + 事后 `syncLoopTurn`）；我们照做：回复编辑闭合自己的轮次后，**把活循环的 `lastTurn` 推到该轮号**。
+- **形状与降级**：`syncLoopTurn(agent, maxTurn)` 只看 `phase.kind === 'idle'` 且 `phase.lastTurn` 为数字时才动，否则 `'unavailable'` 什么也不碰（冷会话、循环不在场都走这条），并把结果以 `loopTurn` 写进 apply 响应、把 `unavailable` 记进 `/dsh-edit-turn/debug` 的请求环（字段刻意不叫 `code:`——静态检查会把它当宿主错误码去要文案）。
+- 新增/改写 host 测试 2 个：命中的循环被推过消耗掉的轮号（连续两次编辑，计数器只向前），够不着的循环原样留着并留诊断；加单测 1 个（守卫：running / 缺字段 / null 都返回 unavailable）。129 单测 / 80 契约 / 静态 exit0 / verify:live / verify:ui 全绿。
+
 **0.2.14** —— 修「重新 apply 时上一次注入的节点不清理 → 同一条消息行上堆出多个宿主」（互操作契约 I3 / §5）。只修 Bug，交互语义不变。
 
 - **修复：重新 apply（HMR / 现场重载 / 插件开关 / bundle 组重载）会在同一行里再种一个编辑宿主，而不是复用上一次那个**。旧宿主的身份记在模块实例的 WeakMap 里，实例一换就认不出；于是每 apply 一次，那条操作条里就多一个「编辑这条消息」的笔。真机 CDP 探针实测同一 strip 里 `dshet-action-host` 多达 **7 个**、children 一度到 17（页面重载后回到 1、stripKids = 5），用户看到的是「一行上出现 3 个重跑按钮」。现在**每个注入节点都带命名空间属性**（宿主 `data-dshet-action-host="1"`、浮层根 `data-dshet-layer="1"`、编辑框 `data-dshet-editor="1"`、替代气泡 `data-dshet-revision="1"`），注入前先按属性在行内查一次、查到就**复用**——并且把它重新指到**当前**控制器（激活函数挂在按钮元素上、按下时才读，不再是上次那份捕获了旧闭包的监听；否则复用的笔点开的是已退休的控制器，表现就是「点了没反应」）。每趟 DOM pass 结束还会清掉「本次实例没有认领的」同命名空间宿主，正是那 7 个的直接来源；扫描只认自己的命名空间，兄弟插件的按钮永远不在候选里（I3）。
