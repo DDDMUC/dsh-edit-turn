@@ -131,7 +131,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
 | 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 80 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 105 项通过 |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 139 项通过 |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
@@ -174,6 +174,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **回退是持久的，隐藏不是**。回退写进日志后，模型上下文永久改变；转录里那些行的隐藏是本插件客户端半部做的。卸载插件后，旧行会重新显示出来（而模型上下文里的回退仍然生效）——因为替换事件是官方事件，不会随插件消失。
 - 回退后**系统提示词保持不变**（窗口永不包含 surface 节点 0，该节点也永不可编辑）。
 - **旧会话（v3 格式日志）在 DSH 0.1.7 下读不到**：DSH 的会话读取层对这类日志返回 `session-not-found`，本插件因此在其中完全不工作（表现为没有编辑入口）。新写的会话是 v4，正常。
+- **改写过的行，只有转录里的那颗复制按钮被接管**。平台自己画的复制按钮在别处（**轨迹视图** `dsh-client-ui-trajectory`）读的是同一份投影数据，本版没有接管它：在那里复制一条被改写过的消息，仍会拿到改写前的文本。
 
 ### 排查：编辑入口整个不见了
 
@@ -214,6 +215,18 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.17** —— 修「改写过的提示词，复制出来还是旧文本」。只修 Bug，交互语义不变。
+
+- **根因在平台侧，但它就在下发的 bundle 里，读得到**：平台的复制按钮把它**画那一行时用的那条消息**交给剪贴板——文本取自投影节点（`dsh-client-ui-chat/lib/client.js:1117` 的 `MessageIconActions` 收一个 `text` prop，`onCopy` 里调 `writeClipboard(text)`，`:1129-1141`；这个 `text` 由 `UserStyleBubble` 从节点数据 `contentParts(data.content)` 解出，`:1398-1404` 把它交出去）。而**改写是替换事件，平台不给它建行**：`messageDefinition.match` 只认 `isAppendSurfaceEvent`（`surfaceOp === 'append'`，`:9267`）。于是那一行永远是**原来那条 append 消息**，行上复制按钮手里是「回复1」，界面上显示「回复2」的却是本插件的替代气泡（`bubble.textContent`）。用户按复制 → 粘出旧文本。**换编辑器无效**：编辑器的文本来自宿主账本（`targetFor` 读 `view.editable`），跟那颗按钮不是一回事。（行号按本机下发版本：DSH `0.2.0-rc.2`。）
+- **修法：接住那颗按钮的按下，平台节点一根手指都不碰**。改写过的行由本插件在**平台自己的**复制按钮上装一个**捕获阶段**的 click 监听（捕获先于宿主挂在 root 上的冒泡处理器），命中即 `stopPropagation`（不让宿主再用旧文本写一次剪贴板），改用**宿主自己的** `writeClipboard`（`@deepseek-ai/dsh-client-ui-primitives`）写入**这一行现在显示的文本**（存在 `data-dshet-copy-text` 上），并自己画出宿主那次「复制成功」：1 秒的勾（样式表 `[data-dshet-copy-flash="1"]`，和宿主一样把图标换成勾）加上宿主自己的文案（`aria-label` 换成「复制成功」，按钮原文案先记在 `data-dshet-copy-label` 里，1 秒后还回去）。
+- **按钮本身不移除、不隐藏、不禁用**（节点归宿主，宿主用自己的 reconciler 卸载它）。**插件走了之后那颗按钮退化成宿主本来的行为（复制原文），而不是变成一颗死按钮**；宿主版本的 `ui-primitives` 若没有 `writeClipboard`，本插件干脆不接管（同样保持宿主行为）。
+- **归属与幂等（I3 / I4）**：接住按钮要用的一切（文本、文案、写入函数）都在**按下那一刻从按钮上读**，所以重载后的新实例能接管旧实例装的那颗监听；`data-dshet-copy-own` 保证同一颗按钮上永远只有一颗监听；行不再被改写、或本插件卸载时，只交还**本插件自己写下的**那些属性（卸载按 `[data-dshet-copy-text]` 全局收回）。兄弟插件的按钮（带自己命名空间的那些）不会被误认成宿主的复制按钮。
+- **不做的**：不改平台代码、不改会话日志；**回复**编辑不受影响（它追加的是**新的一条**回答行，那行自带正确文本）；轨迹视图（`dsh-client-ui-trajectory:5273`）有同一个读法，本版未涉及（见「已知限制」）。
+- **English**: the platform's copy action hands over the text of the message the row was DRAWN for, and a rewritten prompt gets no row of its own (rows are built for append-origin surface events only), so copying from that row pasted the wording the user had replaced. This plugin now answers that press from a capture-phase listener on the host's own copy button - stopping the host's handler from writing the stale text - writes the text the row shows through the host's own `writeClipboard`, draws the host's own one-second "copied" check and label itself, and touches nothing else on the button: never removed, never hidden, never disabled, so a bundle that goes away leaves a working button that copies its own message again.
+- 本版：`npm test` **141/141**、`npm run verify:contract` 80/80、`npm run verify:client` **163/163**（`npm run check` exit 0）；新增 8 条 DOM 用例、6 条静态检查、2 个 `verify:live` 标记。DOM 桩顺带补上 `data-*` 属性与 `dataset` 的**双向反射**（此前只有 dataset→属性 一个方向：`setAttribute('data-...')` 造出来的夹具对 `dataset` 查不到，而浏览器里两者是同一件事）。**负向验证**（`/tmp` 副本，仓库文件未动；逐点还原后只跑 `test/client.dom.test.js`）：整份 `lib/client.js` 还原到 HEAD → **7 条新用例转红**（第 8 条「没被改写的行交给宿主」是不越权的守卫，本就该绿）；逐点：去掉接管调用 → 7 红、恢复行时不再释放 → 1 红、卸载不再收回 → 1 红、去掉 `stopPropagation` → 1 红、不画勾 → 1 红、不还文案 → 1 红、不再删文本标记 → 2 红、不再跳过兄弟按钮 → 1 红、去掉捕获标志 → 1 红、去掉 `data-dshet-copy-own` 优先查找 → 1 红。两套识别（按宿主的文案、按「条里没人认领的第一个按钮」）互为兜底：单独去掉任一条用例仍全绿，**同时去掉正好 2 红**。
+- **验证表里 `npm test` 的旧数字（105）是过期值**，一并改成实测的 139（英文表同处一并改）。
+- **真机提示**：运行中的实例下发的是 profile 里**安装的副本**（`~/.dsh/profiles/web/node_modules/dsh-edit-turn`，仍是 0.2.16），要看到本修复需要**重新安装本目录 + 重启 DSH**；本次没有重启，也没跑 `verify:live` / `verify:ui`（前者需要启动时打印的 token，后者没有可驱动的调试标签页）。
 
 **0.2.15** —— 修一个自己埋的隐患：回复编辑开的合成轮次会让下一次提问撞号。
 
@@ -498,7 +511,7 @@ Verified against DSH `0.1.6-alpha.2` and `0.1.7-rc.1`, entirely **without model 
 | Is the plugin actually mounted in a running instance? (read-only route-guard probe, no token needed) | `npm run probe:loaded [port]` | pass: `/state` answers 400 and `/apply` answers 405 - status codes only this plugin produces |
 | What the browser half asked for and got back (read-only diagnostics, failures included) | `GET /dsh-edit-turn/debug` | pass: a real browser was confirmed fetching replies, and an old v3 session was reproduced as session-not-found |
 | Official append AND READ contract against the real validator, in process | `npm run verify:contract` | 80 checks pass (every write sequence is reloaded through the reader afterwards): the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty developer carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted**, **the invariants siblings depend on (single-node window, same event type, full `sourceEventSeqs` coverage, an `editedBy` marker on every replacement, a rewritten prompt whose `source.kind` is not `user`, a correction that carries no `sourceEventSeqs`)** |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 105 tests pass |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 139 tests pass |
 | Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass, **including anchors on the host's node shapes** |
 | **Real browser rendering smoke** (CDP drives an already-open tab, read-only) | `npm run verify:ui` | all pass: the served bytes are the edited bytes, no empty placeholder left by a retired entry, the reply pencil sits in the platform action bar, a rolled-back row keeps its action bar, **every collapsed user message still shows the text that replaced it**, **that bubble sits above the time and the copy, in the order the platform draws a message**, **the rewriting pencil sits at the end of the surviving bar (confirmed live in the original session, the other session, and back again)**, **the reply pencil leads its bar, ahead of the copy (confirmed live)**, no `.dshet-floating` covers the revision text, and the entries survive a session round trip |
@@ -729,6 +742,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **The rollback is durable; the hiding is not.** Once written, the rollback permanently changes the model context. Hiding those rows in the transcript is this plugin's browser half. Uninstall the plugin and the old rows reappear - while the rollback in the model context still stands, because the replacement is an official event that outlives the plugin.
 - **The system prompt is never touched**: the window can never include surface node 0, and that node is never editable.
 - **Old sessions (v3-format logs) cannot be read under DSH 0.1.7**: the session reader answers `session-not-found` for them, so the plugin does not work in one at all (the visible symptom is no edit entry). Newly written sessions are v4 and work normally.
+- **Only the transcript's own copy button is taken over on a rewritten row.** The platform draws the same stale text in its other copy affordance - the **Trajectory view** (`dsh-client-ui-trajectory`) - which this release does not answer: copying a rewritten message there still hands over the pre-rewrite wording.
 
 ### Troubleshooting: the edit entry disappeared entirely
 

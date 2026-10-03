@@ -325,6 +325,45 @@ check(
   'the pencil darkens to the platform label colour on hover',
   /\.dshet-action:hover[^{]*\{[^}]*color:var\(--dsw-alias-label-primary/.test(css),
 )
+// The one platform action on a collapsed row that cannot answer for itself:
+// copy hands over the text of the message the row was DRAWN for, and a rewritten
+// prompt's row is the original append-origin one. The button stays the host's
+// own - this half answers the press ahead of the host's handler and draws the
+// host's "copied" moment itself.
+console.log('\n  — a rewritten row answers its own copy —')
+check(
+  'the rewritten row hands its copy press to this half',
+  clientSource.includes('function takeOverRowCopy(row, text, t)') && clientSource.includes('takeOverRowCopy(row, text, t)'),
+  'otherwise the row pastes the wording the user replaced',
+)
+check(
+  'the copy listener runs ahead of the host’s own handler',
+  clientSource.includes("button.addEventListener('click', (event) => pressRowCopy(button, event), true)"),
+  'the host listens for clicks at its root, in the bubble phase - capture gets there first',
+)
+check(
+  'the copied moment is drawn from this plugin’s stylesheet',
+  css.includes('[data-dshet-copy-flash="1"]::after') && css.includes('[data-dshet-copy-flash="1"]>svg{opacity:0}'),
+  'the host swaps its icon; on this row its own state never hears the press',
+)
+check(
+  'the handover writes nothing but this plugin’s own markers on the button',
+  clientSource.includes("const COPY_TEXT = 'dshetCopyText'") &&
+    clientSource.includes("const COPY_OWN = 'dshetCopyOwn'") &&
+    clientSource.includes("const COPY_LABEL = 'dshetCopyLabel'") &&
+    clientSource.includes("const COPY_FLASH = 'dshetCopyFlash'"),
+  'the button is never removed, hidden or disabled: the host owns that node',
+)
+check(
+  'a released button falls through to the host’s own handler',
+  clientSource.includes("typeof data[COPY_TEXT] !== 'string') return"),
+  'no text marker means the row is not rewritten (any more) and the host answers',
+)
+check(
+  'the handover is taken back on unload',
+  clientSource.includes("each('[data-dshet-copy-text]', (button) => releaseCopyButton(button))"),
+  'only this plugin’s writes on a HOST node go back (I4)',
+)
 // The host can rebuild the row between mousedown and mouseup (it does so
 // constantly while a turn streams), and then no click event ever fires - the
 // button reads as dead. The actions ride on pointerdown so the press itself

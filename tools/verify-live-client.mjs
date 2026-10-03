@@ -45,6 +45,8 @@ const MARKERS = [
   { needle: 'injectRowAction(row, editTarget', what: "the collapsed row's pencil placed in the bar that survived" },
   { needle: 'fitEditorHeight', what: 'the editor box that grows with its text' },
   { needle: "'/dsh-rerun-turn'", what: 'the re-run button that belongs to the sibling plugin' },
+  { needle: 'takeOverRowCopy', what: 'the rewritten row answering its own copy' },
+  { needle: 'dshetCopyText', what: 'the copy handover this plugin writes on the host’s button' },
 ]
 
 function arg(name) {
