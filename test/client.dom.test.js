@@ -157,6 +157,16 @@ class StubElement {
 
   setAttribute(name, value) {
     this.attributes[name] = String(value)
+    // The DOM reflects a `data-*` attribute into `dataset` as well, and this
+    // plugin reads those markers both ways (it writes through `dataset` and
+    // finds the node again by attribute). A stub that only reflected one way
+    // would make a fixture built with `setAttribute('data-dsrr-action', ...)`
+    // invisible to a `dataset.dsrrAction` lookup - which is a difference no
+    // browser has.
+    if (name.startsWith('data-')) {
+      const key = name.slice(5).replace(/-([a-z0-9])/g, (_match, char) => char.toUpperCase())
+      this.dataset[key] = String(value)
+    }
   }
 
   getAttribute(name) {
@@ -168,19 +178,44 @@ class StubElement {
     return name in this.attributes
   }
 
-  addEventListener(type, handler) {
+  addEventListener(type, handler, options) {
     const list = this.listeners.get(type) ?? []
-    list.push(handler)
+    const capture = options === true || (options !== null && options !== undefined && options.capture === true)
+    list.push({ handler, capture })
     this.listeners.set(type, list)
   }
 
+  /**
+   * Dispatch on this element.
+   *
+   * The real DOM runs a capture phase from the root down and a bubble phase back
+   * up, and React listens for clicks at the root, in the bubble phase. That split
+   * is what the plugin relies on when it answers a platform button's press (its
+   * listener is registered with `capture: true` and calls `stopPropagation()`),
+   * so the two phases are modelled: capture listeners run first, bubble listeners
+   * after, and a stopped event reaches neither the later ones nor the element's
+   * own `onclick`.
+   */
   fire(type, extra = {}) {
-    const event = { type, preventDefault() {}, stopPropagation() {}, ...extra }
+    let stopped = false
+    const event = {
+      type,
+      preventDefault() {},
+      stopPropagation() {
+        stopped = true
+      },
+      ...extra,
+    }
+    const handlers = this.listeners.get(type) ?? []
+    const run = (item) => {
+      if (!stopped) item.handler(event)
+    }
+    for (const item of handlers) if (item.capture === true) run(item)
     // Both wiring styles are in use: `el.onclick = fn` on the injected actions,
     // `addEventListener` on the editor's textarea.
     const property = this[`on${type}`]
-    if (typeof property === 'function') property(event)
-    for (const handler of this.listeners.get(type) ?? []) handler(event)
+    if (typeof property === 'function' && !stopped) property(event)
+    for (const item of handlers) if (item.capture !== true) run(item)
     return event
   }
 
@@ -336,6 +371,11 @@ async function loadBundle(shared = null) {
     },
   }
   globalThis.document = document
+  // Where the platform's own clipboard writer lands, so a test can read back
+  // what a press would have pasted. It hangs off the document because a reload
+  // reuses the page, and both instances write into the same record.
+  if (document.clipboard === undefined) document.clipboard = []
+  const clipboard = document.clipboard
   const windowListeners = new Map()
   globalThis.window = {
     __ModuleLoader__: { load: ({ factory }) => { bundleFactory = factory } },
@@ -389,7 +429,15 @@ async function loadBundle(shared = null) {
   const requireStub = (id) => {
     if (id === 'react') return react
     if (id === 'react/jsx-runtime') return { jsx, jsxs, Fragment: 'Fragment' }
-    if (id === '@deepseek-ai/dsh-client-ui-primitives') return {}
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') return {
+      // The platform's own clipboard write, which its copy button (and now this
+      // plugin, on a rewritten row) calls. Same shape - a promise for "accepted" -
+      // and it records the text where the real one would put it.
+      writeClipboard: (text) => {
+        clipboard.push(text)
+        return Promise.resolve(true)
+      },
+    }
     throw new Error(`unexpected require(${id})`)
   }
 
@@ -423,12 +471,18 @@ async function loadBundle(shared = null) {
   const { definition, component } = overlay
   const props = definition.inject(SESSION_ID)
   const dict = dictionaries[0].dict.zh
-  const t = (key) => (key in dict ? dict[key] : key)
+  // A key an entry's own namespace does not define resolves against the SHARED
+  // `common` dictionary in the host (dsh-client-locale's `translate` does the
+  // fallback). The platform's own copy button is labelled from there, so a
+  // harness that stopped at the plugin's dictionary would read the key itself.
+  const common = { copy: '复制', copied: '复制成功' }
+  const t = (key) => (key in dict ? dict[key] : key in common ? common[key] : key)
   return {
     component,
     controller: props.controller,
     t,
     document,
+    clipboard,
     cleanups,
     rows,
     fresh: () => cleanups.splice(0).forEach((fn) => fn()),
@@ -1554,6 +1608,216 @@ test('a row with no bar to keep still shows the rewritten prompt', async () => {
   // one place left where it can sit without covering the text.
   assert.equal(byClass(bubble, 'dshet-action').length, 1, 'the rewrite is still editable')
   assert.equal(bubble._classes.has('dshet-revision-action'), true, 'and the bubble reserves its gutter')
+})
+
+// --- the rewritten row's own copy --------------------------------------------
+//
+// The platform's copy action hands over the text of the message it DREW the row
+// for. A prompt this plugin rewrote in place gets no row of its own - the host
+// draws rows for append-origin surface events only - so the row that stands for
+// it is the ORIGINAL one, still carrying the wording the user replaced: rewrite
+// 回复1 into 回复2, press copy on that row, paste 回复1.
+//
+// The button is the host's and stays exactly where it is; this half answers the
+// press before the host's own handler sees it, with the text the row shows.
+
+test('copying from a rewritten row hands over the rewritten text, not the old one', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy')
+  const snapshot = { nodes: new Map([['row-copy', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(revisionBubble(host.row).textContent, 'revised prompt', 'the row shows the rewritten text')
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'and its copy button hands that text over')
+
+  // The host's own handler is still on the button - modelled both ways a host
+  // owns a press (its own handler on the element, and a listener the plugin did
+  // not plant) - and it writes the message the row was drawn for. The plugin
+  // answers first, so it never gets the press.
+  const hostWrites = []
+  host.copy.addEventListener('click', () => hostWrites.push('original'))
+  host.copy.onclick = () => hostWrites.push('original')
+  host.copy.fire('click')
+  assert.deepEqual(hostWrites, [], 'the host handler never saw the press')
+
+  await Promise.resolve()
+  assert.deepEqual(harness.clipboard, ['revised prompt'], 'the rewritten text is what landed')
+  assert.equal(host.copy.dataset.dshetCopyFlash, '1', 'and the button shows the host’s own "copied" moment')
+  assert.equal(host.copy.getAttribute('aria-label'), '复制成功', 'labelled the way the host labels its own')
+
+  // The check is this half's own draw, and it goes back by itself.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(host.copy.dataset.dshetCopyFlash, undefined, 'the check is taken back')
+  assert.equal(host.copy.getAttribute('aria-label'), '复制', 'and the host’s own label with it')
+
+  // Nothing about the button itself was touched.
+  assert.equal(host.copy.parentElement, host.bar, 'the host’s button never moved')
+  assert.equal(host.copy.disabled, false, 'and is not disabled')
+  assert.equal(host.copy.style.display, undefined, 'and is not hidden')
+  assert.equal(host.copy.dataset.dshetCopyOwn, '1', 'the one write on it is this half’s own marker')
+})
+
+test('a row that was never rewritten is left to the host', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-plain-copy')
+  const snapshot = { nodes: new Map([['row-plain-copy', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.copy.dataset.dshetCopyText, undefined, 'no text is handed over from here')
+  assert.equal(host.copy.dataset.dshetCopyOwn, undefined, 'and no listener was planted on a row that needs none')
+  host.copy.addEventListener('click', () => harness.clipboard.push('original'))
+  host.copy.fire('click')
+  assert.deepEqual(harness.clipboard, ['original'], 'the press reaches the host’s own handler')
+})
+
+test('a sibling plugin’s button in the bar is not mistaken for the host’s copy', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-foreign')
+  const snapshot = { nodes: new Map([['row-copy-foreign', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const foreign = harness.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  // In front of the host's own button, which is where a bar rebuilt by a sibling
+  // would put it: the bar's first button is not automatically the host's.
+  host.bar.insertBefore(foreign, host.copy)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the host’s own copy button answers')
+  assert.equal(foreign.dataset.dshetCopyText, undefined, 'the sibling’s button is left alone')
+  assert.equal(foreign.dataset.dshetCopyOwn, undefined, 'no listener of ours on it either')
+  assert.equal(foreign.attributes['data-dsrr-action'], '1', 'nor is its own marker touched')
+})
+
+// The host's own wording is what names its copy button, and a host that cannot
+// resolve it must not cost the row its handover: the structural rule behind it
+// still answers - the first button in the bar no plugin claims.
+test('a host whose copy wording this plugin cannot resolve still gets the handover', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-unlabelled')
+  const snapshot = { nodes: new Map([['row-copy-unlabelled', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  // A wording the plugin's own dictionary does not carry (say, a locale this
+  // build predates), and a sibling's button sitting in front of it.
+  host.copy.setAttribute('aria-label', 'Kopieren')
+  const foreign = harness.document.createElement('button')
+  foreign.className = 'xzv4MW_action dsrr-turn-action'
+  foreign.setAttribute('data-dsrr-action', '1')
+  host.bar.insertBefore(foreign, host.copy)
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the unlabelled host button is recognised anyway')
+  assert.equal(foreign.dataset.dshetCopyText, undefined, 'and the sibling’s is still not')
+})
+
+test('a marked button is found again after the bar has grown around it (I3)', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-i3')
+  const snapshot = { nodes: new Map([['row-copy-i3', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  // A wording the label rule cannot resolve, so the only way back to this button
+  // is the marker this half wrote on it.
+  host.copy.setAttribute('aria-label', 'Kopieren')
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the first pass handed the press over')
+
+  // A button that marks nothing lands in FRONT of it, and the row is rewritten
+  // again: the handover has to follow the button this half marked, not whatever
+  // happens to be first now.
+  const stray = harness.document.createElement('button')
+  stray.className = 'xzv4MW_action'
+  host.bar.insertBefore(stray, host.copy)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ...revisedState(), turns: [{ seq: 7, turn: 1, messageId: 'm-u1', text: 'second wording', attachments: 0 }] }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.copy.dataset.dshetCopyText, 'second wording', 'the marked button took the new wording')
+  assert.equal(stray.dataset.dshetCopyText, undefined, 'and the stray in front of it got nothing')
+})
+
+test('the copy handover goes back when the row stops being rewritten', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-release')
+  const snapshot = { nodes: new Map([['row-copy-release', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the row’s copy answers for the rewrite')
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => plainState() })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(host.copy.dataset.dshetCopyText, undefined, 'the rewrite is over, so the handover is too')
+  assert.equal(host.copy.dataset.dshetCopyLabel, undefined, 'nothing of ours is left written on the button')
+  host.copy.addEventListener('click', () => harness.clipboard.push('original'))
+  host.copy.fire('click')
+  assert.deepEqual(harness.clipboard, ['original'], 'the host’s own handler answers again')
+})
+
+test('unloading gives the host’s copy button back, still working', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-unload')
+  const snapshot = { nodes: new Map([['row-copy-unload', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the live row answers with the rewrite')
+
+  harness.dispose()
+
+  assert.equal(host.copy.dataset.dshetCopyText, undefined, 'the handover was taken back')
+  assert.equal(host.copy.dataset.dshetCopyLabel, undefined, 'and so was every marker of ours on it')
+  assert.equal(host.copy.parentElement, host.bar, 'the button stays where the host owns it')
+  // A bundle that goes away has to leave a WORKING button behind, not a dead
+  // one: the listener it planted is inert without the text marker, so the press
+  // reaches the host’s own handler again.
+  host.copy.addEventListener('click', () => harness.clipboard.push('original'))
+  host.copy.fire('click')
+  assert.deepEqual(harness.clipboard, ['original'], 'the host’s handler answers on its own again')
+})
+
+test('a reloaded bundle reuses the host’s copy button and plants no second listener', async () => {
+  const first = await loadBundle()
+  const host = mountHostUserRow(first.document, 'row-copy-reload')
+  const snapshot = { nodes: new Map([['row-copy-reload', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await first.controller.load(true)
+  render(first, first.controller, snapshot)
+  assert.equal(host.copy.dataset.dshetCopyText, 'revised prompt', 'the first apply handed the press over')
+
+  // The reload, in its worst ordering: a new module instance over the same DOM
+  // while the previous one has not been disposed yet.
+  const second = await loadBundle({ document: first.document })
+  await second.controller.load(true)
+  render(second, second.controller, snapshot)
+
+  assert.equal(globalThis.document.clipboard.length, 0, 'nothing was copied by merely rendering')
+  host.copy.fire('click')
+  await Promise.resolve()
+  assert.deepEqual(second.clipboard, ['revised prompt'],
+    'the live instance’s text is written once - two listeners would write twice')
 })
 
 /** Open the pencil on `host`, type `text` and save it in one click. */
