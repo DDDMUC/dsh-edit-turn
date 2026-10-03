@@ -401,17 +401,34 @@ check(
 check(
   'the landed replacement carries the semantic marker',
   landedCarrier !== undefined &&
-    landedCarrier.data.source.kind === `plugin:${PLUGIN_ID}` &&
+    landedCarrier.data.source.kind === 'user' &&
     landedCarrier.data.source.editedBy === PLUGIN_ID,
   JSON.stringify(landedCarrier === undefined ? null : landedCarrier.data.source),
 )
-// Documented behaviour, not an accident: a consumer that finds human prompts by
-// `source.kind === 'user'` will classify the revision as plugin content. That is
-// deliberate - it is not a fresh human turn, and the platform must not answer it.
+// The carrier stands in the user place, so it keeps the platform human identity.
+// Every consumer that finds human prompts by source.kind === user - the turn outline
+// behind the turn rail and the Trajectory view, ui-trajectory, ui-chat, the inbox
+// steering filter, lastPromptAt - must keep seeing the turn prompt. 0.2.15 and
+// earlier wrote a producer-owned kind here instead, and the edited turn lost its
+// prompt: the outline reported an empty prompt and the Trajectory view filed the
+// wording under context rather than under the user.
+//
+// Keeping kind user does NOT make the carrier fresh input, which is what the
+// previous version of this check guarded. Queueing never reads kind: the inbox
+// projection reducer ignores every event except agent/inbox/spliced
+// (dsh-agent-loop, inboxProjectionDefinition), and the only writer of that event is
+// an explicit agent splice. The scan that skips past fresh input tests
+// surfaceOp === append, and this carrier is surfaceOp { op: replace }.
 check(
-  'a rewritten prompt is plugin content, not a fresh human turn',
-  landedCarrier !== undefined && landedCarrier.data.source.kind !== 'user',
-  JSON.stringify(landedCarrier === undefined ? null : landedCarrier.data.source.kind),
+  'a rewritten prompt keeps the human identity and stays a replacement, not new input',
+  landedCarrier !== undefined &&
+    landedCarrier.data.source.kind === 'user' &&
+    landedCarrier.surfaceOp !== undefined &&
+    landedCarrier.surfaceOp.op === 'replace',
+  JSON.stringify({
+    kind: landedCarrier === undefined ? null : landedCarrier.data.source.kind,
+    surfaceOp: landedCarrier === undefined ? null : landedCarrier.surfaceOp,
+  }),
 )
 
 // ---------------------------------------------------------------------------

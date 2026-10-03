@@ -398,13 +398,13 @@ test('the default carrier is an empty dormant developer message', () => {
   assert.equal(carrier.data.turn, 2)
 })
 
-test('the fallback carrier is a non-empty plugin-sourced user message', () => {
+test('the fallback carrier is a non-empty user prompt that keeps kind "user"', () => {
   const log = twoTurnLog()
   const plan = planRollback(log, foldSurface(log).nodes, { seq: 2 })
   const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'user/message', markerText: 'MARK' })
   assert.equal(carrier.type, 'user/message')
   assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'MARK' }])
-  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}`, editedBy: PLUGIN_ID })
+  assert.deepEqual(carrier.data.source, { kind: 'user', editedBy: PLUGIN_ID })
   assert.equal(carrier.data.role, 'user')
 })
 

@@ -274,7 +274,7 @@ test('POST /apply rolls the context back and admits the revised prompt', async (
   }
 })
 
-test('the carrier lands with complete shadow coverage and a plugin source', async () => {
+test('the carrier lands with complete shadow coverage and the platform human identity', async () => {
   const h = await harness()
   try {
     const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'revised' })
@@ -283,8 +283,12 @@ test('the carrier lands with complete shadow coverage and a plugin source', asyn
     assert.deepEqual(carrier.sourceEventSeqs, [2])
     assert.deepEqual(carrier.surfaceOp, { op: 'replace', startSeq: 2, endSeq: 2 })
     assert.deepEqual(carrier.data.content, [{ type: 'text', text: 'revised' }], 'the carrier IS the revision')
-    // v4 format: producer-owned kind, no plugin wrapper
-  assert.deepEqual(carrier.data.source, { kind: `plugin:${PLUGIN_ID}`, editedBy: PLUGIN_ID })
+    // The platform decides "this is the human's prompt" by `source.kind === 'user'`
+    // (turn-outline, Trajectory, ui-chat, inbox steering, lastPromptAt). A carrier
+    // standing in the user's place must keep that kind, and `editedBy` carries the
+    // provenance the old producer-owned kind used to.
+    assert.equal(carrier.data.source.kind, 'user', 'the carrier keeps the platform human identity')
+    assert.deepEqual(carrier.data.source, { kind: 'user', editedBy: PLUGIN_ID })
     assert.equal(carrier.data.content.length, 1, 'a rewritten prompt carrier carries text')
   } finally {
     await h.close()

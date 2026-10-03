@@ -114,11 +114,13 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 1. **prompt 编辑保持单节点窗口**：`planRollback` 的 `mode === 'prompt'` 只遮蔽目标那一格（`shadowed = [target.seq]`），不会顺手回退到末尾；
 2. **替换事件与目标同事件类型**：改 `user/message` 落下的就是 `user/message`（回复编辑不换类型就换不了位，见第 5 条）；
 3. **`sourceEventSeqs` 永远列全窗口**：官方校验要求完整覆盖，缺一个节点事件会被拒；
-4. **每个替换都带语义标记**：`source.kind === 'plugin:dsh-edit-turn'` 且 `source.editedBy === 'dsh-edit-turn'`——包括那个不含文本的空 `developer/message` 载体，兄弟插件按 `editedBy` 识别即可，不必靠推断窗口形状；
+4. **每个替换都带语义标记**：`source.editedBy === 'dsh-edit-turn'`——包括那个不含文本的空 `developer/message` 载体，兄弟插件按 `editedBy` 识别即可，不必靠推断窗口形状；
 5. **回复编辑 = 多节点回退 + 追加新回复**，不是就地替换：旧回复行没有入口是**设计如此**（新行自带入口）。不要为了保住旧行的入口往 `assistant/message` 上加 `sourceEventSeqs`——官方校验会直接拒；
 6. **映射已公开**：`GET /dsh-edit-turn/state` 的 `revisions[]` 给出 `{ replacementSeq, startSeq, endSeq, shadowed }`（字段名与 `POST /apply` 响应一致），`hidden[]` 每题一格列出 `{ seq, turn, replacement }`。跨插件不必再从事件流自行推导。
 
-**`source.kind` 的行为（有意为之）**：prompt 编辑落地的那条 `user/message` 的 `source.kind` 是 `plugin:dsh-edit-turn`，**不是 `user`**。因此凡是以 `source.kind === 'user'` 识别"人类提问"的消费者（例如按人类提问划分回复删除窗口的逻辑），会把这条改写后的提问当作**普通内容**。这是刻意的：它是一段插件写入的文本，不是新的用户发话，平台也就不该再回答它；需要识别它的消费者请用上面的 `revisions`/`editedBy`，不要放宽 `source.kind === 'user'` 的判定。
+**`source.kind` 的行为（这里修过一个坑）**：prompt 编辑落地的那条 `user/message` **保持 `source.kind === 'user'`**，来历记在 `source.editedBy` 上。原因：平台里有近二十处按 `source.kind === 'user'` 认定「这是人类提问」——`dsh-session-turn-outline`（轮次导轨与轨迹视图）、`dsh-client-ui-trajectory`、`dsh-client-ui-chat`、inbox 的 steering 过滤、会话列表的 `lastPromptAt`。载体站在用户的位置上，改掉这个 kind 会让这些消费者**看不见这一轮的提问**：导轨空掉、`turnOutline` 的 `prompt` 变成空串、轨迹视图把提问归到「上下文」而不是「用户」。（0.2.15 及更早就是这样。）
+
+保持 `kind === 'user'` **不会**让它变成「被回答的新输入」：入队根本不看 kind——inbox 投影的 reducer 只处理 `agent/inbox/spliced`（`dsh-agent-loop`），而该事件只由显式的 agent splice 写入；跳过新输入的那些扫描判的是 `surfaceOp === 'append'`，而载体是 `surfaceOp: { op: 'replace' }`。
 
 ### 验证状态
 
@@ -479,11 +481,13 @@ The transcript only builds rows for **append surface events** (ui-chat's user an
 1. **A prompt edit keeps a single-node window**: `planRollback` for `mode === 'prompt'` shadows exactly the message itself (`shadowed = [target.seq]`) and never rolls back to the tail;
 2. **The replacement event has the type of the target**: a `user/message` edit lands a `user/message` (a reply cannot be swapped in place — see 5);
 3. **`sourceEventSeqs` always lists the whole window**: the official validator demands complete coverage; one missing node and the append is refused;
-4. **Every replacement carries the semantic marker**: `source.kind === 'plugin:dsh-edit-turn'` and `source.editedBy === 'dsh-edit-turn'` — including the empty text-free `developer/message` carrier, so siblings can recognise rewrites by `editedBy` alone instead of inferring from the window shape;
+4. **Every replacement carries the semantic marker**: `source.editedBy === 'dsh-edit-turn'` — including the empty text-free `developer/message` carrier, so siblings can recognise rewrites by `editedBy` alone instead of inferring from the window shape;
 5. **A reply edit is a multi-node rollback plus an appended correction**, not an in-place swap: the old reply row keeping no entry is **by design** (the new row carries it). Do not add `sourceEventSeqs` to an `assistant/message` to keep the old row's entry — the official validator refuses it outright;
 6. **The mapping is published**: `revisions[]` on `GET /dsh-edit-turn/state` gives `{ replacementSeq, startSeq, endSeq, shadowed }` (the field names the `POST /apply` response already used), and `hidden[]` lists `{ seq, turn, replacement }` per shadowed row. No sibling has to re-derive the ledger from the event stream.
 
-**The `source.kind` behaviour, intentionally:** after a prompt edit the landed `user/message` has `source.kind === 'plugin:dsh-edit-turn'`, **not `user`**. Any consumer that detects human prompts by `source.kind === 'user'` (for example, partitioning reply-deletion windows by human turns) will classify the revision as ordinary content. That is deliberate: the text was written by a plugin, it is not a fresh human turn, and the platform must not answer it. Consumers that need to find it should use `revisions`/`editedBy` above rather than loosening the `source.kind === 'user'` test.
+**The `source.kind` behaviour — this one was a bug:** after a prompt edit the landed `user/message` **keeps `source.kind === 'user'`**, with the provenance on `source.editedBy`. About twenty places in DSH detect human prompts with `source.kind === 'user'` — `dsh-session-turn-outline` (the turn rail and the Trajectory view), `dsh-client-ui-trajectory`, `dsh-client-ui-chat`, the inbox steering filter, `lastPromptAt` on the session list. The carrier stands in the user's place, so changing that kind made every one of those consumers stop seeing the turn's prompt: the rail lost it, `turnOutline` reported an empty prompt, and the Trajectory view filed the wording under context rather than under the user. (0.2.15 and earlier did exactly that.)
+
+Keeping `kind === 'user'` does **not** turn the carrier into fresh input that gets answered: queueing never reads `kind` — the inbox projection's reducer handles only `agent/inbox/spliced` (`dsh-agent-loop`), and that event is written solely by an explicit agent splice; the scans that skip past fresh input test `surfaceOp === 'append'`, and this carrier is `surfaceOp: { op: 'replace' }`.
 
 ### Verification status
 
