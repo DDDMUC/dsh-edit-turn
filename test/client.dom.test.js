@@ -2394,3 +2394,108 @@ test('a late dispose from the replaced instance does not leave the row without a
   assert.ok(editorIn(second), 'and the rebuilt pencil opens the editor')
 })
 
+// --- a save that changes nothing ---------------------------------------------
+//
+// The host writes nothing when the draft IS the live text, and says so with
+// `unchanged`. This half has to read that flag for what it is: not a failure (the
+// old `applied === false` wording would tell the user the rollback failed), not a
+// change (no row was shadowed, so none may be hidden), and NOT a reason to skip
+// the re-run the user asked for.
+
+const unchangedApply = (kind) => ({
+  ok: true,
+  status: 200,
+  json: async () => ({ ok: true, kind, applied: false, unchanged: true, shadowed: [], original: 'original' }),
+})
+
+test('a save with no change keeps the message, notices, and asks no re-run', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-noop')
+  const snapshot = { nodes: new Map([['row-noop', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push({ url: target, body: init && init.body })
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    if (target.includes('/dsh-edit-turn/apply')) return unchangedApply('prompt')
+    return pluginState()
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+
+  byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '保存').fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  // Read the notice immediately: the harness's `window.setTimeout` is a 0ms
+  // timer, so the banner's own 12s auto-dismiss lands on the very next tick.
+  const notice = controller.getSnapshot().notice
+  for (let attempt = 0; attempt < 10 && editorIn(harness) !== null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  render(harness, controller, snapshot)
+
+  assert.equal(JSON.parse(calls.find((call) => call.url.includes('/dsh-edit-turn/apply')).body).text, 'original',
+    'the prefilled text was posted as it was')
+  assert.equal(notice, 'unchanged', 'and the user is told why nothing happened')
+  assert.equal(editorIn(harness), null, 'the editor closes like any save')
+  assert.equal(controller.getSnapshot().hidden.size, 0, 'no row was shadowed')
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'so the message stays on screen')
+  assert.equal(host.row.style.display, undefined, 'and its row is not displayed away')
+  assert.equal(byClass(host.row, 'dshet-action').length, 1, 'the message keeps its pencil')
+  assert.equal(calls.some((call) => call.url === '/dsh-rerun-turn/apply'), false, 'a plain save re-runs nothing')
+
+  // That code is a real string in the user's language, not a raw key: put it back
+  // on screen and read the banner the component builds for it.
+  controller.notify('unchanged')
+  const tree = harness.component({ useChat: () => snapshot, useEditTurn: () => controller.getSnapshot(), controller, t: harness.t })
+  assert.equal(JSON.stringify(tree).includes('内容没有变化'), true, 'the banner says what happened')
+  controller.dismissNotice()
+})
+
+test('a re-run with no change still re-runs the turn', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-noop-rerun')
+  const snapshot = { nodes: new Map([['row-noop-rerun', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    calls.push({ url: target, body: init && init.body })
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 400, json: async () => ({ ok: false }) }
+    if (target.startsWith('/dsh-rerun-turn/state?sessionId=')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, replies: [{ seq: 3, turn: 1 }, { seq: 9, turn: 1 }, { seq: 4, turn: 2 }] }) }
+    }
+    if (target === '/dsh-rerun-turn/apply') return { ok: true, status: 200, json: async () => ({ ok: true, started: true }) }
+    if (target.includes('/dsh-edit-turn/apply')) return unchangedApply('prompt')
+    return pluginState()
+  }
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  byClass(host.row, 'dshet-action')[0].fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, snapshot)
+  const rerun = byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '重跑')
+  assert.ok(rerun, 'the re-run button is there')
+
+  rerun.fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  // Captured before the chain runs: a notice published during the save would
+  // already be up by now (and, in this harness, dismissed on the next tick).
+  const notice = controller.getSnapshot().notice
+  for (let attempt = 0; attempt < 20 && !calls.some((call) => call.url === '/dsh-rerun-turn/apply'); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+
+  const applies = calls.map((call) => call.url).filter((url) => url.includes('/apply'))
+  assert.deepEqual(applies, ['/dsh-edit-turn/apply', '/dsh-rerun-turn/apply'],
+    'the save wrote nothing and the re-run still started')
+  const chained = calls.find((call) => call.url === '/dsh-rerun-turn/apply')
+  assert.equal(JSON.parse(chained.body).seq, 9, "the turn's newest reply is still the target")
+  assert.equal(notice, null, 'a re-run is its own feedback: no "nothing changed" banner')
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'the message is still on screen')
+  assert.equal(controller.getSnapshot().hidden.size, 0)
+})
+
