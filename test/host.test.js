@@ -364,6 +364,143 @@ test('the second confirmation step is opt-in, and honoured when asked for', asyn
   }
 })
 
+// --- a save that changes nothing ---------------------------------------------
+//
+// The editor opens prefilled with the live text - the host's own parse, the very
+// one `/state` publishes as `turns[].text` - so "open the editor and save
+// without typing" reaches /apply as an exact copy of that text. It used to write
+// anyway: for a prompt, a replacement event with no revision behind it (one real
+// session collected three of those on one unchanged question, and every save
+// added a row to the ledger); for a reply, a synthetic turn plus a fresh answer
+// (two phantom rounds in the rail for one unchanged reply). Neither is a lie the
+// log can afford, and both are avoided by comparing the draft with the live text
+// before anything is appended.
+
+test('a save whose text is already the live prompt writes nothing at all', async () => {
+  const h = await harness()
+  try {
+    const before = h.session.seq
+    const events = h.session.snapshotEvents()
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'original prompt' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.ok, true)
+    assert.equal(res.json.unchanged, true, 'the caller is told nothing was written')
+    assert.equal(res.json.applied, false)
+    assert.deepEqual(res.json.shadowed, [], 'nothing left the surface')
+    assert.equal(res.json.replacementSeq, undefined, 'no replacement was written')
+    assert.equal(res.json.original, 'original prompt', 'and it names what it compared against')
+    // A no-op writes nothing, so there is nothing to flush either.
+    assert.equal(res.json.flushed, undefined)
+
+    // Not one event: the log is exactly what it was.
+    assert.equal(h.session.seq, before)
+    assert.deepEqual(h.session.snapshotEvents(), events)
+
+    // Pressing it again is just as quiet - which is the shape the real session was
+    // in, five identical saves on one wording.
+    const again = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: 'original prompt' })
+    assert.equal(again.status, 200)
+    assert.equal(again.json.unchanged, true)
+    assert.deepEqual(h.session.snapshotEvents(), events)
+
+    // The conversation did not move: no row is hidden, the ledger has no entry,
+    // both prompts are still offered, and the model was not asked anything.
+    const state = await getState(h.port)
+    assert.deepEqual(state.json.hidden, [])
+    assert.equal(state.json.edits, 0)
+    assert.deepEqual(state.json.turns.map((turn) => turn.text), ['original prompt', 'second prompt'])
+    assert.deepEqual(h.prompts, [])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a save whose text is already the live reply writes nothing and opens no turn', async () => {
+  const h = await harness()
+  try {
+    const before = h.session.seq
+    const events = h.session.snapshotEvents()
+    const derived = h.session.deriveMessages().length
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'first answer' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.unchanged, true)
+    assert.equal(res.json.applied, false)
+    assert.equal(res.json.kind, 'reply', 'the caller still knows which editor asked')
+    assert.deepEqual(res.json.shadowed, [], 'the reply is still on the surface')
+
+    // Both things a reply edit adds are absent: the synthetic turn (turn/start +
+    // step/start) and the appended correction.
+    assert.equal(h.session.seq, before)
+    assert.deepEqual(h.session.snapshotEvents(), events, 'the log is untouched')
+    const types = h.session.snapshotEvents().map((event) => event.type)
+    assert.equal(types.filter((type) => type === 'turn/start').length, 2, 'no phantom round in the rail')
+    assert.equal(types.filter((type) => type === 'assistant/message').length, 2, 'and no second answer')
+    assert.equal(h.session.deriveMessages().length, derived, 'the derived context is exactly what it was')
+    assert.equal(res.json.appendedSeq, undefined)
+    assert.equal(res.json.loopTurn, undefined, 'the live loop counter was not touched')
+    assert.deepEqual(h.prompts, [])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a real revision is still written verbatim, and then it is the live text', async () => {
+  const h = await harness()
+  try {
+    const before = h.session.seq
+    // Compared verbatim: whitespace is a difference, not a normalisation, and the
+    // write path trims nothing either (the only trim in the handler is the
+    // emptiness check, which is about validity, not equality).
+    const text = 'original prompt '
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.unchanged, undefined, 'a changed draft is not reported as unchanged')
+    assert.equal(res.json.applied, true)
+    assert.deepEqual(res.json.shadowed, [2])
+    assert.equal(res.json.flushed, true)
+    assert.equal(h.session.seq, before + 1, 'exactly the one replacement, as before')
+    const carrier = h.session.snapshotEvents().find((event) => event.seq === res.json.replacementSeq)
+    assert.deepEqual(carrier.data.content, [{ type: 'text', text }], 'the text is stored as typed')
+
+    // The same draft, addressed at the node it just wrote, is now a no-op: the
+    // guard compares against the wording the surface carries, not the old row.
+    const after = h.session.seq
+    const again = await applyEdit(h.port, { sessionId: SESSION_ID, seq: res.json.replacementSeq, text })
+    assert.equal(again.status, 200, again.payload)
+    assert.equal(again.json.unchanged, true)
+    assert.equal(h.session.seq, after, 'the second save wrote nothing')
+  } finally {
+    await h.close()
+  }
+})
+
+test('the no-op answer sits behind the same refusals as a real edit', async () => {
+  // A guard that answered "nothing to do" before the target was resolved would
+  // report success for a message that cannot be edited at all, and would hide a
+  // busy session from the user.
+  const busy = await harness()
+  try {
+    busy.session.append('turn/start', { turn: 3 })
+    const res = await applyEdit(busy.port, { sessionId: SESSION_ID, seq: 2, text: 'original prompt' })
+    assert.equal(res.status, 409)
+    assert.equal(res.json.code, 'busy')
+  } finally {
+    await busy.close()
+  }
+
+  const head = await harness()
+  try {
+    // Seq 1 is the system-prompt head: never editable, and identical text must
+    // not turn that into a quiet success.
+    const res = await applyEdit(head.port, { sessionId: SESSION_ID, seq: 1, text: 'SYS' })
+    assert.equal(res.status, 400)
+    assert.equal(res.json.code, 'not-editable')
+    assert.equal(head.session.seq, 10, 'and nothing was written for it')
+  } finally {
+    await head.close()
+  }
+})
+
 // --- refusals ---------------------------------------------------------------
 
 test('a second edit of the same turn is refused as already rolled back', async () => {

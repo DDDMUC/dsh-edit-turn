@@ -56,6 +56,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 编辑器是**平台输入框那样的一个圆角盒子**：输入区在上、取消与主按钮在右下，聚焦时整圈描边高亮；**随文字长高**（空的时候不留空白），没有标题栏、没有常驻说明、没有拖拽手柄。键盘也和输入框一致：**Enter 保存、Shift+Enter 换行、Esc 取消**（确认步里 Esc 是退回上一步）。**输入法优先**：组合中的 Enter 与"候选选词的 Enter"（`isComposing` 或 `keyCode 229`，平台自己的输入框也是这两条一起挡）都不会被当成保存，组合期间也不重排输入框——此前少挡了 229 那半，拼音选词按回车会直接保存/关闭，看起来就是"打不了中文"。
 
 编辑器里如果提示「这条消息包含图片或文件附件」，说明改写只保留文字，附件会被丢弃。
+**一字不改就按保存，什么都不会发生。** 编辑器预填的就是这条消息**现在**的文本，所以「打开编辑器、不输入、直接保存」等于没提出任何修改：宿主不写任何事件（不落替换、不开合成轮次、不追加回答），编辑器关闭并提示「内容没有变化，未做任何修改」。会话日志、轮次导轨、轨迹视图都保持原样——此前它照样落一条替换（一次会话里三条），改回答时还会多出一整个轮次（用户只发了两条消息，轨迹视图里却有四轮）。**「重跑」不受这条守卫影响**：文本没变但用户点的是「重跑」，宿主同样不写，重跑照常发起（用户的意图就是让这一轮重新生成）。
 
 **编辑模型的回答**：悬停任意一条模型回复，同样会出现编辑入口。改完点「保存」——这条回答被替换为你写的内容，它之后的内容一并移除，模型从此把你写的内容当成自己说过的话，对话可以继续下去。
 
@@ -96,6 +97,8 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 
 **重跑不由本插件做。** "改完立刻重答"是姊妹插件 `dsh-rerun-turn` 的操作：它遮蔽该轮、用表面现在显示的提示词（也就是你改后的文本）重新生成，再把后续轮次逐事件重放回来。本插件只负责把编辑落地；编辑器里的「重跑」按钮仅在检测到它挂载时出现，点击后先保存、再调用它的 `POST /dsh-rerun-turn/apply`。它不在（例如桌面版没装）时，没有这个按钮。
 
+**文本没变就不写（0.2.18）。** 决定「写什么」的那一层在落任何事件之前，把请求里的文本与**当前活节点的文本**做**逐字**比较（`readMessageText`——`/state` 的 `turns[].text` / `replies[].text` 用的就是它，所以编辑器预填的文本与这里的比较对象天然同源）。相同则直接返回 `{ applied:false, unchanged:true, shadowed:[] }`：不落替换、不 flush、不开轮次、不动活循环的轮次计数器。比较**不 trim**：只有空白差异（哪怕多一个尾随空格）也算真修改，走原来的写入路径，行为与本版之前完全一致。`unchanged` 是给调用方的**标志**而不是拒绝——路由照常 200 返回，编辑器「重跑」的链式调用照常发起；所以这道守卫只拦得住「写」，拦不住用户要的重跑。
+
 **为什么不做文件截断？** 因为那不是官方能力。`dsh-session-persistence-jsonl` 只暴露残帧崩溃修复用的 `truncateTornTail`，正常路径下「Committed events are never rewritten」；运行中的宿主把会话放在内存 append-only 日志 + 投影缓存里，改磁盘不会让它重新读取。截断还会破坏 `sourceEventSeqs` 的 `[start,end]` 压缩表示与多帧 zstd 结构。surface-replace 是官方为这件事准备的机制。
 
 **插件接口**
@@ -103,7 +106,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 | 类型 | 名称 | 说明 |
 |---|---|---|
 | 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本（`hidden` + `revisions`）、surface、忙碌状态 |
-| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容；响应含 `applied` / `shadowed` / `replacementSeq` |
+| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容；响应含 `applied` / `shadowed` / `replacementSeq`；改后文本与当前活文本一字不差时什么都不写，响应改为 `applied:false` + `unchanged:true` + `shadowed:[]`（`original` 是它比较的那份文本）。这是一个**标志，不是拒绝**：调用方自己决定下一步（编辑器的「重跑」正是靠它继续发起重跑） |
 | 工具 | `edit_turn_targets` | 只读：列出该会话当前可编辑的轮次与原文（供 agent 自查） |
 | 前端 | `conversation.input.overlay` | 每会话控制器：编辑入口、就地编辑器、被遮蔽行的隐藏账本 |
 
@@ -131,7 +134,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
 | 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 80 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 139 项通过 |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 147 项通过（含「文本没变 → 不写」的四条：改提问、改回答（不新增轮次）、真改了仍照旧写入、走「重跑」时不写但重跑仍发起） |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
@@ -169,6 +172,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - 编辑一条用户消息**只替换那一条**，**保存永不调用模型**；编辑一条模型回答只替换内容，同样不问模型。想立刻重答，用 `dsh-rerun-turn` 的「重跑」。
 - **提示词编辑只动那一条**：它下面的回复与之后的对话**原样保留**。**回复编辑**才会移除该回答及其后的内容——回答变了，建立在它之上的一切都不再成立。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
 - **只改写文本**。消息里含图片/文件附件时，改写后只保留文字（编辑器会提示）。
+- **文本一字不差时保存不写任何记录**（0.2.18）：编辑器预填的就是这条消息**现在**的文本，原样保存不会写入任何事件（不落替换、不开轮次），编辑器关闭并提示「内容没有变化」，日志与轨迹都保持原样；**「重跑」例外，它照常发起**。副作用：一条带**工具调用或思考过程**的模型回答，如果你一字不改地保存（本意只是想借替换把它们丢掉），本版不会再替换它，那些调用会留在上下文里——要丢掉它们，请把文本改成与原文不同的内容再保存。
 - **会话必须当前在 DSH 中打开**，否则返回 `409 session-not-active`。
 - **进行中拒绝编辑**：未闭合的轮次或正在压缩时返回 `409 busy`。
 - **回退是持久的，隐藏不是**。回退写进日志后，模型上下文永久改变；转录里那些行的隐藏是本插件客户端半部做的。卸载插件后，旧行会重新显示出来（而模型上下文里的回退仍然生效）——因为替换事件是官方事件，不会随插件消失。
@@ -215,6 +219,18 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.18** —— 修「一字不改地保存，也会写记录 / 多出轮次」。只修 Bug，交互语义不变。
+
+- **症状（真实会话 `session-f728ff1b`）**：用户 5 次编辑的文本全是「回复1」，一字未变。3 次「改提问」各落一条替换事件（`seq 29/30/31`，`source.editedBy:dsh-edit-turn`），2 次「改回答」各开一个合成轮次（`developer/message` 空载体 + 新 `assistant/message`，`seq 32-37` 与 `38-43`）。用户只发了 2 条消息，轨迹视图里却有 4 轮（「怎么有四轮？」）。加守卫后这 5 条记录、2 个轮次都不该产生。
+- **守卫的位置**：`applyEdit`（宿主半部）里、算出回退窗口并确认目标仍在 surface 上之后、**任何 `session.append` 之前**。文本没变则直接返回 `{ kind, applied:false, unchanged:true, shadowed:[], original }`——不落替换、不 flush、不开轮次、不动活循环的 `lastTurn`。
+- **怎么比较**：`text === plan.original`，而 `plan.original` 就是 `readMessageText(target)` 的结果，也就是 `/state` 的 `turns[].text` / `replies[].text` 用的**同一份解析**（编辑器预填的正是它）。**逐字比较、不 trim**：只有空白差异（多一个尾随空格）仍算真修改，走原来的写入路径，行为与旧版**完全一致**——这是防回归的关键一条。
+- **两条路都走同一个守卫**：改提问（`user/message` 载体）不写替换；改回答（`developer/message` 空载体 + 合成轮次 + 新 `assistant/message`）既不写替换，也**不开轮次、不追加回答**。
+- **「重跑」不被守卫拦掉（关键陷阱）**：编辑器的「重跑」= 先保存、再链式调用 `POST /dsh-rerun-turn/apply`，所以守卫只能拦「写」。`unchanged` 是**标志**而非拒绝：路由照常 200，客户端读到它以后，`confirm()` 里那句 `if (rerunIntent) this.startSiblingRerun(target.turn)` 仍然执行（它与「写没写」无关，不被 `applied === false` 的报错分支吃到），只在**没有**重跑意图时才提示「内容没有变化」。
+- **客户端只做三件事**：不把 `unchanged` 当成 `applied:false` 的失败（旧文案会说「已回退，但替换没有落地」）、不隐藏任何行（`shadowed` 为空，消息留在屏上、铅笔还在）、照常把重跑交出去。
+- **English**: saving a draft that is verbatim the text the message already carries now writes NOTHING - no replacement event, no synthetic turn, no appended answer - and answers `unchanged:true`. The decision lives in the host, in the layer that decides what to write, and compares against the same parse the editor was filled with (`readMessageText`), verbatim and without trimming. The flag is not a refusal: the editor still starts the sibling re-run when that is what the user pressed.
+- 本版：`npm test` **147/147**、`npm run verify:contract` 80/80、`npm run verify:client` **163/163**（`npm run check` exit 0）；新增 4 条宿主用例（改提问不写、改回答不写且不新增轮次、真改了仍逐字写入且随后同样的保存成为 no-op、no-op 不越过 busy/not-editable 等既有拒绝）与 2 条 DOM 用例（原样保存 → 提示且不隐藏行、不发重跑；文本没变但点「重跑」→ 不写但重跑照常发起）。
+- **负向验证**（`/tmp` 副本，仓库文件未动）：去掉宿主守卫 → **恰好 3 条**新用例转红（144/147）；把客户端的 `data.unchanged === true` 改成 `false` → **恰好 2 条**新用例转红；把 `unchanged` 分支改成提前 return（即“在路由/客户端直接 return 掉整个 apply”那种错法）→ **恰好 1 条**转红，正是「文本没变但走重跑 → 重跑仍发起」。
 
 **0.2.17** —— 修「改写过的提示词，复制出来还是旧文本」。只修 Bug，交互语义不变。
 
@@ -380,6 +396,7 @@ This plugin adds it:
 - **The smallest window that is correct.** A prompt edit shadows exactly one node (`shadowed = [target.seq]`); a reply edit shadows the reply through the end of the surface - a changed answer invalidates everything built on it - which also keeps an assistant message (carrying its own tool_use blocks) and the tool/result it produced together. A dangling call/result pair is impossible.
 - **A rewritten message stays editable.** It still shows where the original stood, and hovering it offers the pencil again.
 - **Saving never calls the model.** It only writes the context. Regenerating a turn after the edit is a different operation, owned by the sister plugin **dsh-rerun-turn** (it shadows the turn, regenerates from the prompt the surface now shows, and replays the turns that followed); this plugin only forwards to it, through the "Re-run" button, when it is mounted.
+- **A save that changes nothing writes nothing** (0.2.18). The layer that decides what to write compares the draft with the live text **verbatim**, through the same parse the editor was prefilled from (`readMessageText`, the one behind `/state`’s `turns[].text`), and answers `unchanged: true` before appending anything: no replacement event, no synthetic turn, no appended answer, no loop-counter sync. The flag is not a refusal - the route still answers 200, and the editor still starts the re-run when that was the button the user pressed.
 - **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The answer is rolled back together with everything after it, and the corrected text is **appended** as a fresh reply - the model goes on treating it as its own. `source.editedBy` records honestly that the plugin wrote those words.
 - **One click applies** - no second confirmation by default. The editor is already an explicit action the user opened; with `confirm: true` the confirmation step states what this save will discard, while the input box itself stays clean.
 - **Bilingual UI** that follows the current DSH locale.
@@ -417,6 +434,14 @@ an Enter that commits IME composition is never taken as save).
 If the editor warns that the message carries attachments, the rewrite keeps the
 text only and drops them.
 
+**Saving a draft that is word-for-word what the message already says does
+nothing at all.** The editor was prefilled with that text, so an untouched save
+is not a request to change anything: the host writes no event - no replacement,
+no synthetic turn, no fresh answer - closes the editor and says
+"nothing changed". The log, the turn rail and the Trajectory view stay exactly
+as they were. **"Re-run" is not affected**: an unchanged draft plus that button
+still re-runs the turn, because regenerating it is what the user asked for.
+
 **Editing what the model said.** Hover any model reply and the same edit action
 appears. Click "Save" - the reply is replaced with your text,
 everything after it is removed, and the model goes on treating your words as its
@@ -453,6 +478,8 @@ node, then:
   inside an open turn and step; the carrier is the empty `developer/message`,
   the corrected text is appended as an assistant message inside that turn, and
   `step/end` + `turn/end` close it behind the correction.
+
+**An unchanged draft is not written at all** (0.2.18): the layer that decides what to write compares the request’s text with the live node’s text - through the same `readMessageText` the editor was prefilled from - and returns `{ applied: false, unchanged: true, shadowed: [] }` **before** appending anything: no replacement, no flush, no turn, no loop-counter sync. The comparison is verbatim and does not trim, so any real difference (a trailing space included) takes the old path unchanged. `unchanged` is a flag for the caller, never a refusal: the route still answers 200, and the editor’s "Re-run" chain still starts (its whole point is to regenerate the turn even when the wording is what it already was).
 
 Then append:
 
@@ -511,7 +538,7 @@ Verified against DSH `0.1.6-alpha.2` and `0.1.7-rc.1`, entirely **without model 
 | Is the plugin actually mounted in a running instance? (read-only route-guard probe, no token needed) | `npm run probe:loaded [port]` | pass: `/state` answers 400 and `/apply` answers 405 - status codes only this plugin produces |
 | What the browser half asked for and got back (read-only diagnostics, failures included) | `GET /dsh-edit-turn/debug` | pass: a real browser was confirmed fetching replies, and an old v3 session was reproduced as session-not-found |
 | Official append AND READ contract against the real validator, in process | `npm run verify:contract` | 80 checks pass (every write sequence is reloaded through the reader afterwards): the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty developer carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted**, **the invariants siblings depend on (single-node window, same event type, full `sourceEventSeqs` coverage, an `editedBy` marker on every replacement, a rewritten prompt whose `source.kind` is not `user`, a correction that carries no `sourceEventSeqs`)** |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 139 tests pass |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 147 tests pass (including the four no-op cases: an unchanged prompt, an unchanged reply - no new turn - a real revision still written as before, and re-run with an unchanged draft) |
 | Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass, **including anchors on the host's node shapes** |
 | **Real browser rendering smoke** (CDP drives an already-open tab, read-only) | `npm run verify:ui` | all pass: the served bytes are the edited bytes, no empty placeholder left by a retired entry, the reply pencil sits in the platform action bar, a rolled-back row keeps its action bar, **every collapsed user message still shows the text that replaced it**, **that bubble sits above the time and the copy, in the order the platform draws a message**, **the rewriting pencil sits at the end of the surviving bar (confirmed live in the original session, the other session, and back again)**, **the reply pencil leads its bar, ahead of the copy (confirmed live)**, no `.dshet-floating` covers the revision text, and the entries survive a session round trip |
@@ -737,6 +764,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **Editing a user message replaces that one message and leaves the rest of the conversation untouched; saving never calls the model.** For an immediate answer, use `dsh-rerun-turn`'s "Re-run"; editing a model reply only replaces the text, too.
 - **A prompt edit touches only that message.** The reply under it and the whole conversation after it are kept; saving never calls the model. A **reply edit** removes that answer and everything built on it, because a changed answer invalidates what followed. Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
 - **Text only.** A message carrying image or file attachments keeps its text and drops them (the editor warns first).
+- **A draft identical to the live text writes nothing** (0.2.18): saving it as-is closes the editor with a "nothing changed" notice and leaves both the log and the rail alone; "Re-run" is the exception and still starts. The consequence worth knowing: a reply edit that is *textually* identical - the one case where you might have wanted the save only to drop that reply’s tool calls or reasoning - is now a no-op, and those calls stay in the context.
 - **The session must be open in DSH**, otherwise the route answers `409 session-not-active`.
 - **Running work is refused**: an unclosed turn or an in-flight compaction answers `409 busy`.
 - **The rollback is durable; the hiding is not.** Once written, the rollback permanently changes the model context. Hiding those rows in the transcript is this plugin's browser half. Uninstall the plugin and the old rows reappear - while the rollback in the model context still stands, because the replacement is an official event that outlives the plugin.
