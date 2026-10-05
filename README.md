@@ -24,6 +24,7 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 
 - **官方 seam，不改日志** —— 回退 = 追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的替换事件。原始事件全部留在会话文件里，只是不再进入 `deriveMessages()`。与官方 `/compact` 用的是同一套契约。
 - **改写内容就是载体本身** —— 提示词编辑落下的是一条 `user/message` 替换事件，内容就是你改后的那句话。它既让模型读到你改后的版本，也在转录里显示成你自己的气泡；平台不会把它当成新输入去回答（这一点踩过坑：**追加**一条 user 消息会触发平台自动回答，越改越多）。
+- **块随消息一起改（0.2.19）** —— 改写一条带图/带文件的消息不再只留文字：**用户没碰过的块原样搬**（逐字节复制，attachmentId、文件名、尺寸一个不改），**删掉的块不写**，**新加的块**经平台的附件服务录用后写进载体。代码里没有任何"这是图片/这是文件"的判断，唯一的判定是"这个块里有文字吗"，所以平台以后加的块类型自动适用。编辑器的非文字块显示成芯片（缩略图或名字 + 大小 + 删除按钮），另有一个「添加附件」入口；服务不在时退回旧行为（只改文字 + 继续显示那条警告）。
 - **窗口最小化** —— 提示词编辑只遮蔽目标那一格（`shadowed = [target.seq]`）；回复编辑才需要"到末尾"的窗口（回答变了，建立在它之上的一切都不再成立），因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
 - **保存永不调用模型** —— 保存只写上下文，不产生任何模型调用。"改完立刻重答"是另一件事，交给姊妹插件 **dsh-rerun-turn**（它遮蔽该轮、用表面上的提示词重新生成、再把后续轮次逐事件重放回来）；本插件只在它装着时提供一个「重跑」按钮转发过去。
 - **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，再**追加**一条带改写文本的助手消息——模型会把改写后的内容当成自己说过的话，对话可以继续。`source.editedBy` 会如实记录这段文字由插件写入。
@@ -55,7 +56,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 
 编辑器是**平台输入框那样的一个圆角盒子**：输入区在上、取消与主按钮在右下，聚焦时整圈描边高亮；**随文字长高**（空的时候不留空白），没有标题栏、没有常驻说明、没有拖拽手柄。键盘也和输入框一致：**Enter 保存、Shift+Enter 换行、Esc 取消**（确认步里 Esc 是退回上一步）。**输入法优先**：组合中的 Enter 与"候选选词的 Enter"（`isComposing` 或 `keyCode 229`，平台自己的输入框也是这两条一起挡）都不会被当成保存，组合期间也不重排输入框——此前少挡了 229 那半，拼音选词按回车会直接保存/关闭，看起来就是"打不了中文"。
 
-编辑器里如果提示「这条消息包含图片或文件附件」，说明改写只保留文字，附件会被丢弃。
+编辑器里，消息带的图片与文件**各显示成一个芯片**（缩略图或文件名 + 大小 + 删除按钮）：不碰就原样保留，点删除就是不要它了；旁边还有一个「**添加附件**」（这条消息本来没有附件时也能用）。缩略图由本插件的只读路由按需取回；取不回来、或那些字节不是图片，芯片退回显示名字。**只有当这个部署没有附件存储时**，编辑器才会改回旧的那句话——「这条消息包含图片或文件附件，改写会丢弃它们，只保留文字」——并且不出现添加入口。
 **一字不改就按保存，什么都不会发生。** 编辑器预填的就是这条消息**现在**的文本，所以「打开编辑器、不输入、直接保存」等于没提出任何修改：宿主不写任何事件（不落替换、不开合成轮次、不追加回答），编辑器关闭并提示「内容没有变化，未做任何修改」。会话日志、轮次导轨、轨迹视图都保持原样——此前它照样落一条替换（一次会话里三条），改回答时还会多出一整个轮次（用户只发了两条消息，轨迹视图里却有四轮）。**「重跑」不受这条守卫影响**：文本没变但用户点的是「重跑」，宿主同样不写，重跑照常发起（用户的意图就是让这一轮重新生成）。
 
 **编辑模型的回答**：悬停任意一条模型回复，同样会出现编辑入口。改完点「保存」——这条回答被替换为你写的内容，它之后的内容一并移除，模型从此把你写的内容当成自己说过的话，对话可以继续下去。
@@ -99,6 +100,8 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 
 **文本没变就不写（0.2.18）。** 决定「写什么」的那一层在落任何事件之前，把请求里的文本与**当前活节点的文本**做**逐字**比较（`readMessageText`——`/state` 的 `turns[].text` / `replies[].text` 用的就是它，所以编辑器预填的文本与这里的比较对象天然同源）。相同则直接返回 `{ applied:false, unchanged:true, shadowed:[] }`：不落替换、不 flush、不开轮次、不动活循环的轮次计数器。比较**不 trim**：只有空白差异（哪怕多一个尾随空格）也算真修改，走原来的写入路径，行为与本版之前完全一致。`unchanged` 是给调用方的**标志**而不是拒绝——路由照常 200 返回，编辑器「重跑」的链式调用照常发起；所以这道守卫只拦得住「写」，拦不住用户要的重跑。
 
+**块随消息一起改（0.2.19）。** 载体不再写死成一个 text 块，而是照**提交的块列表**重建：列表里只有两种条目——`{ keep: <index> }`（原文里那一块，原样搬）与 `{ add: {...} }`（用户刚选的字节，录用后写进载体）。"原样搬"是 `structuredClone` 出来的原文块对象，**逐字节一致**；删掉的块就是**不在列表里**，因此不写；新文字落在原文**第一个文字块**的位置，其余块维持相对顺序（`planBlockLayout` / `assembleBlocks`）——真实日志里 `text → image` 与 `image → text` 两种顺序都常见，所以不重排。整个模块里**只有一处**块判断（`isTextBlock`：这个块里有文字吗），别的什么类型都不认识。录用走平台公开的附件服务：`ctx.get('attachments')`（`dsh-attachment` 的 `AttachmentStore`，`dsh-acp` 用的同一个 seam；另接受 `attachment` / `attachment-local` 两个包名拼写）的 `saveImage` / `saveFile`，**每次请求现场探测**；服务不在就退回只写文字，响应带 `dropped: true`，**一个引用都不会写进日志**。录用发生在任何 `session.append` 之前：被拒（超限、字节非法）时返回 400 `attachment-refused`，日志与轮次一个字节都不动。
+
 **为什么不做文件截断？** 因为那不是官方能力。`dsh-session-persistence-jsonl` 只暴露残帧崩溃修复用的 `truncateTornTail`，正常路径下「Committed events are never rewritten」；运行中的宿主把会话放在内存 append-only 日志 + 投影缓存里，改磁盘不会让它重新读取。截断还会破坏 `sourceEventSeqs` 的 `[start,end]` 压缩表示与多帧 zstd 结构。surface-replace 是官方为这件事准备的机制。
 
 **插件接口**
@@ -106,7 +109,8 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 | 类型 | 名称 | 说明 |
 |---|---|---|
 | 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本（`hidden` + `revisions`）、surface、忙碌状态 |
-| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → 写入改后内容；响应含 `applied` / `shadowed` / `replacementSeq`；改后文本与当前活文本一字不差时什么都不写，响应改为 `applied:false` + `unchanged:true` + `shadowed:[]`（`original` 是它比较的那份文本）。这是一个**标志，不是拒绝**：调用方自己决定下一步（编辑器的「重跑」正是靠它继续发起重跑） |
+| 路由 | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text, parts? }` → 写入改后内容；`parts` 是要保留/新增的块列表（`[{ keep } \| { add: { data, mediaType?, name? } }]`，缺省 = 老客户端的纯文字载体）；响应含 `applied` / `shadowed` / `replacementSeq` / `dropped` / `blocks`；改后文本与当前活文本一字不差**且块列表与原消息相同**时什么都不写，响应改为 `applied:false` + `unchanged:true` + `shadowed:[]`（`original` 是它比较的那份文本）。这是一个**标志，不是拒绝**：调用方自己决定下一步（编辑器的「重跑」正是靠它继续发起重跑） |
+| 路由 | `GET /dsh-edit-turn/attachment?sessionId=&seq=&index=` | 只读：该会话日志确实引用过的那个块的原始字节（芯片缩略图用）；回环 + 同源 + 只认本会话引用过的引用，取不到就 404（芯片退回显示名字）。它**只用于显示**，改写路径完全不经过它 |
 | 工具 | `edit_turn_targets` | 只读：列出该会话当前可编辑的轮次与原文（供 agent 自查） |
 | 前端 | `conversation.input.overlay` | 每会话控制器：编辑入口、就地编辑器、被遮蔽行的隐藏账本 |
 
@@ -119,7 +123,8 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 3. **`sourceEventSeqs` 永远列全窗口**：官方校验要求完整覆盖，缺一个节点事件会被拒；
 4. **每个替换都带语义标记**：`source.editedBy === 'dsh-edit-turn'`——包括那个不含文本的空 `developer/message` 载体，兄弟插件按 `editedBy` 识别即可，不必靠推断窗口形状；
 5. **回复编辑 = 多节点回退 + 追加新回复**，不是就地替换：旧回复行没有入口是**设计如此**（新行自带入口）。不要为了保住旧行的入口往 `assistant/message` 上加 `sourceEventSeqs`——官方校验会直接拒；
-6. **映射已公开**：`GET /dsh-edit-turn/state` 的 `revisions[]` 给出 `{ replacementSeq, startSeq, endSeq, shadowed }`（字段名与 `POST /apply` 响应一致），`hidden[]` 每题一格列出 `{ seq, turn, replacement }`。跨插件不必再从事件流自行推导。
+6. **块列表是可选的、向前兼容的参数**：`POST /apply` 多了一个 `parts`（`[{ keep } | { add }]`）；**不传就是 0.2.18 的行为**（纯文字载体），响应里的 `dropped` 会如实说明这次保存有没有丢下非文字块。`GET /state` 的 `capabilities: { attachments, preview }` 说明这个部署能不能录用/读取块；`turns[].blocks` 逐块给出 `{ index, type, name?, mediaType?, bytes?, width?, height?, preview }`，且**只按字段有无读取**、不按类型分支——兄弟插件按同样的方式读即可，平台加新块类型不需要任何人改；
+7. **映射已公开**：`GET /dsh-edit-turn/state` 的 `revisions[]` 给出 `{ replacementSeq, startSeq, endSeq, shadowed }`（字段名与 `POST /apply` 响应一致），`hidden[]` 每题一格列出 `{ seq, turn, replacement }`。跨插件不必再从事件流自行推导。
 
 **`source.kind` 的行为（这里修过一个坑）**：prompt 编辑落地的那条 `user/message` **保持 `source.kind === 'user'`**，来历记在 `source.editedBy` 上。原因：平台里有近二十处按 `source.kind === 'user'` 认定「这是人类提问」——`dsh-session-turn-outline`（轮次导轨与轨迹视图）、`dsh-client-ui-trajectory`、`dsh-client-ui-chat`、inbox 的 steering 过滤、会话列表的 `lastPromptAt`。载体站在用户的位置上，改掉这个 kind 会让这些消费者**看不见这一轮的提问**：导轨空掉、`turnOutline` 的 `prompt` 变成空串、轨迹视图把提问归到「上下文」而不是「用户」。（0.2.15 及更早就是这样。）
 
@@ -134,8 +139,8 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
 | 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 80 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 147 项通过（含「文本没变 → 不写」的四条：改提问、改回答（不新增轮次）、真改了仍照旧写入、走「重跑」时不写但重跑仍发起） |
-| 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议） | `npm run verify:client` | 全部通过 |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 182 项通过（含「文本没变 → 不写」的四条，以及块随消息一起改的 35 条：未动的块逐字节保留、删块少一块、文字位置不变、no-op 语义升级、附件服务缺失时降级且不写坏数据、自定义 `quote-card` 块的通用性、录用与拒绝、`/state` 的块描述与能力、附件字节路由、编辑器芯片/删除/添加/缩略图/降级警告） |
+| 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议、块契约） | `npm run verify:client` | 184 项全部通过（含 12 条新的块契约检查：能力上报、服务现场探测、录用是唯一建块路径、录用先于 append、**两侧都不特判块类型**、块逐字节复制、文字归位、`dropped` 上报、只在无服务时警告、芯片靠 `error` 事件自证） |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
 | 真实 profile 安装 / 补丁合成 / 启动 / 工具契约 / 路由守卫 | `npm run verify:profile` | 全部通过 |
@@ -171,7 +176,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - 编辑一条回答会把它替换为**纯文本**：该回答里的工具调用与思考过程会被移除（编辑器会提示），因为它们的结果已不再成立。
 - 编辑一条用户消息**只替换那一条**，**保存永不调用模型**；编辑一条模型回答只替换内容，同样不问模型。想立刻重答，用 `dsh-rerun-turn` 的「重跑」。
 - **提示词编辑只动那一条**：它下面的回复与之后的对话**原样保留**。**回复编辑**才会移除该回答及其后的内容——回答变了，建立在它之上的一切都不再成立。想保留原文形成分支，需要走 `sessionController.fork({ sessionId, atSeq })`，尚未实现。
-- **只改写文本**。消息里含图片/文件附件时，改写后只保留文字（编辑器会提示）。
+- **消息里的块随消息一起改，回答里的块不随**。用户消息的图片/文件（以及平台以后加的块类型）会原样保留、可单个删除、可新增（见「工作原理」）；**模型回答里的工具调用与思考过程无法保留**——它们一旦离开原轮次就不再成立，所以回答编辑仍是纯文本，编辑器照旧提示。
 - **文本一字不差时保存不写任何记录**（0.2.18）：编辑器预填的就是这条消息**现在**的文本，原样保存不会写入任何事件（不落替换、不开轮次），编辑器关闭并提示「内容没有变化」，日志与轨迹都保持原样；**「重跑」例外，它照常发起**。副作用：一条带**工具调用或思考过程**的模型回答，如果你一字不改地保存（本意只是想借替换把它们丢掉），本版不会再替换它，那些调用会留在上下文里——要丢掉它们，请把文本改成与原文不同的内容再保存。
 - **会话必须当前在 DSH 中打开**，否则返回 `409 session-not-active`。
 - **进行中拒绝编辑**：未闭合的轮次或正在压缩时返回 `409 busy`。
@@ -219,6 +224,20 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.19** —— 改写消息对所有内容块通用：图片、文件、以及平台以后加的块都随消息一起改。
+
+- **症状**：改写一条带图/带文件的消息，**非文字块必然丢**。`readMessageText` 只取 text 块（其余只累加 `attachments` 计数），`buildCarrier` 写死 `content: [{ type: 'text', text }]`，宿主里也没有拒绝路径——那个计数唯一的用途就是让客户端画一行「改写会丢弃它们」，等于把数据丢失写进了说明文案。
+- **修法只有一条规则：用户动过没有**。提交的块列表只有两种条目——`{ keep: <index> }`（原文里那一块，原样搬）与 `{ add: {...} }`（用户刚选的字节，录用后写进载体）。**没碰的块**用 `structuredClone` 复制原文块对象，逐字节一致（attachmentId、文件名、宽高、以后新加的字段一个不改）；**删掉的块**不在列表里，因此不写；**新加的块**经 `ctx.get('attachments')` 的 `saveImage`/`saveFile` 录用后写进载体。整个模块里**只有一处**块判断（`isTextBlock`：这个块里有文字吗）——将来平台加视频、音频、引用卡片**自动适用**（已用一个自定义 `quote-card` 块在真实校验器上验过：追加、投影、改写全程无损）。
+- **布局照原文，不重排**：新文字落在原文**第一个文字块**的位置；原文没有文字块时追加在末尾。真实日志里 `text → image` 与 `image → text` 两种顺序都常见。
+- **0.2.18 的 no-op 升级为整条消息**：文本一字未变**并且**提交的块列表与原消息逐字段相同 → 什么都不写（不落替换、不开轮次、不 flush）；**删掉一个块、或加一个块，即使文本没动也是真修改**，照写。
+- **降级是显式的**：附件服务**每次请求现场探测**（`ctx.get('attachments')`，另接受 `attachment` / `attachment-local` 两个包名拼写），不存在就退回今天的行为——只写文字、响应带 `dropped: true`、编辑器继续显示那条警告并且**不出现**「添加附件」入口。此时**一个引用都不会写进日志**（不写坏数据）。录用发生在任何 `session.append` 之前：被拒（超限、字节非法、非规范 base64）返回 400 `attachment-refused`，日志与轮次一个字节都不动。
+- **回答编辑仍是纯文本**：回答里的 tool_use / 思考过程一离开原轮次就不再成立，所以它们不提供芯片、照旧提示「会被移除」——这是有意的，不是漏掉。
+- **编辑器新增芯片**：非文字块各显示成一个芯片（缩略图，或不认识的块就显示名字/媒体类型 + 大小 + 删除按钮），并有一个「添加附件」入口。缩略图走本插件自己的只读路由 `GET /dsh-edit-turn/attachment?sessionId=&seq=&index=`（回环 + 同源 + 只服务该会话日志确实引用过的引用），**浏览器解不出来就退回芯片标签**——靠 `error` 事件自证，不靠类型判断。
+- **English**: rewriting a message now carries every block it carried, not only its text. A block the user did not touch is copied verbatim (a structured clone of the original block object - attachment ids, names, sizes and every field a later platform adds), a block they removed is simply not written, and a newly picked payload is admitted through the platform's attachment store (`ctx.get('attachments')`, the seam dsh-acp uses) before the first append, so a refused upload can never leave a rollback behind. The only block test left in the module is "does this block carry text", and the revised text lands where the first text block was, so `text → image` stays `text' → image`. With no store mounted the host degrades to the text-only carrier it always wrote, reports `dropped: true`, writes no reference at all, and the editor keeps the old warning instead of offering a picker it could not honour.
+- 本版：`npm test` **182/182**、`npm run verify:contract` 80/80、`npm run verify:client` **184/184**（`npm run check` exit 0）；新增 14 条纯逻辑用例、14 条宿主用例、7 条 DOM 用例、12 条静态检查（另加 9 个新样式类断言）。
+- **负向验证**（`/tmp/dshet-neg` 副本，仓库文件未动）：去掉「原样搬运」（保留块退化成只留 `type`）→ **恰好 8 条**转红；去掉「录用」（`admitUpload` 绕过附件服务直接造块）→ **恰好 5 条**转红；去掉「布局保持」（文字总是落在末尾）→ **恰好 12 条**转红；把附件服务当成一定存在（不再降级）→ **恰好 1 条**转红，正是降级那条用例；客户端不再画芯片 → **恰好 4 条**转红（只跑 DOM 文件）。
+- **本版未验证**：真实浏览器里贴图/删芯片的手感（需要真机与 token），以及派生请求里的图片字节（这条按约定留给平台侧代码验证）。
 
 **0.2.18** —— 修「一字不改地保存，也会写记录 / 多出轮次」。只修 Bug，交互语义不变。
 
@@ -393,6 +412,7 @@ This plugin adds it:
 
 - **Official seam, log untouched.** A rollback appends one replacement event carrying `surfaceOp: { op: 'replace', startSeq, endSeq }`. Every original event stays in the session file; it simply stops entering `deriveMessages()`. This is the same contract `/compact` uses.
 - **The revision is the carrier.** A prompt edit lands a `user/message` replacement whose content **is** your revised text: it updates the model context and shows in the transcript in place of the old wording. The platform does not answer it as a new input (that was tried: *appending* a user message makes the platform reply, and the next save added another copy). Reply edits stay silent too: their carrier is an empty `developer/message` - the format admits only system-prompt sources on `system/message`, and an empty plugin-owned system node is exactly what used to make sessions unreadable (see below).
+- **A revised message carries every block it carried (0.2.19).** A block the user did not touch is copied verbatim (a structured clone of the original block object: attachment ids, names, sizes and every field a later platform adds), a block they removed is not written, and a newly picked payload is admitted through the platform's attachment store before anything is appended. Nothing in the module names a block type - the only block test is "does this block carry text" - so a block kind the platform adds later works with no change here. The editor draws one chip per non-text block (a thumbnail when its bytes are reachable, otherwise its name and size, plus a remove button) and offers an "Add an attachment" entry; with no store mounted it falls back to the old warning and no picker.
 - **The smallest window that is correct.** A prompt edit shadows exactly one node (`shadowed = [target.seq]`); a reply edit shadows the reply through the end of the surface - a changed answer invalidates everything built on it - which also keeps an assistant message (carrying its own tool_use blocks) and the tool/result it produced together. A dangling call/result pair is impossible.
 - **A rewritten message stays editable.** It still shows where the original stood, and hovering it offers the pencil again.
 - **Saving never calls the model.** It only writes the context. Regenerating a turn after the edit is a different operation, owned by the sister plugin **dsh-rerun-turn** (it shadows the turn, regenerates from the prompt the surface now shows, and replays the turns that followed); this plugin only forwards to it, through the "Re-run" button, when it is mounted.
@@ -431,8 +451,14 @@ resize grip, and the keyboard matches the composer: **Enter saves, Shift+Enter
 breaks the line, Escape cancels** (stepping back out of the confirmation first;
 an Enter that commits IME composition is never taken as save).
 
-If the editor warns that the message carries attachments, the rewrite keeps the
-text only and drops them.
+Images and files on the message each show up **as a chip** (a thumbnail, or its
+name and size, plus a remove button): leave it alone and it is kept exactly as it
+was, press remove and it is gone from the save. Next to them is "**Add an
+attachment**", which works even on a message that carried none; the thumbnail is
+fetched by this plugin's own read-only route and gives up quietly (falling back
+to the label) when those bytes are not a picture. Only a deployment with **no**
+attachment store gets the old sentence - "this message carries image or file
+attachments; rewriting keeps the text only" - and no picker at all.
 
 **Saving a draft that is word-for-word what the message already says does
 nothing at all.** The editor was prefilled with that text, so an untouched save
@@ -505,12 +531,32 @@ break the `[start, end]` run-compressed `sourceEventSeqs` representation and the
 multi-frame zstd layout. Surface-replace is the mechanism the format provides
 for exactly this.
 
+**Blocks travel with the message (0.2.19).** The carrier is no longer written
+as a single text block; it is rebuilt from the submitted block list, whose
+vocabulary is two entries: `{ keep: <index> }` (that block of the original
+message, carried as it is) and `{ add: {...} }` (bytes the user just picked, to
+be admitted). "Carried as it is" means a `structuredClone` of the original block
+object - byte for byte, references and all - while a block the user removed is
+simply absent from the list and therefore not written, and the revised text lands
+where the original's first text block stood (`planBlockLayout` /
+`assembleBlocks`). The real logs show `text → image` and `image → text` about
+equally often, so nothing is reordered. The module contains exactly one block
+test, `isTextBlock`, and knows no other type. New blocks are admitted through
+the platform's own store, `ctx.get('attachments')` (`dsh-attachment`'s
+`AttachmentStore`, the seam dsh-acp uses; `attachment` and `attachment-local`
+are accepted as package-name spellings of the same service), probed **per
+request**; a deployment without it degrades to the text-only carrier, answers
+`dropped: true` and writes no reference at all. Admission happens before the
+first `session.append`, so a refused upload (too large, malformed bytes) answers
+400 `attachment-refused` and leaves the log and the turn counter untouched.
+
 **Plugin surface**
 
 | Kind | Name | Purpose |
 |---|---|---|
 | Route | `GET /dsh-edit-turn/state?sessionId=` | Editable turns, the hidden-row ledger (`hidden` + `revisions`), the surface, busy state |
-| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text }` → write the revised text; the response carries `applied` / `shadowed` / `replacementSeq` |
+| Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text, parts? }` → write the revised text; `parts` is the block list to keep and add (`[{ keep } \| { add: { data, mediaType?, name? } }]`; omitted means the text-only carrier an older client sends); the response carries `applied` / `shadowed` / `replacementSeq` / `dropped` / `blocks` |
+| Route | `GET /dsh-edit-turn/attachment?sessionId=&seq=&index=` | Read-only: the raw bytes of one block the session's own log cites (a chip's thumbnail). Loopback and same-origin only, and it serves nothing no session references; a miss answers 404 and the chip falls back to its label. Display only - the edit path never goes through it |
 | Tool | `edit_turn_targets` | Read-only: list the session's editable turns and their text |
 | Client | `conversation.input.overlay` | Per-session controller: edit entry, in-place editor, hidden-row ledger |
 
@@ -523,7 +569,8 @@ The transcript only builds rows for **append surface events** (ui-chat's user an
 3. **`sourceEventSeqs` always lists the whole window**: the official validator demands complete coverage; one missing node and the append is refused;
 4. **Every replacement carries the semantic marker**: `source.editedBy === 'dsh-edit-turn'` — including the empty text-free `developer/message` carrier, so siblings can recognise rewrites by `editedBy` alone instead of inferring from the window shape;
 5. **A reply edit is a multi-node rollback plus an appended correction**, not an in-place swap: the old reply row keeping no entry is **by design** (the new row carries it). Do not add `sourceEventSeqs` to an `assistant/message` to keep the old row's entry — the official validator refuses it outright;
-6. **The mapping is published**: `revisions[]` on `GET /dsh-edit-turn/state` gives `{ replacementSeq, startSeq, endSeq, shadowed }` (the field names the `POST /apply` response already used), and `hidden[]` lists `{ seq, turn, replacement }` per shadowed row. No sibling has to re-derive the ledger from the event stream.
+6. **The block list is an optional, forward-compatible parameter**: `POST /apply` accepts `parts` (`[{ keep } | { add }]`), and **omitting it is exactly the 0.2.18 behaviour** (a text-only carrier), with the response's `dropped` stating whether that save left non-text blocks behind. `GET /state` answers `capabilities: { attachments, preview }` for what this deployment can admit and read, and `turns[].blocks` describes each block as `{ index, type, name?, mediaType?, bytes?, width?, height?, preview }` - read by field presence, never by type, so a sibling can do the same and a block kind the platform adds later needs no change anywhere;
+7. **The mapping is published**: `revisions[]` on `GET /dsh-edit-turn/state` gives `{ replacementSeq, startSeq, endSeq, shadowed }` (the field names the `POST /apply` response already used), and `hidden[]` lists `{ seq, turn, replacement }` per shadowed row. No sibling has to re-derive the ledger from the event stream.
 
 **The `source.kind` behaviour — this one was a bug:** after a prompt edit the landed `user/message` **keeps `source.kind === 'user'`**, with the provenance on `source.editedBy`. About twenty places in DSH detect human prompts with `source.kind === 'user'` — `dsh-session-turn-outline` (the turn rail and the Trajectory view), `dsh-client-ui-trajectory`, `dsh-client-ui-chat`, the inbox steering filter, `lastPromptAt` on the session list. The carrier stands in the user's place, so changing that kind made every one of those consumers stop seeing the turn's prompt: the rail lost it, `turnOutline` reported an empty prompt, and the Trajectory view filed the wording under context rather than under the user. (0.2.15 and earlier did exactly that.)
 
@@ -538,8 +585,8 @@ Verified against DSH `0.1.6-alpha.2` and `0.1.7-rc.1`, entirely **without model 
 | Is the plugin actually mounted in a running instance? (read-only route-guard probe, no token needed) | `npm run probe:loaded [port]` | pass: `/state` answers 400 and `/apply` answers 405 - status codes only this plugin produces |
 | What the browser half asked for and got back (read-only diagnostics, failures included) | `GET /dsh-edit-turn/debug` | pass: a real browser was confirmed fetching replies, and an old v3 session was reproduced as session-not-found |
 | Official append AND READ contract against the real validator, in process | `npm run verify:contract` | 80 checks pass (every write sequence is reloaded through the reader afterwards): the replacement is accepted, the derived history really shrinks, the log stays append-only, a tool result leaves with its call, the empty developer carrier adds no model message, **two consecutive rollbacks are both accepted**, **the whole reply-editing mechanism is accepted**, **the invariants siblings depend on (single-node window, same event type, full `sourceEventSeqs` coverage, an `editedBy` marker on every replacement, a rewritten prompt whose `source.kind` is not `user`, a correction that carries no `sourceEventSeqs`)** |
-| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 147 tests pass (including the four no-op cases: an unchanged prompt, an unchanged reply - no new turn - a real revision still written as before, and re-run with an unchanged draft) |
-| Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract) | `npm run verify:client` | all pass |
+| Pure logic, host integration and browser-half DOM behaviour (real HTTP, real validator, stubbed services, DOM stub) | `npm test` | 182 tests pass (the four no-op cases, plus the 35 that cover blocks travelling with the message: an untouched block kept byte for byte, a removed block gone, the text back in its own place, the widened no-op guard, the text-only degradation with no store, an unknown block type carried like any other, admission and refusal, the state's block descriptions and capabilities, the attachment-bytes route, and the editor's chips, removal, picker, thumbnail and fallback warning) |
+| Browser-half static checks (registration, i18n completeness, styles, skin legibility, three-way version sync, wire contract, block contract) | `npm run verify:client` | all 184 pass (including 12 new block-contract checks: the capability report, the per-request store probe, admission as the only way a block is created, admission before the first append, **no block type special-cased on either side**, the verbatim copy, the text's placement, the `dropped` report, the warning that survives only where a store is missing, and a chip proving itself through the `error` event) |
 | Live client artifact (is the running DSH serving the current code?) | `npm run verify:live -- --token-file ~/path/to/dsh.log` | all pass, **including anchors on the host's node shapes** |
 | **Real browser rendering smoke** (CDP drives an already-open tab, read-only) | `npm run verify:ui` | all pass: the served bytes are the edited bytes, no empty placeholder left by a retired entry, the reply pencil sits in the platform action bar, a rolled-back row keeps its action bar, **every collapsed user message still shows the text that replaced it**, **that bubble sits above the time and the copy, in the order the platform draws a message**, **the rewriting pencil sits at the end of the surviving bar (confirmed live in the original session, the other session, and back again)**, **the reply pencil leads its bar, ahead of the copy (confirmed live)**, no `.dshet-floating` covers the revision text, and the entries survive a session round trip |
 | Real profile: install, patch composition, boot, tool contract, route guards | `npm run verify:profile` | all pass |
@@ -763,7 +810,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 - **Editing a reply replaces it with plain text**: the tool calls and reasoning inside it are removed (the editor warns first), because their results are no longer valid.
 - **Editing a user message replaces that one message and leaves the rest of the conversation untouched; saving never calls the model.** For an immediate answer, use `dsh-rerun-turn`'s "Re-run"; editing a model reply only replaces the text, too.
 - **A prompt edit touches only that message.** The reply under it and the whole conversation after it are kept; saving never calls the model. A **reply edit** removes that answer and everything built on it, because a changed answer invalidates what followed. Keeping the original as a branch needs `sessionController.fork({ sessionId, atSeq })`, which is not implemented.
-- **Text only.** A message carrying image or file attachments keeps its text and drops them (the editor warns first).
+- **Blocks travel with a user message, not with a reply.** The images and files on your own message are kept as they are, can be removed one by one and new ones can be added (see "How it works"); the **tool calls and reasoning inside a model reply cannot survive** - they stop being true the moment the reply is replaced - so a reply edit is still text only, and the editor says so.
 - **A draft identical to the live text writes nothing** (0.2.18): saving it as-is closes the editor with a "nothing changed" notice and leaves both the log and the rail alone; "Re-run" is the exception and still starts. The consequence worth knowing: a reply edit that is *textually* identical - the one case where you might have wanted the save only to drop that reply’s tool calls or reasoning - is now a no-op, and those calls stay in the context.
 - **The session must be open in DSH**, otherwise the route answers `409 session-not-active`.
 - **Running work is refused**: an unclosed turn or an in-flight compaction answers `409 busy`.

@@ -155,6 +155,7 @@ check('the initial state is empty', snapshot.editing === null && snapshot.notice
 // past `=== null` guards. Pin the exact key set: adding a field requires
 // updating this list, removing one breaks the build here rather than in the UI.
 const EXPECTED_SNAPSHOT_KEYS = [
+  'attachmentsOk',
   'confirmStep',
   'confirming',
   'draft',
@@ -165,6 +166,7 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'loadError',
   'loaded',
   'notice',
+  'parts',
   'pending',
   'replies',
   'repliesByMessage',
@@ -245,6 +247,17 @@ const REQUIRED_CLASSES = [
   'dshet-btn',
   'dshet-btn-primary',
   'dshet-notice',
+  // The block chips: the editor's own view of what a message carries, and the
+  // entry that adds one.
+  'dshet-chips',
+  'dshet-chip',
+  'dshet-thumb',
+  'dshet-chip-label',
+  'dshet-chip-size',
+  'dshet-chip-remove',
+  'dshet-attach-row',
+  'dshet-attach',
+  'dshet-attach-input',
 ]
 for (const className of REQUIRED_CLASSES) {
   check(`.${className} is styled`, css.includes(`.${className}`))
@@ -672,6 +685,71 @@ check(
 check(
   'the apply route records what it was asked for',
   hostSource.includes("kind: 'apply'") && hostSource.includes('kind: \'state\''),
+)
+
+// A revised message carries its BLOCKS, not only its text. The contract that
+// makes that safe is small enough to pin here: a submitted block is either kept
+// verbatim or admitted through the platform's store, the text goes back where
+// the text was, and no block type is ever named - so a picture, a file and
+// whatever the platform carries next all travel the same way.
+console.log('\n  — a save carries the blocks, and names no block type —')
+check(
+  'the host publishes what it can do with blocks, and the client reads it',
+  hostSource.includes('capabilities: { attachments: store !== null') && clientSource.includes('data.capabilities'),
+  'the editor may only offer what the host can honour',
+)
+check(
+  'the attachment store is probed per request, never assumed',
+  hostSource.includes('ctx.get(name)') && hostSource.includes("const ATTACHMENT_SERVICES = ['attachments'"),
+  'a deployment without a store must keep working, and one that mounts it later must start working',
+)
+check(
+  'the store is the only way a new block is created',
+  hostSource.includes('await store.saveImage(') && hostSource.includes('await store.saveFile('),
+  'a block built by hand would cite a reference nothing can resolve',
+)
+check(
+  'admission runs before the first append',
+  /const admitted = [\][\s\S]{0,400}await admitUpload\(store, slot\.upload\)/.test(hostSource),
+  'a refused upload must not leave a rollback behind',
+)
+check(
+  'the submitted list is only ever "kept" or "added"',
+  hostSource.includes('{ keep } | { add }') && clientSource.includes('? { keep: part.keep } : { add: part.add }'),
+)
+check(
+  'a kept block is copied verbatim',
+  hostSource.includes('structuredClone(block)'),
+  'the promise of the feature is that an untouched block crosses the edit byte for byte',
+)
+check(
+  'NO block type is special-cased on either side',
+  !/type\s*===\s*'(image|file|video|audio|document)'/.test(hostSource) &&
+    !/type\s*===\s*'(image|file|video|audio|document)'/.test(clientSource) &&
+    !/'(image|file|video|audio)'\s*===\s*\w+\.type/.test(hostSource),
+  'a block type the platform adds later has to work with no change here',
+)
+check(
+  'the revised text goes back where the first text block was',
+  hostSource.includes('firstText') && hostSource.includes('textAt'),
+)
+check(
+  'the answer says what a save left behind',
+  hostSource.includes('const dropped = layout === null') && clientSource.includes("notify('attachments-dropped')"),
+)
+check(
+  'the editor warns only when the host cannot carry the blocks',
+  clientSource.includes('if (target.attachments > 0 && !chips)'),
+  'the old "rewriting drops them" warning belongs to a deployment with no attachment store',
+)
+check(
+  'a chip draws itself from its bytes and gives up quietly otherwise',
+  clientSource.includes("image.addEventListener('error'"),
+  'deciding with a type test instead would make the next block kind invisible',
+)
+check(
+  'the attachment route serves bytes for a chip thumbnail',
+  hostSource.includes('\`${ROUTE_PREFIX}/attachment\`') && clientSource.includes('${ROUTE_PREFIX}/attachment?sessionId='),
 )
 
 // Nothing in the contract above says what the client does with the answer to a
