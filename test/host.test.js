@@ -10,8 +10,11 @@
 //
 //   node --test "test/*.test.js"
 import assert from 'node:assert/strict'
+import { writeFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import net from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { Session } from '@deepseek-ai/dsh-session'
@@ -207,6 +210,7 @@ test('every route is mounted, so a missing one never silently passes', async () 
   try {
     assert.deepEqual([...h.routes.keys()].sort(), [
       '/dsh-edit-turn/apply',
+      '/dsh-edit-turn/attachment',
       '/dsh-edit-turn/debug',
       '/dsh-edit-turn/state',
     ])
@@ -886,3 +890,407 @@ test('the tool admits when it has no session to inspect', async () => {
     await h.close()
   }
 })
+
+// --- blocks: a revised message carries everything it carried -----------------
+//
+// The edit is rebuilt from the submitted block list: a block the user left alone
+// is copied verbatim, one they removed is not written, and a newly picked one is
+// admitted through the platform's attachment store. The fixtures below are the
+// real shapes (an image reference, a file reference) plus a block type this
+// plugin has never heard of, which has to travel exactly like the others.
+
+const IMAGE_REF = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', width: 4, height: 3, bytes: 1234, name: 'shot.png' }
+const FILE_REF = { attachmentId: `sha256:${'b'.repeat(64)}`, name: 'notes.pdf', bytes: 5678 }
+const BLOCKS = [
+  { type: 'text', text: '看图' },
+  { type: 'image', attachment: IMAGE_REF },
+  { type: 'file', attachment: FILE_REF },
+  // A block from a platform this plugin has never seen. The real validator
+  // accepts it and the projection passes it through, so nothing here may need to
+  // know what it is.
+  { type: 'quote-card', payload: { quote: '引用卡片', page: 3 } },
+]
+
+/** One completed turn whose prompt carries blocks of every kind. */
+function buildBlockyLog(session, blocks = BLOCKS) {
+  session.append('turn/start', { turn: 1 })
+  session.append(
+    'system/message',
+    { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'plugin', plugin: 'stub-bundle' } } },
+    { surfaceOp: 'append' },
+  )
+  session.append('user/message', { id: 'u1', role: 'user', content: blocks, source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('assistant/message', { turn: 1, step: 1, message: modelMessage('a1', 'first answer'), stream: [] }, { surfaceOp: 'append' })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+}
+
+/** A store that admits everything and remembers what it was handed. */
+function stubStore() {
+  const calls = []
+  return {
+    calls,
+    imageLimits: { mediaTypes: ['image/png', 'image/jpeg'] },
+    async saveImage(input) {
+      calls.push({ kind: 'image', input })
+      return {
+        attachmentId: `sha256:${'c'.repeat(64)}`,
+        mediaType: input.mediaType,
+        bytes: input.data.byteLength,
+        width: 2,
+        height: 2,
+        ...(input.name === undefined ? {} : { name: input.name }),
+      }
+    },
+    async saveFile(input) {
+      calls.push({ kind: 'file', input })
+      return { attachmentId: `sha256:${'d'.repeat(64)}`, name: input.name === undefined ? 'file' : input.name, bytes: input.data.byteLength }
+    },
+  }
+}
+
+const blockySession = (blocks = BLOCKS) => {
+  const session = Session.create(SESSION_ID)
+  buildBlockyLog(session, blocks)
+  return session
+}
+
+const carrierOf = (h, response) => h.session.snapshotEvents().find((event) => event.seq === response.json.replacementSeq)
+
+test('a revised message keeps every block the user did not touch, byte for byte', async () => {
+  const h = await harness({ session: blockySession(), services: { attachments: stubStore() } })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { keep: 1 }, { keep: 2 }, { keep: 3 }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true)
+    const content = carrierOf(h, res).data.content
+    assert.equal(content.length, 4)
+    assert.deepEqual(content[0], { type: 'text', text: '改过的文字' }, 'the revised text stands in the text block, in place')
+    for (const index of [1, 2, 3]) {
+      assert.equal(JSON.stringify(content[index]), JSON.stringify(BLOCKS[index]), `block ${index} must cross the edit byte for byte`)
+    }
+    assert.equal(res.json.dropped, false)
+    // The derived context carries the blocks too: the model sees the picture,
+    // not a note about a picture.
+    const derived = h.session.deriveMessages()
+    const message = derived.find((entry) => entry.role === 'user')
+    assert.deepEqual(message.content.map((block) => block.type), ['text', 'image', 'file', 'quote-card'])
+    assert.equal(JSON.stringify(message.content[1]), JSON.stringify(BLOCKS[1]), 'and the picture the model sees is the original one')
+  } finally {
+    await h.close()
+  }
+})
+
+test('a block the user removes is not written, and nothing else moves', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { keep: 2 }],
+    })
+    assert.equal(res.json.applied, true)
+    const content = carrierOf(h, res).data.content
+    assert.deepEqual(content.map((block) => block.type), ['text', 'file'])
+    assert.equal(JSON.stringify(content[1]), JSON.stringify(BLOCKS[2]))
+    assert.deepEqual(store.calls, [], 'removing a block asks the store for nothing')
+  } finally {
+    await h.close()
+  }
+})
+
+test('the revised text lands where the original text block was', async () => {
+  // The layout the real logs show as often as the other one: picture first.
+  const blocks = [{ type: 'image', attachment: IMAGE_REF }, { type: 'text', text: '看图' }, { type: 'quote-card', payload: { page: 1 } }]
+  const h = await harness({ session: blockySession(blocks), services: { attachments: stubStore() } })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { keep: 1 }, { keep: 2 }],
+    })
+    const content = carrierOf(h, res).data.content
+    assert.deepEqual(content.map((block) => block.type), ['image', 'text', 'quote-card'])
+    assert.equal(JSON.stringify(content[0]), JSON.stringify(blocks[0]), 'the picture did not move')
+    assert.equal(JSON.stringify(content[2]), JSON.stringify(blocks[2]))
+  } finally {
+    await h.close()
+  }
+})
+
+test('a block type this plugin has never seen travels like any other', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 3 }, { keep: 0 }],
+    })
+    const content = carrierOf(h, res).data.content
+    assert.equal(content.length, 2)
+    // The text keeps ITS place from the original message, whatever order the
+    // submitted list happened to name the blocks in: it stood before the card,
+    // so it still does.
+    assert.deepEqual(content.map((block) => block.type), ['text', 'quote-card'])
+    assert.equal(JSON.stringify(content[1]), JSON.stringify(BLOCKS[3]), 'no field of it is interpreted')
+    assert.deepEqual(store.calls, [])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a newly picked block is admitted through the store and cited by the carrier', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const bytes = Buffer.from('png-bytes')
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 1 }, { add: { data: bytes.toString('base64'), mediaType: 'image/png', name: 'new.png' } }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(store.calls.length, 1)
+    assert.equal(store.calls[0].kind, 'image')
+    assert.equal(Buffer.from(store.calls[0].input.data).toString(), 'png-bytes')
+    assert.equal(store.calls[0].input.name, 'new.png')
+    const content = carrierOf(h, res).data.content
+    assert.deepEqual(content.map((block) => block.type), ['text', 'image', 'image'])
+    assert.equal(content[2].attachment.attachmentId, `sha256:${'c'.repeat(64)}`, 'the carrier cites what the store returned')
+    // ...and the answer describes the blocks the carrier now carries, so the
+    // editor can be reopened on the row it just rewrote.
+    assert.deepEqual(res.json.blocks.map((block) => block.index), [1, 2])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a tag-along file is stored verbatim, not forced through the image path', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { add: { data: Buffer.from('pdf-bytes').toString('base64'), mediaType: 'application/pdf', name: 'new.pdf' } }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(store.calls[0].kind, 'file')
+    const content = carrierOf(h, res).data.content
+    assert.deepEqual(content.map((block) => block.type), ['text', 'file'])
+    assert.equal(content[1].attachment.name, 'new.pdf')
+  } finally {
+    await h.close()
+  }
+})
+
+test('a store that refuses an upload leaves the log exactly as it was', async () => {
+  const store = {
+    imageLimits: { mediaTypes: ['image/png'] },
+    async saveImage() {
+      throw new Error('Image batch exceeds the configured aggregate image-byte limit.')
+    },
+    async saveFile() {
+      throw new Error('this deployment cannot store files')
+    },
+  }
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { add: { data: Buffer.from('x').toString('base64'), mediaType: 'image/png' } }],
+    })
+    assert.equal(res.status, 400, res.payload)
+    assert.equal(res.json.code, 'attachment-refused')
+    assert.equal(h.session.seq, before, 'a refused upload must not leave a rollback behind')
+    assert.deepEqual(h.session.deriveMessages().find((entry) => entry.id === 'u1').content, BLOCKS)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a message rewritten on a deployment with no attachment store degrades to text only', async () => {
+  // The store is the ONE thing that can turn bytes into a reference a session
+  // may cite. Without it nothing new may be written - and nothing that is
+  // already in the log may be promised either: the carrier is exactly what this
+  // plugin wrote before blocks travelled, and the answer says what it cost.
+  const h = await harness({ session: blockySession() })
+  try {
+    const state = await getState(h.port)
+    assert.deepEqual(state.json.capabilities, { attachments: false, preview: false })
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '改过的文字',
+      parts: [{ keep: 0 }, { keep: 1 }, { keep: 2 }, { keep: 3 }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true)
+    assert.equal(res.json.dropped, true, 'the answer states what the save left behind')
+    const carrier = carrierOf(h, res)
+    assert.deepEqual(carrier.data.content, [{ type: 'text', text: '改过的文字' }])
+    // Nothing broken was written: no block cites a reference, and the real
+    // loader still reads the whole log.
+    assert.equal(carrier.data.content.some((block) => block.attachment !== undefined), false)
+    assert.equal(h.session.deriveMessages().length > 0, true)
+    assert.equal(h.session.snapshotEvents().length, 6, 'one replacement event, and nothing else')
+  } finally {
+    await h.close()
+  }
+})
+
+test('an unchanged save that keeps every block writes nothing at all', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      seq: 2,
+      text: '看图',
+      parts: [{ keep: 0 }, { keep: 1 }, { keep: 2 }, { keep: 3 }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, false)
+    assert.equal(res.json.unchanged, true)
+    assert.deepEqual(res.json.shadowed, [], 'nothing left the surface, so nothing may be hidden')
+    assert.equal(res.json.dropped, false)
+    assert.equal(h.session.seq, before, 'no replacement, no synthetic turn, no appended answer')
+    assert.deepEqual(store.calls, [])
+    // The editor gets the block list it opened with back, so a second save is
+    // the same no-op rather than a rewrite that drops everything.
+    assert.deepEqual(res.json.blocks.map((block) => block.index), [1, 2, 3])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a save that removes a block IS a change, even with the text untouched', async () => {
+  const h = await harness({ session: blockySession(), services: { attachments: stubStore() } })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: '看图', parts: [{ keep: 0 }, { keep: 1 }] })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true, 'the message is not what it was')
+    assert.deepEqual(carrierOf(h, res).data.content.map((block) => block.type), ['text', 'image'])
+  } finally {
+    await h.close()
+  }
+})
+
+test('a client from before blocks travelled still works, and is told what it cost', async () => {
+  const h = await harness({ session: blockySession(), services: { attachments: stubStore() } })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 2, text: '改过的文字' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true)
+    assert.deepEqual(carrierOf(h, res).data.content, [{ type: 'text', text: '改过的文字' }])
+    assert.equal(res.json.dropped, true)
+    // The same caller's unchanged save is still the no-op it was in 0.2.18:
+    // text-only carriers are not compared against blocks the caller never saw.
+    const again = await applyEdit(h.port, { sessionId: SESSION_ID, seq: res.json.replacementSeq, text: '改过的文字' })
+    assert.equal(again.json.unchanged, true)
+    assert.equal(again.json.applied, false)
+  } finally {
+    await h.close()
+  }
+})
+
+test('the state describes what a prompt carries, and what this host can do', async () => {
+  const store = stubStore()
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const res = await getState(h.port)
+    assert.deepEqual(res.json.capabilities, { attachments: true, preview: false }, 'this stub store has no read seam')
+    const turn = res.json.turns[0]
+    assert.equal(turn.attachments, 3)
+    assert.deepEqual(turn.blocks, [
+      { index: 1, type: 'image', name: 'shot.png', mediaType: 'image/png', bytes: 1234, width: 4, height: 3, preview: false },
+      { index: 2, type: 'file', name: 'notes.pdf', bytes: 5678, preview: false },
+      { index: 3, type: 'quote-card', preview: false },
+    ])
+  } finally {
+    await h.close()
+  }
+})
+
+test('the attachment route serves the bytes of a cited block, and nothing else', async () => {
+  const store = {
+    ...stubStore(),
+    async readImage(ref) {
+      return { ref, data: Buffer.from('PNG!') }
+    },
+  }
+  // A store that answers for one session only, so "another session's block" is
+  // a real case and not an artefact of the stubs (the default stub answers for
+  // whatever id it is asked about).
+  const session = blockySession()
+  const h = await harness({
+    session,
+    services: {
+      attachments: store,
+      sessions: { get: (id) => (id === SESSION_ID ? session : undefined), flush: async () => {} },
+      sessionQuery: {
+        readSession: async (id) => {
+          if (id !== SESSION_ID) throw new Error('session-not-found')
+          return { events: session.snapshotEvents() }
+        },
+      },
+    },
+  })
+  try {
+    const res = await raw(h.port, { path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=2&index=1` })
+    assert.equal(res.status, 200)
+    assert.equal(res.payload, 'PNG!')
+    assert.equal(res.head.includes('image/png'), true, 'the media type the reference declares')
+    // A block with no attachment reference has no bytes to serve.
+    const text = await raw(h.port, { path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=2&index=0` })
+    assert.equal(text.status, 404)
+    // Nor does a message that does not exist, or another session's.
+    const missing = await raw(h.port, { path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=99&index=1` })
+    assert.equal(missing.status, 404)
+    const foreign = await raw(h.port, { path: '/dsh-edit-turn/attachment?sessionId=session-99999999-2222-4333-8444-555555555555&seq=2&index=1' })
+    assert.equal(foreign.status, 404)
+    const post = await raw(h.port, { method: 'POST', path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=2&index=1`, body: '{}' })
+    assert.equal(post.status, 405)
+    const bad = await raw(h.port, { path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=x&index=1` })
+    assert.equal(bad.status, 400)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a file block is served verbatim when the store backs it with a host path', async () => {
+  const path = join(tmpdir(), `dshet-attachment-${process.pid}-${Date.now()}.pdf`)
+  writeFileSync(path, 'PDF!')
+  const store = {
+    ...stubStore(),
+    fileHostPath(ref) {
+      return String(ref.attachmentId) === FILE_REF.attachmentId ? path : (() => { throw new Error('not a file reference') })()
+    },
+  }
+  const h = await harness({ session: blockySession(), services: { attachments: store } })
+  try {
+    const res = await raw(h.port, { path: `/dsh-edit-turn/attachment?sessionId=${SESSION_ID}&seq=2&index=2` })
+    assert.equal(res.status, 200)
+    assert.equal(res.payload, 'PDF!')
+    assert.equal(res.head.includes('application/octet-stream'), true, 'a verbatim file has no declared media type')
+  } finally {
+    await h.close()
+    rmSync(path, { force: true })
+  }
+})
+

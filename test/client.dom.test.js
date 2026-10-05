@@ -2499,3 +2499,222 @@ test('a re-run with no change still re-runs the turn', async () => {
   assert.equal(controller.getSnapshot().hidden.size, 0)
 })
 
+
+// --- chips: a revised message keeps what it carries --------------------------
+//
+// The editor used to say "rewriting drops your attachments" and mean it. It now
+// draws one chip per block the message carries, lets the user remove one, and
+// posts the surviving list with the save - while a host that cannot admit a
+// block gets the old warning instead, because there the old behaviour is the
+// honest one.
+
+const BLOCKS = [
+  { index: 1, type: 'image', name: 'shot.png', mediaType: 'image/png', bytes: 1234, width: 4, height: 3, preview: false },
+  { index: 2, type: 'file', name: 'notes.pdf', bytes: 5678, preview: false },
+  { index: 3, type: 'quote-card', preview: false },
+]
+
+const blockyState = (options = {}) => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    ok: true,
+    hidden: [],
+    turns: [{
+      seq: 2,
+      turn: 1,
+      messageId: 'm-u1',
+      text: '看图',
+      attachments: BLOCKS.length,
+      blocks: options.blocks === undefined ? BLOCKS : options.blocks,
+    }],
+    capabilities: { attachments: options.attachments !== false, preview: true },
+    config: { confirm: false },
+  }),
+})
+
+/** Open the editor on the one user row, with /state answered by the state above. */
+async function openEditor(harness, snapshot, requests) {
+  globalThis.fetch = async (url, init) => {
+    const target = String(url)
+    if (requests !== undefined) requests.push({ url: target, body: init && init.body })
+    if (target.includes('/dsh-edit-turn/state')) return blockyState(harness.stateOptions)
+    if (target === '/dsh-rerun-turn/state') return { ok: false, status: 404, json: async () => ({ ok: false }) }
+    if (target.includes('/dsh-edit-turn/apply')) return harness.applyAnswer
+    return { ok: false, status: 404, json: async () => ({ ok: false }) }
+  }
+  await harness.controller.load(true)
+  render(harness, harness.controller, snapshot)
+  const pencil = byClass(snapshot.row, 'dshet-action')[0]
+  pencil.fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, harness.controller, snapshot)
+  return editorIn(harness)
+}
+
+const chipLabels = (box) => byClass(box, 'dshet-chip').map((chip) => {
+  const label = byClass(chip, 'dshet-chip-label')[0]
+  return label === undefined ? null : label.textContent
+})
+
+const simpleRow = (harness) => {
+  const host = mountHostUserRow(harness.document)
+  return { nodes: new Map([[ROW_KEY, { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]), row: host.row }
+}
+
+test('a message that carries blocks shows one chip per block, and no warning', async () => {
+  const harness = await loadBundle()
+  const snapshot = simpleRow(harness)
+  const box = await openEditor(harness, snapshot)
+  assert.deepEqual(chipLabels(box), ['shot.png', 'notes.pdf', 'quote-card'], 'one chip per block, named from the block itself')
+  const sizes = byClass(box, 'dshet-chip').map((chip) => {
+    const size = byClass(chip, 'dshet-chip-size')[0]
+    return size === undefined ? null : size.textContent
+  })
+  assert.deepEqual(sizes, ['1.2 KB', '5.5 KB', null], 'and its size, when the block reports one')
+  assert.equal(byClass(box, 'dshet-chip-remove').length, 3, 'every chip can be removed')
+  assert.equal(byClass(box, 'dshet-warn').length, 0, 'nothing is going to be dropped, so nothing warns')
+  assert.equal(byClass(box, 'dshet-attach').length, 1, 'and there is somewhere to add one')
+})
+
+test('a host that cannot carry blocks keeps the old warning, and offers no picker', async () => {
+  const harness = await loadBundle()
+  harness.stateOptions = { attachments: false }
+  const snapshot = simpleRow(harness)
+  const box = await openEditor(harness, snapshot)
+  assert.equal(byClass(box, 'dshet-chip').length, 0, 'no chip may promise a block this host cannot keep')
+  assert.equal(byClass(box, 'dshet-attach').length, 0)
+  const warn = byClass(box, 'dshet-warn')[0]
+  assert.ok(warn, 'the warning this editor always had')
+  assert.equal(warn.textContent, harness.t('editor.warn.attachments'))
+})
+
+
+test('removing a chip takes the block off the list that is saved', async () => {
+  const harness = await loadBundle()
+  const snapshot = simpleRow(harness)
+  const requests = []
+  const box = await openEditor(harness, snapshot, requests)
+  assert.equal(chipLabels(box).length, 3)
+  const removed = byClass(byClass(box, 'dshet-chip')[1], 'dshet-chip-remove')[0]
+  removed.fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, harness.controller, snapshot)
+  const after = editorIn(harness)
+  assert.deepEqual(chipLabels(after), ['shot.png', 'quote-card'], 'the chip is gone from the strip')
+
+  harness.applyAnswer = {
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, kind: 'prompt', applied: true, shadowed: [2], replacementSeq: 99, dropped: false, blocks: [] }),
+  }
+  const save = byClass(after, 'dshet-btn').find((button) => button.textContent === '保存')
+  save.fire('pointerdown')
+  for (let attempt = 0; attempt < 10 && !requests.some((call) => call.url.includes('/dsh-edit-turn/apply')); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  const sent = JSON.parse(requests.find((call) => call.url.includes('/dsh-edit-turn/apply')).body)
+  assert.deepEqual(sent.parts, [{ keep: 1 }, { keep: 3 }], 'the block the user removed is not in the list')
+  assert.equal(sent.text, '看图', 'and the text travelled unchanged')
+})
+
+test('a file the user picks becomes a chip and travels with the save', async () => {
+  const harness = await loadBundle()
+  const snapshot = simpleRow(harness)
+  const requests = []
+  const box = await openEditor(harness, snapshot, requests)
+  globalThis.FileReader = class {
+    readAsDataURL() {
+      this.result = 'data:application/pdf;base64,UERG'
+      this.onload()
+    }
+  }
+  try {
+    const picker = byClass(box, 'dshet-attach-input')[0]
+    picker.files = [{ name: 'new.pdf', type: 'application/pdf', size: 3 }]
+    picker.fire('change')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, harness.controller, snapshot)
+    const grown = editorIn(harness)
+    assert.deepEqual(chipLabels(grown), ['shot.png', 'notes.pdf', 'quote-card', 'new.pdf'], 'the picked file is a chip of its own')
+    const picked = byClass(grown, 'dshet-chip').at(-1)
+    const ownBytes = byClass(picked, 'dshet-thumb')[0]
+    assert.ok(ownBytes, 'a picked payload draws itself from the bytes it is already carrying')
+    assert.equal(ownBytes.src.startsWith('data:application/pdf;base64,'), true)
+
+    harness.applyAnswer = {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true, kind: 'prompt', applied: true, shadowed: [2], replacementSeq: 99, dropped: false, blocks: [] }),
+    }
+    const save = byClass(grown, 'dshet-btn').find((button) => button.textContent === '保存')
+    save.fire('pointerdown')
+    for (let attempt = 0; attempt < 10 && !requests.some((call) => call.url.includes('/dsh-edit-turn/apply')); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const sent = JSON.parse(requests.find((call) => call.url.includes('/dsh-edit-turn/apply')).body)
+    assert.deepEqual(sent.parts.at(-1), { add: { data: 'UERG', mediaType: 'application/pdf', name: 'new.pdf' } },
+      'the bytes travel with the revision, in the canonical base64 the host wants')
+  } finally {
+    delete globalThis.FileReader
+  }
+})
+
+
+test('a chip draws its thumbnail from the attachment route, and gives up when it cannot', async () => {
+  const harness = await loadBundle()
+  harness.stateOptions = { blocks: [{ ...BLOCKS[0], preview: true }, BLOCKS[1]] }
+  const snapshot = simpleRow(harness)
+  const box = await openEditor(harness, snapshot)
+  const image = byClass(box, 'dshet-thumb')[0]
+  assert.ok(image, 'a block whose bytes are reachable is drawn from them')
+  assert.equal(image.src, '/dsh-edit-turn/attachment?sessionId=' + encodeURIComponent(SESSION_ID) + '&seq=2&index=1')
+  assert.equal(byClass(box, 'dshet-thumb').length, 1, 'a block with nothing to read gets no thumbnail')
+
+  // The browser is what decides whether those bytes are a picture: a block type
+  // list here would make the next block kind invisible.
+  image.fire('error')
+  assert.equal(byClass(editorIn(harness), 'dshet-thumb').length, 0, 'the chip keeps its label instead')
+  assert.deepEqual(chipLabels(editorIn(harness)), ['shot.png', 'notes.pdf'])
+})
+
+test('a save that could not keep the blocks says so', async () => {
+  const harness = await loadBundle()
+  const snapshot = simpleRow(harness)
+  const box = await openEditor(harness, snapshot)
+  harness.applyAnswer = {
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, kind: 'prompt', applied: true, shadowed: [2], replacementSeq: 99, dropped: true, blocks: [] }),
+  }
+  const save = byClass(box, 'dshet-btn').find((button) => button.textContent === '保存')
+  save.fire('pointerdown')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const notice = harness.controller.getSnapshot().notice
+  assert.equal(notice, 'attachments-dropped', 'the editor is gone by now: the banner is the only thing that can say it')
+  const tree = harness.component({ useChat: () => snapshot, useEditTurn: () => harness.controller.getSnapshot(), controller: harness.controller, t: harness.t })
+  assert.equal(JSON.stringify(tree).includes('没能保留'), true, 'and it says so in the language on screen')
+  harness.controller.dismissNotice()
+})
+
+test('an unchanged save keeps the message and posts the same block list', async () => {
+  const harness = await loadBundle()
+  const host = mountHostUserRow(harness.document)
+  const snapshot = { nodes: new Map([[ROW_KEY, { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]), row: host.row }
+  const requests = []
+  const box = await openEditor(harness, snapshot, requests)
+  harness.applyAnswer = {
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, kind: 'prompt', applied: false, unchanged: true, shadowed: [], dropped: false, blocks: BLOCKS }),
+  }
+  const save = byClass(box, 'dshet-btn').find((button) => button.textContent === '保存')
+  save.fire('pointerdown')
+  for (let attempt = 0; attempt < 10 && !requests.some((call) => call.url.includes('/dsh-edit-turn/apply')); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  const sent = JSON.parse(requests.find((call) => call.url.includes('/dsh-edit-turn/apply')).body)
+  assert.deepEqual(sent.parts, [{ keep: 1 }, { keep: 2 }, { keep: 3 }], 'opening the editor and pressing save sends every block back untouched')
+  assert.equal(host.row.dataset.dshetHidden, undefined, 'and nothing was hidden, because nothing was written')
+})
+

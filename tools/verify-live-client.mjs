@@ -47,6 +47,9 @@ const MARKERS = [
   { needle: "'/dsh-rerun-turn'", what: 'the re-run button that belongs to the sibling plugin' },
   { needle: 'takeOverRowCopy', what: 'the rewritten row answering its own copy' },
   { needle: 'dshetCopyText', what: 'the copy handover this plugin writes on the host’s button' },
+  { needle: 'dshet-chips', what: 'the chip strip that shows what a message carries' },
+  { needle: 'dshet-attach', what: 'the picker that adds a block to the revision' },
+  { needle: "? { keep: part.keep } : { add: part.add }", what: 'the block list the save carries' },
 ]
 
 function arg(name) {

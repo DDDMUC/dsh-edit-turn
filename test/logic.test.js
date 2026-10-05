@@ -11,8 +11,14 @@ import { test } from 'node:test'
 
 import {
   PLUGIN_ID,
+  admitUpload,
+  assembleBlocks,
+  blockSummaries,
   buildCarrier,
   buildCorrection,
+  canPreviewAttachments,
+  isTextBlock,
+  normalizeParts,
   editableReplies,
   editableTurns,
   foldSurface,
@@ -24,8 +30,12 @@ import {
   messageIdOf,
   noteRequest,
   openTurn,
+  planBlockLayout,
+  resolveAttachmentStore,
+  sameJson,
   syncLoopTurn,
   planRollback,
+  readMessageBlocks,
   readMessageText,
   recentRequests,
   rollbackLedger,
@@ -480,3 +490,240 @@ test('the request log records failures too, and stays bounded', () => {
   assert.equal(recentRequests().length, 40, 'the ring drops the oldest')
   assert.equal(recentRequests().at(-1).n, 59)
 })
+
+// --- blocks travel with the edit --------------------------------------------
+//
+// A revised message carries everything it carried before, not only its text. The
+// rules are three: a block the user did not touch is copied verbatim, a block the
+// user removed is not written, and the revised text goes back where the first
+// text block was. Nothing below asks what a block IS - which is the whole point,
+// because a block type the platform adds later has to travel the same way.
+
+const IMAGE_REF = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', width: 4, height: 3, bytes: 1234, name: 'shot.png' }
+const FILE_REF = { attachmentId: `sha256:${'b'.repeat(64)}`, name: 'notes.pdf', bytes: 5678 }
+const IMAGE_BLOCK = { type: 'image', attachment: IMAGE_REF }
+const FILE_BLOCK = { type: 'file', attachment: FILE_REF }
+// A block from a platform this plugin has never seen. Nothing in the edit path
+// may need to know it: it is kept, copied and written like any other.
+const ALIEN_BLOCK = { type: 'quote-card', payload: { quote: '引用卡片', source: '第 3 页' }, rank: 2 }
+
+function blockyPrompt(blocks) {
+  return ev(20, 'user/message', { id: 'ub', role: 'user', content: blocks, source: { kind: 'user' } }, append)
+}
+
+function keepAll(blocks) {
+  return normalizeParts(blocks.map((_, index) => ({ keep: index })), blocks.length)
+}
+
+test('readMessageText and readMessageBlocks read the same blocks', () => {
+  const blocks = [{ type: 'text', text: '看图' }, IMAGE_BLOCK]
+  const event = blockyPrompt(blocks)
+  assert.deepEqual(readMessageText(event), { text: '看图', attachments: 1 })
+  assert.deepEqual(readMessageBlocks(event), blocks)
+  assert.equal(isTextBlock(blocks[0]), true)
+  assert.equal(isTextBlock(IMAGE_BLOCK), false)
+  assert.equal(isTextBlock(null), false)
+  // The reply shape nests its message one level deeper; the block readers do not
+  // care which shape they were handed.
+  const reply = ev(21, 'assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', content: [IMAGE_BLOCK] }, stream: [] }, append)
+  assert.deepEqual(readMessageBlocks(reply), [IMAGE_BLOCK])
+})
+
+test('blockSummaries describes a block from its own fields, never from its type', () => {
+  const blocks = [{ type: 'text', text: 'x' }, IMAGE_BLOCK, FILE_BLOCK, ALIEN_BLOCK]
+  const summaries = blockSummaries(blocks, true)
+  assert.deepEqual(summaries, [
+    { index: 1, type: 'image', name: 'shot.png', mediaType: 'image/png', bytes: 1234, width: 4, height: 3, preview: true },
+    { index: 2, type: 'file', name: 'notes.pdf', bytes: 5678, preview: true },
+    // No attachment, so nothing to read and nothing to preview: the chip shows
+    // the block's own name, which is all this knows.
+    { index: 3, type: 'quote-card', preview: false },
+  ])
+  assert.equal(blockSummaries(blocks, false)[0].preview, false, 'a deployment with no read path promises no thumbnail')
+})
+
+test('a submitted block list names kept blocks and uploads, nothing else', () => {
+  assert.deepEqual(normalizeParts([{ keep: 1 }, { add: { data: 'AA==', name: 'a.bin' } }], 3), [
+    { keep: 1 },
+    { add: { data: 'AA==', name: 'a.bin' } },
+  ])
+  const invalid = (value, count) => assert.throws(() => normalizeParts(value, count), (error) => error.code === 'invalid')
+  invalid([{ keep: 3 }], 3)
+  invalid([{ keep: -1 }], 3)
+  invalid([{ keep: 1.5 }], 3)
+  invalid([{ keep: 0 }, { keep: 0 }], 2)
+  invalid([{}], 1)
+  invalid([{ add: { name: 'no bytes' } }], 1)
+  invalid([null], 1)
+  invalid('nope', 1)
+})
+
+test('an untouched block crosses the edit verbatim, byte for byte', () => {
+  const original = [
+    { type: 'text', text: '第一段' },
+    IMAGE_BLOCK,
+    FILE_BLOCK,
+    ALIEN_BLOCK,
+    { type: 'text', text: '第二段' },
+  ]
+  const layout = planBlockLayout(original, keepAll(original))
+  const content = assembleBlocks(original, layout, [], '改过的文字')
+  // Two text blocks become one, at the first one's position; every other block
+  // is exactly where it was and exactly what it was.
+  assert.equal(content.length, 4)
+  assert.deepEqual(content[0], { type: 'text', text: '改过的文字' })
+  assert.deepEqual(content.map((block) => block.type), ['text', 'image', 'file', 'quote-card'])
+  for (const index of [1, 2, 3]) {
+    assert.equal(JSON.stringify(content[index]), JSON.stringify(original[index]))
+    assert.notEqual(content[index], original[index], 'a copy, so nothing can reach back into the log')
+  }
+})
+
+test('a block the user removes is simply not written', () => {
+  const original = [{ type: 'text', text: 't' }, IMAGE_BLOCK, FILE_BLOCK]
+  const parts = normalizeParts([{ keep: 0 }, { keep: 2 }], 3)
+  const content = assembleBlocks(original, planBlockLayout(original, parts), [], 't2')
+  assert.equal(content.length, 2)
+  assert.deepEqual(content.map((block) => block.type), ['text', 'file'])
+})
+
+test('the revised text lands where the first text block was', () => {
+  const textFirst = [{ type: 'text', text: 't' }, IMAGE_BLOCK]
+  const imageFirst = [IMAGE_BLOCK, { type: 'text', text: 't' }]
+  const betweenImages = [IMAGE_BLOCK, { type: 'text', text: 't' }, { ...IMAGE_BLOCK }]
+  const after = assembleBlocks(textFirst, planBlockLayout(textFirst, keepAll(textFirst)), [], 'T')
+  const before = assembleBlocks(imageFirst, planBlockLayout(imageFirst, keepAll(imageFirst)), [], 'T')
+  const middle = assembleBlocks(betweenImages, planBlockLayout(betweenImages, keepAll(betweenImages)), [], 'T')
+  assert.deepEqual(after.map((block) => block.type), ['text', 'image'])
+  assert.deepEqual(before.map((block) => block.type), ['image', 'text'])
+  assert.deepEqual(middle.map((block) => block.type), ['image', 'text', 'image'])
+  assert.equal(JSON.stringify(before[0]), JSON.stringify(IMAGE_BLOCK), 'the image did not move')
+  assert.equal(JSON.stringify(middle[2]), JSON.stringify(IMAGE_BLOCK), 'neither did the second one')
+})
+
+test('a message with no text block gets the text appended, not prepended', () => {
+  const original = [IMAGE_BLOCK, ALIEN_BLOCK]
+  const content = assembleBlocks(original, planBlockLayout(original, keepAll(original)), [], 'caption')
+  assert.deepEqual(content.map((block) => block.type), ['image', 'quote-card', 'text'])
+})
+
+test('an added block lands where the user put it, and is not confused with a kept one', () => {
+  const original = [{ type: 'text', text: 't' }, IMAGE_BLOCK]
+  const added = { type: 'image', attachment: { ...IMAGE_REF, attachmentId: `sha256:${'c'.repeat(64)}` } }
+  const parts = normalizeParts([{ keep: 1 }, { add: { data: 'AA==' } }], 2)
+  const layout = planBlockLayout(original, parts)
+  assert.equal(layout.added, 1)
+  const content = assembleBlocks(original, layout, [added], 'T')
+  assert.deepEqual(content.map((block) => block.type), ['text', 'image', 'image'])
+  assert.equal(content[2], added)
+})
+
+test('sameJson compares values, not key order', () => {
+  assert.equal(sameJson({ a: 1, b: [1, { c: 2 }] }, { b: [1, { c: 2 }], a: 1 }), true)
+  assert.equal(sameJson([{ type: 'text', text: 'x' }], [{ text: 'x', type: 'text' }]), true)
+  assert.equal(sameJson({ a: 1 }, { a: 1, b: undefined }), false)
+  assert.equal(sameJson([1, 2], [1, 2, 3]), false)
+  assert.equal(sameJson('a', 'a'), true)
+  assert.equal(sameJson(null, {}), false)
+  // The comparison the no-op guard makes: an edit that keeps everything and
+  // changes nothing must land on the original blocks exactly.
+  const original = [{ type: 'text', text: 't' }, IMAGE_BLOCK]
+  const rebuilt = assembleBlocks(original, planBlockLayout(original, keepAll(original)), [], 't')
+  assert.equal(sameJson(rebuilt, original), true)
+  assert.equal(sameJson(assembleBlocks(original, planBlockLayout(original, keepAll(original)), [], 't '), original), false)
+})
+
+test('an upload becomes whichever block the store accepts it as', async () => {
+  const calls = []
+  const store = {
+    imageLimits: { mediaTypes: ['image/png', 'image/jpeg'] },
+    async saveImage(input) {
+      calls.push(['image', input])
+      return IMAGE_REF
+    },
+    async saveFile(input) {
+      calls.push(['file', input])
+      return FILE_REF
+    },
+  }
+  const png = await admitUpload(store, { data: Buffer.from('png-bytes').toString('base64'), mediaType: 'image/png', name: 'shot.png' })
+  assert.deepEqual(png, { type: 'image', attachment: IMAGE_REF })
+  assert.equal(calls[0][1].mediaType, 'image/png')
+  assert.equal(calls[0][1].name, 'shot.png')
+  assert.equal(Buffer.from(calls[0][1].data).toString(), 'png-bytes')
+  const pdf = await admitUpload(store, { data: Buffer.from('file-bytes').toString('base64'), mediaType: 'application/pdf', name: 'notes.pdf' })
+  assert.deepEqual(pdf, { type: 'file', attachment: FILE_REF })
+  assert.equal(Buffer.from(calls[1][1].data).toString(), 'file-bytes')
+  const nameless = await admitUpload(store, { data: Buffer.from('x').toString('base64') })
+  assert.deepEqual(nameless, { type: 'file', attachment: FILE_REF }, 'a payload with no declared type is stored verbatim')
+  assert.deepEqual(calls[2][1], { data: calls[2][1].data })
+})
+
+test('a store that refuses a payload produces a refusal, not a broken block', async () => {
+  const store = {
+    imageLimits: { mediaTypes: ['image/png'] },
+    async saveImage() {
+      throw new Error('Image batch exceeds the configured aggregate image-byte limit.')
+    },
+  }
+  await assert.rejects(
+    () => admitUpload(store, { data: Buffer.from('x').toString('base64'), mediaType: 'image/png' }),
+    (error) => error.code === 'attachment-refused' && error.status === 400 && /aggregate/.test(error.message),
+  )
+  // Nothing the platform's own wire admission would refuse may reach the store.
+  await assert.rejects(
+    () => admitUpload(store, { data: 'not base64 at all!!', mediaType: 'image/png' }),
+    (error) => error.code === 'invalid',
+  )
+  await assert.rejects(() => admitUpload(store, { data: '' }), (error) => error.code === 'invalid')
+})
+
+test('the attachment store is only used when the deployment really has one', () => {
+  const store = { saveImage() {}, saveFile() {} }
+  const named = (name) => ({ get: (asked) => (asked === name ? store : undefined) })
+  assert.equal(resolveAttachmentStore(named('attachments')), store)
+  assert.equal(resolveAttachmentStore(named('attachment-local')), store, 'the package spelling is accepted too')
+  assert.equal(resolveAttachmentStore({ get: () => undefined }), null)
+  assert.equal(resolveAttachmentStore({ get: () => ({}) }), null, 'a service that cannot admit anything is not a store')
+  assert.equal(resolveAttachmentStore({ get: () => ({ saveImage: true }) }), null, 'nor is one whose methods are not callable')
+  assert.equal(
+    resolveAttachmentStore({
+      get: () => {
+        throw new Error('unknown service')
+      },
+    }),
+    null,
+    'a context that refuses the lookup is an absent store, not a crash',
+  )
+  assert.equal(resolveAttachmentStore(null), null)
+  assert.equal(resolveAttachmentStore({}), null)
+  assert.equal(canPreviewAttachments(store), false, 'a store with no read seam draws no thumbnails')
+  assert.equal(canPreviewAttachments({ readImage() {} }), true)
+  assert.equal(canPreviewAttachments({ fileHostPath() {} }), true)
+  assert.equal(canPreviewAttachments(null), false)
+})
+
+test('the carrier carries the block list it is given', () => {
+  const log = twoTurnLog()
+  const plan = planRollback(log, foldSurface(log).nodes, { seq: 2 })
+  const content = [{ type: 'text', text: 'MARK' }, IMAGE_BLOCK]
+  const carrier = buildCarrier(plan, lastTurnOf(log), { carrier: 'user/message', markerText: 'MARK' }, content)
+  assert.deepEqual(carrier.data.content, content)
+  // The developer carrier never carries blocks: nothing may project into the
+  // model's context from a silent replacement.
+  const silent = buildCarrier(plan, lastTurnOf(log), { carrier: 'system/message' }, content)
+  assert.deepEqual(silent.data.message.content, [])
+})
+
+test('editableTurns publishes the blocks a prompt carries', () => {
+  const log = twoTurnLog()
+  log.splice(2, 0, blockyPrompt([{ type: 'text', text: '看图' }, IMAGE_BLOCK, ALIEN_BLOCK]))
+  const turns = editableTurns(log, foldSurface(log).nodes, { preview: true })
+  const blocky = turns.find((turn) => turn.seq === 20)
+  assert.deepEqual(blocky.blocks.map((block) => block.index), [1, 2])
+  assert.equal(blocky.blocks[0].preview, true)
+  assert.equal(blocky.blocks[1].preview, false, 'a block with no attachment reference has nothing to preview')
+  const plain = turns.find((turn) => turn.seq === 2)
+  assert.deepEqual(plain.blocks, [], 'a message with only text has no chips')
+})
+
