@@ -2399,8 +2399,9 @@ test('a late dispose from the replaced instance does not leave the row without a
 // The host writes nothing when the draft IS the live text, and says so with
 // `unchanged`. This half has to read that flag for what it is: not a failure (the
 // old `applied === false` wording would tell the user the rollback failed), not a
-// change (no row was shadowed, so none may be hidden), and NOT a reason to skip
-// the re-run the user asked for.
+// change (no row was shadowed, so none may be hidden), NOT a reason to skip the
+// re-run the user asked for, and - since 0.2.20 - not something to announce: the
+// save was simply not an edit, so the editor closes in silence.
 
 const unchangedApply = (kind) => ({
   ok: true,
@@ -2408,7 +2409,7 @@ const unchangedApply = (kind) => ({
   json: async () => ({ ok: true, kind, applied: false, unchanged: true, shadowed: [], original: 'original' }),
 })
 
-test('a save with no change keeps the message, notices, and asks no re-run', async () => {
+test('a save with no change keeps the message, announces nothing, and asks no re-run', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
   const host = mountHostUserRow(harness.document, 'row-noop')
@@ -2430,29 +2431,26 @@ test('a save with no change keeps the message, notices, and asks no re-run', asy
   byClass(editorIn(harness), 'dshet-btn').find((button) => button.textContent === '保存').fire('pointerdown')
   await new Promise((resolve) => setTimeout(resolve, 0))
   // Read the notice immediately: the harness's `window.setTimeout` is a 0ms
-  // timer, so the banner's own 12s auto-dismiss lands on the very next tick.
+  // timer, so a banner published here would be dismissed on the very next tick -
+  // and a banner is exactly what this save must not publish any more.
   const notice = controller.getSnapshot().notice
   for (let attempt = 0; attempt < 10 && editorIn(harness) !== null; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
   render(harness, controller, snapshot)
+  const tree = harness.component({ useChat: () => snapshot, useEditTurn: () => controller.getSnapshot(), controller, t: harness.t })
 
   assert.equal(JSON.parse(calls.find((call) => call.url.includes('/dsh-edit-turn/apply')).body).text, 'original',
     'the prefilled text was posted as it was')
-  assert.equal(notice, 'unchanged', 'and the user is told why nothing happened')
+  assert.equal(notice, null, 'a save that changed nothing announces nothing at all')
+  assert.equal(JSON.stringify([tree]).includes('dshet-notice'), false, 'and the component draws no banner for it')
+  assert.equal(byClass(harness.document.body, 'dshet-notice').length, 0, 'so nothing is laid over the composer')
   assert.equal(editorIn(harness), null, 'the editor closes like any save')
   assert.equal(controller.getSnapshot().hidden.size, 0, 'no row was shadowed')
   assert.equal(host.row.dataset.dshetHidden, undefined, 'so the message stays on screen')
   assert.equal(host.row.style.display, undefined, 'and its row is not displayed away')
   assert.equal(byClass(host.row, 'dshet-action').length, 1, 'the message keeps its pencil')
   assert.equal(calls.some((call) => call.url === '/dsh-rerun-turn/apply'), false, 'a plain save re-runs nothing')
-
-  // That code is a real string in the user's language, not a raw key: put it back
-  // on screen and read the banner the component builds for it.
-  controller.notify('unchanged')
-  const tree = harness.component({ useChat: () => snapshot, useEditTurn: () => controller.getSnapshot(), controller, t: harness.t })
-  assert.equal(JSON.stringify(tree).includes('内容没有变化'), true, 'the banner says what happened')
-  controller.dismissNotice()
 })
 
 test('a re-run with no change still re-runs the turn', async () => {
