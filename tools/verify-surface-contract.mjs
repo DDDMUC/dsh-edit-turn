@@ -23,6 +23,7 @@ import {
   PLUGIN_ID,
   buildCarrier,
   buildCorrection,
+  buildReplayWrites,
   editableReplies,
   editableTurns,
   foldSurface,
@@ -432,7 +433,7 @@ check(
 )
 
 // ---------------------------------------------------------------------------
-console.log('\n9. editing what the model said')
+console.log('\n9. editing what the model said: shadow, correction, replay')
 const replySession = freshSession('000000000005')
 buildTwoTurnLog(replySession)
 const replyEvents = replySession.snapshotEvents()
@@ -448,6 +449,10 @@ check('a reply is planned as a reply edit, not a re-run', replyPlan.mode === 're
 check('its window opens at the reply and ends on the last surface node',
   replyPlan.startSeq === replyPlan.shadowed[0] && replyPlan.endSeq === replyFold.nodes.at(-1))
 check('the plan names the original turn and step', replyPlan.turn === 1 && replyPlan.step === 1)
+// The window takes the reply AND every later turn; the replay range starts at
+// the next turn's own bracket and ends on that turn's closing record.
+check('the plan finds the later turn to replay', replyPlan.replayFrom === 7 && replyPlan.logTo === 15,
+  JSON.stringify({ replayFrom: replyPlan.replayFrom, logTo: replyPlan.logTo }))
 // The correction cannot reuse the original turn: by the time it is written that
 // turn is closed, and the read path refuses a step message outside an open turn
 // and step. It gets a turn of its own, which also advances the runtime's own
@@ -476,7 +481,7 @@ check('an assistant message is REFUSED as a replacement carrier',
   typeof carrierRefusal === 'string' && carrierRefusal.includes('sourceEventSeqs'), carrierRefusal)
 
 // What is accepted instead: open a turn, roll back invisibly, append the
-// correction inside it, close it.
+// correction inside it, close it - then replay every later turn behind it.
 const replyCarrier = buildCarrier(replyPlan, replyTurn, { carrier: 'system/message' })
 let replyFailure = null
 try {
@@ -496,13 +501,32 @@ try {
 check('turn + rollback + appended correction is ACCEPTED', replyFailure === null, replyFailure)
 check(
   'the turn is closed behind the correction',
-  replySession.snapshotEvents().slice(-3).map((event) => event.type).join(',') === 'assistant/message,step/end,turn/end',
-  replySession.snapshotEvents().slice(-3).map((event) => event.type).join(','),
+  replySession.snapshotEvents().slice(-2).map((event) => event.type).join(',') === 'step/end,turn/end',
+  replySession.snapshotEvents().slice(-2).map((event) => event.type).join(','),
 )
+
+// The infix splice: exactly what dsh-rerun-turn does after a regenerated answer,
+// with the user's text instead of the model call.
+const REPLAY_ID = 'verify-replay-1'
+const replayStart = replySession.seq
+const replayWrites = buildReplayWrites(replyEvents, replyPlan, replyTurn + 1, REPLAY_ID, replayStart)
+let replayFailure = null
+try {
+  for (const write of replayWrites) {
+    const options = {}
+    if (write.surfaceOp !== undefined) options.surfaceOp = write.surfaceOp
+    if (write.sourceEventSeqs !== undefined) options.sourceEventSeqs = write.sourceEventSeqs
+    replySession.append(write.type, write.data, options)
+  }
+} catch (error) {
+  replayFailure = String((error && error.message) || error)
+}
+check('the replay is ACCEPTED by the real validator', replayFailure === null, replayFailure)
 check(
-  'the closing turn/end names the correction turn',
-  replySession.snapshotEvents().at(-1).data.turn === replyTurn,
-  String(replySession.snapshotEvents().at(-1).data.turn),
+  'the replay opens one fresh turn and closes it',
+  replayWrites.filter((write) => write.type === 'turn/start').length === 1 &&
+    replayWrites.filter((write) => write.type === 'turn/end').length === 1,
+  JSON.stringify(replayWrites.map((write) => write.type)),
 )
 // THE check this file was missing: the read path. Without it the suite blessed
 // a write that only the lenient append accepted.
@@ -510,15 +534,47 @@ const replyLoadFailure = loadFailure(replySession)
 check('the reply edit survives the read-path validator', replyLoadFailure === null, String(replyLoadFailure))
 const afterReply = texts(replySession.deriveMessages())
 const rolesAfterReply = replySession.deriveMessages().map((message) => message.role)
-check('the model now sees the corrected text as its own reply',
-  afterReply.length === 3 && afterReply[2] === '改写后的回答', JSON.stringify(afterReply))
+check(
+  'the model reads the corrected reply, then the replayed turn',
+  JSON.stringify(afterReply) === JSON.stringify([
+    'VERIFY SYSTEM PROMPT',
+    '第一轮提问',
+    '改写后的回答',
+    '第二轮提问',
+    '',
+    'file body',
+    '第二轮回答',
+  ]),
+  JSON.stringify(afterReply),
+)
 check('the earlier prompt is untouched and still first', afterReply[1] === '第一轮提问', JSON.stringify(afterReply))
-check('the history stays strictly alternating', rolesAfterReply.join(',') === 'system,user,assistant', rolesAfterReply.join(','))
-check('the tool result left together with the reply it belonged to',
-  !replySession.deriveMessages().some((message) => (message.content || []).some((block) => block.type === 'tool-result')))
-// Found by its marker, not by position: the closing events now come after it.
-// The type is part of the search: the silent carrier of the rollback carries the
-// same marker, and this is about the correction that follows it.
+check(
+  'the later prompt and its answer both survived',
+  afterReply.includes('第二轮提问') && afterReply.includes('第二轮回答'),
+  JSON.stringify(afterReply),
+)
+check(
+  'the history keeps the tool result as a tool message',
+  rolesAfterReply.join(',') === 'system,user,assistant,user,assistant,tool,assistant',
+  rolesAfterReply.join(','),
+)
+const replayedCall = replySession.snapshotEvents().find((event) => event.type === 'tool/call' && event.seq > replayStart)
+const replayedResult = replySession.snapshotEvents().find((event) => event.type === 'tool/result' && event.seq > replayStart)
+check('the tool call and result were replayed as a pair', replayedCall !== undefined && replayedResult !== undefined)
+check(
+  'the replayed result cites the copied assistant message',
+  replayedResult !== undefined && Array.isArray(replayedResult.sourceEventSeqs) &&
+    replayedResult.sourceEventSeqs.length === 1 && replayedResult.sourceEventSeqs[0] < replayedResult.seq,
+  JSON.stringify(replayedResult === undefined ? null : replayedResult.sourceEventSeqs),
+)
+const replayedPrompt = replySession.snapshotEvents().find(
+  (event) => event.type === 'user/message' && event.data.source && event.data.source.replayId === REPLAY_ID,
+)
+check('the replayed prompt names its operation and its original',
+  replayedPrompt !== undefined && replayedPrompt.data.source.replayBy === PLUGIN_ID &&
+    replayedPrompt.data.source.originalSeq === 9,
+  JSON.stringify(replayedPrompt === undefined ? null : replayedPrompt.data.source))
+// Found by its marker, not by position.
 const appendedCorrection = replySession
   .snapshotEvents()
   .find((event) => event.type === 'assistant/message' &&
@@ -530,10 +586,11 @@ check('the correction is a model-kind reply, so it renders as one', appendedCorr
 check('the correction records who wrote the text', appendedCorrection.data.message.source.editedBy === PLUGIN_ID)
 check('the correction carries a turn and a step, so reply nodes cannot collide',
   appendedCorrection.data.turn === replyTurn && appendedCorrection.data.step === 1)
-// A reply edit is a multi-node rollback plus an appended correction, never an
-// in-place swap: an assistant message may not carry `sourceEventSeqs`, and the
-// old reply row is meant to keep no entry - the new row carries it. Pinning
-// this so a future "keep the old row's actions" change cannot sneak in.
+// A reply edit is a multi-node rollback plus an appended correction plus a
+// replayed tail, never an in-place swap: an assistant message may not carry
+// `sourceEventSeqs`, and the old reply row is meant to keep no entry - the new
+// row carries it. Pinning this so a future "keep the old row's actions" change
+// cannot sneak in.
 check(
   'the correction carries no sourceEventSeqs',
   appendedCorrection.sourceEventSeqs === undefined,
@@ -546,17 +603,18 @@ try {
   continueFailure = String((error && error.message) || error)
 }
 check('the conversation can continue from a corrected reply', continueFailure === null, continueFailure)
-check('the follow-up lands after the correction', texts(replySession.deriveMessages()).at(-1) === '下一个问题')
+check('the follow-up lands after the replayed turn', texts(replySession.deriveMessages()).at(-1) === '下一个问题')
 // And a full turn after a reply edit opens the turn the format expects (the one
-// our edit consumed), which is what keeps the NEXT user message writable and
-// readable. This is the other half of what the old write got wrong.
+// after the last replayed turn), which is what keeps the NEXT user message
+// writable and readable. This is the other half of what the old write got wrong.
 let nextTurnFailure = null
 try {
-  replySession.append('turn/start', { turn: replyTurn + 1 })
-  replySession.append('step/start', { turn: replyTurn + 1, step: 1 })
+  const nextTurn = lastTurnOf(replySession.snapshotEvents()) + 1
+  replySession.append('turn/start', { turn: nextTurn })
+  replySession.append('step/start', { turn: nextTurn, step: 1 })
   replySession.append('user/message', userMessage('m-later', '再下一个问题'), { surfaceOp: 'append' })
-  replySession.append('step/end', { turn: replyTurn + 1, step: 1 })
-  replySession.append('turn/end', { turn: replyTurn + 1, reason: { kind: 'completed' } })
+  replySession.append('step/end', { turn: nextTurn, step: 1 })
+  replySession.append('turn/end', { turn: nextTurn, reason: { kind: 'completed' } })
 } catch (error) {
   nextTurnFailure = String((error && error.message) || error)
 }

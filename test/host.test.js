@@ -534,7 +534,7 @@ test('a tool result row is still refused', async () => {
 
 // --- editing what the model said -------------------------------------------
 
-test('editing a reply replaces it without re-running the model', async () => {
+test('editing a reply replaces it and replays the later turns', async () => {
   const h = await harness()
   try {
     const before = h.session.seq
@@ -543,28 +543,32 @@ test('editing a reply replaces it without re-running the model', async () => {
     assert.equal(res.json.kind, 'reply')
     assert.equal(res.json.applied, true)
     assert.equal(typeof res.json.appendedSeq, 'number')
-    // The window still runs to the tail: a corrected answer invalidates
-    // everything that was built on top of it.
+    // The window still runs to the tail: the correction can only be appended,
+    // so everything from the old answer on leaves the surface first.
     assert.deepEqual(res.json.shadowed, [3, 6, 7, 8])
+    // ... and the later turn is then replayed behind the correction, with fresh
+    // turn numbers, so the model keeps it.
+    assert.equal(res.json.replay.replayed, res.json.replay.total)
+    assert.equal(res.json.replay.turns, 1)
+    assert.equal(res.json.replay.error, undefined)
 
-    // Six appends: the turn and step the correction lands in (the read path only
-    // admits a step message inside an open turn and step), the invisible
-    // rollback carrier, the corrected reply, and the two events that close the
-    // turn again behind it.
-    assert.equal(h.session.seq, before + 6)
-    const lastTwo = h.session.snapshotEvents().slice(-2).map((event) => event.type)
-    // Without this the correction lands outside the turn and the host renders
-    // the turn's tail - duration and action strip - above the corrected text.
-    assert.deepEqual(lastTwo, ['step/end', 'turn/end'])
-    const tail = h.session.snapshotEvents().at(-1)
-    // The correction gets the next turn in the log, not the edited reply's own
-    // (that one is closed by the time the correction is written).
-    assert.equal(tail.data.turn, 3, 'the freshly opened turn')
-    assert.equal(tail.data.reason.kind, 'completed')
+    // Ten appends: the turn and step the correction lands in, the invisible
+    // rollback carrier, the corrected reply, the two events that close that
+    // turn, and the four events of the replayed later turn.
+    assert.equal(h.session.seq, before + 10)
     const derived = h.session.deriveMessages()
-    assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant'])
+    assert.deepEqual(derived.map((message) => message.role), ['system', 'user', 'assistant', 'user', 'assistant'])
     assert.equal(derived[2].content[0].text, 'corrected answer')
     assert.equal(derived[1].content[0].text, 'original prompt')
+    // The later turn survived, in order, after the correction.
+    assert.equal(derived[3].content[0].text, 'second prompt')
+    assert.equal(derived[4].content[0].text, 'second answer')
+    // The replayed copy is a fresh event carrying the replay marker.
+    const copy = h.session.snapshotEvents().find((event) =>
+      event.type === 'user/message' && event.data.id !== 'u2' &&
+      event.data.source && event.data.source.replayId === res.json.replay.id)
+    assert.notEqual(copy, undefined)
+    assert.equal(copy.data.source.originalSeq, 6)
 
     // Crucially: the model was NOT asked again.
     assert.deepEqual(h.prompts, [])
@@ -592,12 +596,14 @@ test('a reply edit pushes the live loop past the turn it consumed', async () => 
     assert.equal(res.json.loopTurn, 'synced', 'the loop counter moved with the edit')
     assert.equal(agent.phase.lastTurn, 3, 'and it names the turn just opened, not the one before')
 
-    // A second edit - of a different reply, the first turn's (seq 3) - pushes
-    // the same counter forward again, never backwards.
+    // A second edit - of the first turn's reply (seq 3) - replays that turn and
+    // then the correction written by the first edit, so the counter moves to the
+    // last replay turn, never backwards.
     const second = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'colder' })
     assert.equal(second.json.applied, true, second.payload)
     assert.equal(second.json.loopTurn, 'synced')
-    assert.equal(agent.phase.lastTurn, 4, 'the next turn in the log')
+    assert.equal(second.json.replay.turns, 2)
+    assert.equal(agent.phase.lastTurn, 6, 'the highest turn the replay wrote')
   } finally {
     await h.close()
   }
@@ -643,6 +649,57 @@ test('the appended correction is a normal reply that says who wrote it', async (
   }
 })
 
+test('editing a middle reply keeps the turns before and after it', async () => {
+  // Three completed turns, no tools: the correction of turn 2 must land after
+  // turn 2's prompt, and turn 3 must come back behind it.
+  const session = Session.create(SESSION_ID)
+  session.append('turn/start', { turn: 1 })
+  session.append('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } }, { surfaceOp: 'append' })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'Q1' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('assistant/message', { turn: 1, step: 1, message: modelMessage('a1', 'A1'), stream: [] }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const turn = (number, prompt, answer) => {
+    session.append('turn/start', { turn: number })
+    session.append('step/start', { turn: number, step: 1 })
+    session.append('user/message', { id: `u${number}`, role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    session.append('assistant/message', { turn: number, step: 1, message: modelMessage(`a${number}`, answer), stream: [] }, { surfaceOp: 'append' })
+    session.append('step/end', { turn: number, step: 1 })
+    session.append('turn/end', { turn: number, reason: { kind: 'completed' } })
+  }
+  turn(2, 'Q2', 'A2')
+  turn(3, 'Q3', 'A3')
+  const secondReply = session.snapshotEvents().find((event) =>
+    event.type === 'assistant/message' && event.data.message.id === 'a2')
+  const thirdPrompt = session.snapshotEvents().find((event) =>
+    event.type === 'user/message' && event.data.id === 'u3')
+
+  const h = await harness({ session })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: secondReply.seq, text: 'corrected A2' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.kind, 'reply')
+    assert.deepEqual(res.json.shadowed, [secondReply.seq, thirdPrompt.seq, thirdPrompt.seq + 1])
+    assert.equal(res.json.replay.turns, 1)
+    const derived = h.session.deriveMessages()
+    assert.deepEqual(
+      derived.map((message) => message.content[0].text),
+      ['SYS', 'Q1', 'A1', 'Q2', 'corrected A2', 'Q3', 'A3'],
+    )
+    // The replayed prompt is a live, editable prompt again.
+    const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.json.turns.map((entry) => entry.text).join('|'), 'Q1|Q2|Q3')
+    // The old turn 3 row is gone from the surface; the copy is what carries it.
+    const copied = h.session.snapshotEvents().find((event) =>
+      event.type === 'user/message' && event.data.source && event.data.source.originalSeq === thirdPrompt.seq)
+    assert.notEqual(copied, undefined)
+    assert.equal(h.session.deriveMessages().at(-1).content[0].text, 'A3')
+  } finally {
+    await h.close()
+  }
+})
+
 test('editing the last reply keeps the earlier conversation intact', async () => {
   const h = await harness()
   try {
@@ -663,12 +720,18 @@ test('a corrected reply can be corrected again', async () => {
   const h = await harness()
   try {
     const first = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'version one' })
+    // The correction now sits before the replayed later turn, so the second edit
+    // targets the correction by the seq the host reported, not the tail.
     const second = await applyEdit(h.port, { sessionId: SESSION_ID, seq: first.json.appendedSeq, text: 'version two' })
     assert.equal(second.status, 200, second.payload)
     assert.equal(second.json.kind, 'reply')
     const derived = h.session.deriveMessages()
-    assert.equal(derived.at(-1).content[0].text, 'version two')
+    const corrected = derived.filter((message) =>
+      (message.content || []).some((block) => block.type === 'text' && block.text === 'version two'))
+    assert.equal(corrected.length, 1)
     assert.equal(derived.some((message) => (message.content || []).some((block) => block.type === 'text' && block.text === 'version one')), false)
+    // The later turn was replayed again behind the new correction.
+    assert.equal(derived.at(-1).content[0].text, 'second answer')
   } finally {
     await h.close()
   }

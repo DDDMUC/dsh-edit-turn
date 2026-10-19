@@ -16,8 +16,10 @@ import {
   blockSummaries,
   buildCarrier,
   buildCorrection,
+  buildReplayWrites,
   canPreviewAttachments,
   isTextBlock,
+  isSilentPluginCarrier,
   normalizeParts,
   editableReplies,
   editableTurns,
@@ -224,9 +226,120 @@ test('a model reply is planned as a reply edit that re-runs nothing', () => {
   assert.equal(plan.original, '第一答')
   assert.equal(plan.turn, 1)
   assert.equal(plan.step, 1)
-  // The window still runs to the tail: a corrected answer invalidates everything
-  // that was built on top of it.
+  // The correction can only be appended, so the window runs to the tail and the
+  // turns behind it are replayed back (same infix splice as dsh-rerun-turn).
   assert.deepEqual(plan.shadowed, [3, 6, 7, 8])
+  assert.equal(plan.turnStart, 0)
+  assert.equal(plan.turnEnd, 4)
+  // The later turn starts at its own bracket and the range ends at its turn/end.
+  assert.equal(plan.replayFrom, 5)
+  assert.equal(plan.logTo, 9)
+})
+
+test('a reply in the last turn has nothing to replay', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  const plan = planRollback(log, nodes, { seq: 8 })
+  assert.equal(plan.mode, 'reply')
+  assert.deepEqual(plan.shadowed, [8])
+  assert.equal(plan.replayFrom, null)
+})
+
+test('a prompt edit carries no replay range', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  const plan = planRollback(log, nodes, { seq: 2 })
+  assert.equal(plan.replayFrom, null)
+  assert.equal(plan.logTo, null)
+})
+
+test('buildReplayWrites copies the later turn with fresh numbers and markers', () => {
+  const log = twoTurnLog()
+  const { nodes } = foldSurface(log)
+  const plan = planRollback(log, nodes, { seq: 3 })
+  const writes = buildReplayWrites(log, plan, 4, 'replay-1', 10)
+  // The fixture's tool result has no tool/call event, so the pairing rule drops
+  // it - exactly what rerun's builder does with a dangling result.
+  assert.deepEqual(writes.map((write) => write.type), ['turn/start', 'user/message', 'assistant/message', 'turn/end'])
+  assert.equal(writes[0].data.turn, 4)
+  assert.equal(writes[3].data.turn, 4)
+  const copiedPrompt = writes[1]
+  assert.equal(copiedPrompt.surfaceOp, 'append')
+  assert.equal(copiedPrompt.data.content[0].text, '第二问')
+  assert.equal(copiedPrompt.data.source.kind, 'user')
+  assert.equal(copiedPrompt.data.source.replayBy, PLUGIN_ID)
+  assert.equal(copiedPrompt.data.source.replayId, 'replay-1')
+  assert.equal(copiedPrompt.data.source.originalSeq, 6)
+  assert.notEqual(copiedPrompt.data.id, 'u2')
+  const copiedReply = writes[2]
+  assert.equal(copiedReply.data.message.content[0].text, '第二答')
+  assert.equal(copiedReply.data.message.source.replayBy, PLUGIN_ID)
+  assert.equal(copiedReply.data.message.source.originalSeq, 8)
+  assert.equal(copiedReply.data.message.source.kind, undefined)
+  assert.deepEqual(copiedReply.data.stream, [])
+})
+
+test('a replayed tool call and result stay paired with remapped sourceEventSeqs', () => {
+  const log = [
+    ev(0, 'turn/start', { turn: 1 }),
+    ev(1, 'system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }] } }, append),
+    ev(2, 'user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: '第一问' }], source: { kind: 'user' } }, append),
+    ev(3, 'assistant/message', { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '第一答' }] }, stream: [] }, append),
+    ev(4, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    ev(5, 'turn/start', { turn: 2 }),
+    ev(6, 'step/start', { turn: 2, step: 1 }),
+    ev(7, 'user/message', { id: 'u2', role: 'user', content: [{ type: 'text', text: '第二问' }], source: { kind: 'user' } }, append),
+    ev(8, 'assistant/message', {
+      turn: 2,
+      step: 1,
+      message: {
+        id: 'open',
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: 'c1', name: 'read_file', arguments: '{}' }],
+        source: { kind: 'model', provider: 'p', model: 'm' },
+      },
+      stream: [],
+    }, append),
+    ev(9, 'tool/call', { turn: 2, step: 1, callId: 'c1', name: 'read_file', arguments: '{}' }),
+    ev(10, 'tool/result', {
+      turn: 2,
+      step: 1,
+      message: { id: 't1', role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'body' }], source: { kind: 'tool', callId: 'c1' } },
+    }, { surfaceOp: 'append', sourceEventSeqs: [8] }),
+    ev(11, 'assistant/message', { turn: 2, step: 1, message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: '第二答' }] }, stream: [] }, append),
+    ev(12, 'step/end', { turn: 2, step: 1 }),
+    ev(13, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+  ]
+  const { nodes } = foldSurface(log)
+  const plan = planRollback(log, nodes, { seq: 3 })
+  assert.equal(plan.replayFrom, 5)
+  assert.equal(plan.logTo, 13)
+  const writes = buildReplayWrites(log, plan, 4, 'replay-1', 14)
+  const result = writes.find((write) => write.type === 'tool/result')
+  assert.notEqual(result, undefined)
+  assert.deepEqual(result.sourceEventSeqs, [17], 'points at the copied assistant message')
+  const call = writes.find((write) => write.type === 'tool/call')
+  assert.notEqual(call, undefined)
+  assert.equal(call.data.callId, 'c1')
+  const copiedAssistant = writes.find((write) => write.type === 'assistant/message' && write.data.message.content[0].id === 'c1')
+  assert.notEqual(copiedAssistant, undefined)
+  const copiedUser = writes.find((write) => write.type === 'user/message')
+  assert.equal(copiedUser.data.source.originalSeq, 7)
+  assert.equal(copiedUser.data.source.replayId, 'replay-1')
+})
+
+test('a silent plugin carrier is retired instead of replayed', () => {
+  const log = twoTurnLog()
+  // A rerun carrier standing where a prompt was: no readable text, plugin kind.
+  log.push(ev(10, 'user/message', {
+    id: 'carrier',
+    role: 'user',
+    content: [],
+    source: { kind: 'plugin:dsh-rerun-turn', rerunBy: 'dsh-rerun-turn' },
+  }, append))
+  assert.equal(isSilentPluginCarrier(log.at(-1)), true)
+  // A rewritten prompt from this plugin carries wording and is a real prompt.
+  assert.equal(isSilentPluginCarrier({ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user', editedBy: PLUGIN_ID } } }), false)
 })
 
 test('a prompt editing target reports the prompt mode', () => {

@@ -1,6 +1,6 @@
 # dsh-edit-turn
 
-**DeepSeek Harness 的「编辑某一轮」插件 —— 点用户消息旁的编辑按钮，就地改写那一句。保存即生效：改后的内容成为模型后续读到的版本，这一条消息下面的对话原样不动。** 改写走官方 surface-replace 契约（一条替换事件同时完成"删旧 + 立新"，被替换的内容从模型上下文里消失），**保存本身永不调用模型**。会话日志是 append-only 的，**原始字节一个都不改写**。
+**DeepSeek Harness 的「编辑某一轮」插件 —— 点消息旁的编辑按钮，就地改写。改提问：那一句就地替换，这一条下面的回复与后续对话原样不动；改回答：回答被替换，它后面的轮次先回退、再逐事件重放回来，顺序不变。** 改写走官方 surface-replace 契约（一条替换事件同时完成"删旧 + 立新"，被替换的内容从模型上下文里消失），**保存本身永不调用模型**。会话日志是 append-only 的，**原始字节一个都不改写**。
 
 [中文](#中文) · [English](#english)
 
@@ -18,16 +18,17 @@ DSH 的会话日志是 append-only 的事件流：说错的提示词、问偏的
 - 点击后在该消息下方就地展开编辑器，预填原文；
 - 保存后：**只有这一条消息被替换**——旧措辞从模型上下文里消失，改后的内容占住它的位置（因此后续每一轮读到的都是改后的版本）；
 - **它下面的助手回复、以及之后的全部对话，原样保留**，不重跑、不清空；
-- 装了姊妹插件 **dsh-rerun-turn** 时，编辑器里会多一个「**重跑**」：先保存这次修改，再让它用改后的提示词重新生成这一轮（后续轮次逐事件重放回来，不丢）。
+- **模型回答也能这样改**：改写后的回答落在原回答的位置，它后面的轮次**先回退、再逐事件重放回原位**——改一句回答不会把后面的对话丢掉；
+- 装了姊妹插件 **dsh-rerun-turn** 时，编辑器里会多一个「**重跑**」：先保存这次修改，再让它用改后的提示词重新生成这一轮（后续轮次同样逐事件重放回来，不丢）。
 
 ### 特性
 
 - **官方 seam，不改日志** —— 回退 = 追加一条带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 的替换事件。原始事件全部留在会话文件里，只是不再进入 `deriveMessages()`。与官方 `/compact` 用的是同一套契约。
 - **改写内容就是载体本身** —— 提示词编辑落下的是一条 `user/message` 替换事件，内容就是你改后的那句话。它既让模型读到你改后的版本，也在转录里显示成你自己的气泡；平台不会把它当成新输入去回答（这一点踩过坑：**追加**一条 user 消息会触发平台自动回答，越改越多）。
 - **块随消息一起改（0.2.19）** —— 改写一条带图/带文件的消息不再只留文字：**用户没碰过的块原样搬**（逐字节复制，attachmentId、文件名、尺寸一个不改），**删掉的块不写**，**新加的块**经平台的附件服务录用后写进载体。代码里没有任何"这是图片/这是文件"的判断，唯一的判定是"这个块里有文字吗"，所以平台以后加的块类型自动适用。编辑器的非文字块显示成芯片（缩略图或名字 + 大小 + 删除按钮），另有一个「添加附件」入口；服务不在时退回旧行为（只改文字 + 继续显示那条警告）。
-- **窗口最小化** —— 提示词编辑只遮蔽目标那一格（`shadowed = [target.seq]`）；回复编辑才需要"到末尾"的窗口（回答变了，建立在它之上的一切都不再成立），因此助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
+- **窗口最小化 + 尾部重放** —— 提示词编辑只遮蔽目标那一格（`shadowed = [target.seq]`）；回复编辑因为新回答只能 append，窗口必须到末尾，**但被遮蔽的后续轮次不会消失**：它们会带着新 turn 号、新 messageId、原内容和 replay 标记逐事件重放回来（与 `dsh-rerun-turn` 的 infix splice 是同一套写法，两个仓库的 replay 输出有逐字段对照测试）。助手消息（内含 tool_use）与它产生的 tool/result 永远一起走，**不可能留下悬空的调用/结果对**。
 - **保存永不调用模型** —— 保存只写上下文，不产生任何模型调用。"改完立刻重答"是另一件事，交给姊妹插件 **dsh-rerun-turn**（它遮蔽该轮、用表面上的提示词重新生成、再把后续轮次逐事件重放回来）；本插件只在它装着时提供一个「重跑」按钮转发过去。
-- **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，再**追加**一条带改写文本的助手消息——模型会把改写后的内容当成自己说过的话，对话可以继续。`source.editedBy` 会如实记录这段文字由插件写入。
+- **模型回答也能编辑** —— 回答无法被"替换"：官方格式禁止 `assistant/message` 携带 `sourceEventSeqs`（已在真实校验器上验证）。做法是回退该回答及其后的内容，**追加**一条带改写文本的助手消息，再把回退掉的后续轮次**逐事件重放**在它后面——模型读到的是「前缀 + 改写后的回答 + 原来的后续轮次」，对话可以继续。`source.editedBy` 记录改写文字由插件写入，重放事件另带 `replayBy` / `replayId` / `originalSeq`。
 - **改过的那条还能再改** —— 它仍然显示在原来的位置（由插件渲染成气泡），悬停就有编辑按钮。
 - **一次点击即执行** —— 保存后不再有二次确认（`confirm: true` 可恢复两步确认，确认步里会写明这次保存会丢弃什么）。编辑器本身已经是用户主动打开的动作，保存的后果在 README 与确认步里说明，输入框本身保持干净。
 - **中英双语 UI**，跟随 DSH 当前语言。
@@ -59,7 +60,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 编辑器里，消息带的图片与文件**各显示成一个芯片**（缩略图或文件名 + 大小 + 删除按钮）：不碰就原样保留，点删除就是不要它了；旁边还有一个「**添加附件**」（这条消息本来没有附件时也能用）。缩略图由本插件的只读路由按需取回；取不回来、或那些字节不是图片，芯片退回显示名字。**只有当这个部署没有附件存储时**，编辑器才会改回旧的那句话——「这条消息包含图片或文件附件，改写会丢弃它们，只保留文字」——并且不出现添加入口。
 **一字不改就按保存，什么都不会发生。** 编辑器预填的就是这条消息**现在**的文本，所以「打开编辑器、不输入、直接保存」等于没提出任何修改：宿主不写任何事件（不落替换、不开合成轮次、不追加回答），编辑器照常关闭、**一条提示都不显示**（0.2.20 起；这条提示此前压在输入框的占位文字上）。会话日志、轮次导轨、轨迹视图都保持原样——此前它照样落一条替换（一次会话里三条），改回答时还会多出一整个轮次（用户只发了两条消息，轨迹视图里却有四轮）。**「重跑」不受这条守卫影响**：文本没变但用户点的是「重跑」，宿主同样不写，重跑照常发起（用户的意图就是让这一轮重新生成）。
 
-**编辑模型的回答**：悬停任意一条模型回复，同样会出现编辑入口。改完点「保存」——这条回答被替换为你写的内容，它之后的内容一并移除，模型从此把你写的内容当成自己说过的话，对话可以继续下去。
+**编辑模型的回答**：悬停任意一条模型回复，同样会出现编辑入口。改完点「保存」——这条回答被替换为你写的内容；它后面的轮次先从上下文里回退，再逐事件重放回原位（新 turn 号、新 messageId、原内容），顺序与原来一致，模型从此把你写的内容当成自己说过的话，对话可以继续下去。
 
 注意：回答里的**工具调用与思考过程**无法保留（替换后只留文字，编辑器会提示），因为工具调用的结果已经不再成立。
 
@@ -82,7 +83,7 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
 一次编辑就是**一条官方替换事件**。读事件流（`sessionQuery.readSession`，回退到活动会话的 `snapshotEvents()`），用官方折叠规则算出当前 surface 顺序，定位目标消息的节点，然后：
 
 - 提示词编辑：窗口 = **仅那一格**（`[target.seq]`），载体就是改后的文本；
-- 回复编辑：窗口 = `surface[目标下标 .. 末尾]`（回答变了，建立在它之上的一切都不再成立）；先在日志里**开一个新轮次**（`turn/start` + `step/start`），载体是空 `developer/message`（空内容不投影给模型），随后把改写文本作为一条助手消息追加进这个轮次，再 `step/end` + `turn/end` 收尾。
+- 回复编辑：窗口 = `surface[目标下标 .. 末尾]`（修正回答只能 append，所以窗口必须到末尾）；先在日志里**开一个新轮次**（`turn/start` + `step/start`），载体是空 `developer/message`（空内容不投影给模型），随后把改写文本作为一条助手消息追加进这个轮次，再 `step/end` + `turn/end` 收尾；最后用 `buildReplayWrites` 把窗口里**后续轮次**的 surface 事件逐条重放回来（新 turn 号、新 messageId、`replayBy` / `replayId` / `originalSeq` 标记）。重放规则与 `dsh-rerun-turn` 共用一套：tool call 与 result 必须成对、没等到结果的调用连同它的广告一起丢、`TOOL_NOT_STARTED` 修复保持不带 `sourceEventSeqs`、system / developer / 静默载体 / 日志-only 记录一律跳过。
 
 追加一条：
 
@@ -94,7 +95,7 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 })
 ```
 
-落盘后等一次持久化检查点（`sessions.flush`），保证重启也能看到。
+落盘后等一次持久化检查点（`sessions.flush`），保证重启也能看到。回复编辑的这条重放**不调模型**：它只是把已经记录的事件以新身份再 append 一遍，所以保存仍然是"一次点击、零模型调用"。
 
 **重跑不由本插件做。** "改完立刻重答"是姊妹插件 `dsh-rerun-turn` 的操作：它遮蔽该轮、用表面现在显示的提示词（也就是你改后的文本）重新生成，再把后续轮次逐事件重放回来。本插件只负责把编辑落地；编辑器里的「重跑」按钮仅在检测到它挂载时出现，点击后先保存、再调用它的 `POST /dsh-rerun-turn/apply`。它不在（例如桌面版没装）时，没有这个按钮。
 
@@ -132,14 +133,14 @@ session.append('developer/message', { turn, step, message: { role: 'developer', 
 
 ### 验证状态
 
-本插件在 DSH `0.1.6-alpha.2` 与 `0.1.7-rc.1` 上完成以下验证：
+本插件在 DSH `0.2.1-rc.2`（真实校验器与真实会话）以及 `0.1.6-alpha.2` / `0.1.7-rc.1` 上完成以下验证：
 
 | 验证 | 命令 | 结果 |
 |---|---|---|
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
-| 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 80 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 182 项通过（含「文本没变 → 不写」的四条，以及块随消息一起改的 35 条：未动的块逐字节保留、删块少一块、文字位置不变、no-op 语义升级、附件服务缺失时降级且不写坏数据、自定义 `quote-card` 块的通用性、录用与拒绝、`/state` 的块描述与能力、附件字节路由、编辑器芯片/删除/添加/缩略图/降级警告） |
+| 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 85 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**回复编辑后的尾部重放（后续提问/回答/tool 调用与结果按新 turn 号回到修正回答之后，顺序正确、日志仍可加载）**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）** |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 188 项通过（含回复编辑的尾部重放用例：窗口/重放区间、新 turn 号与新 messageId、tool 调用与结果成对重映射、上一轮修正可再次编辑，以及与 `dsh-rerun-turn` builder 的逐字段对照；另含「文本没变 → 不写」的四条，以及块随消息一起改的 35 条：未动的块逐字节保留、删块少一块、文字位置不变、no-op 语义升级、附件服务缺失时降级且不写坏数据、自定义 `quote-card` 块的通用性、录用与拒绝、`/state` 的块描述与能力、附件字节路由、编辑器芯片/删除/添加/缩略图/降级警告） |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议、块契约） | `npm run verify:client` | 184 项全部通过（含 12 条新的块契约检查：能力上报、服务现场探测、录用是唯一建块路径、录用先于 append、**两侧都不特判块类型**、块逐字节复制、文字归位、`dropped` 上报、只在无服务时警告、芯片靠 `error` 事件自证） |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
@@ -224,6 +225,18 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.2.21** —— 回复编辑改成 infix splice：改一条中间的回答，后面的轮次不再被丢掉，而是重放回来（与 `dsh-rerun-turn` 同一套逻辑）。
+
+- **为什么要改**：0.2.20 的回复编辑是「从这条回答到末尾」的整段回退——改第一条回答，第 2、3 轮就一起消失。所谓「任意位置编辑」此前只对用户消息成立；用户消息的改写本身就在原位，不需要重放。
+- **改法**（宿主半侧）：
+  1. `planRollback` 的回复窗口仍到末尾（修正回答只能 append，尾部必须先离开 surface），但额外算出 `replayFrom`（目标轮之后的下一个 `turn/start` 括号）与 `logTo`（窗口最后一个轮的 `turn/end`）；
+  2. 新增 `buildReplayWrites`：把窗口里后续轮次的 surface 事件按新 turn 号、新 messageId 重放回去，并打 `replayBy` / `replayId` / `originalSeq` 标记。规则与 rerun 完全一致：tool call 与 result 成对、没等到结果的调用连同广告丢掉、`TOOL_NOT_STARTED` 修复保持不带 `sourceEventSeqs`、system/developer/静默载体与日志-only 记录一律跳过；`test/replay-parity.test.js` 把两个仓库的 builder 放在同一份日志上逐字段比对（sibling 不在时 skip）；
+  3. `applyEdit` 在「开轮 → 空载体替换窗口 → 追加修正回答 → 收尾」之后同步重放，并把活循环的轮次计数器推到重放出来的最高轮号；整批只在最后 flush 一次，避免留下「影子已持久化、修正却不在」的中间态；
+  4. 派生顺序变成「前缀 + 改写后的回答 + 原来的后续轮次」，日志仍然 append-only。
+- **测试**：`npm test` **189/189**、`npm run verify:contract` **85** 项、`npm run verify:client` **184** 项全绿；真实 `Session` 校验器上新增「改第一轮回答 → 后续轮次的提问、回答、tool call/result 全部重放回来且顺序正确、日志仍可加载」的用例；宿主集成测试改成断言重放标记与轮次号，并新增「改三段会话中间那一轮的回复，前后两轮都还在」；与 `dsh-rerun-turn` 的 `buildReplayWrites` 有逐字段对照测试。
+- **真实会话验证**（只读、不写盘）：在本机 4 个多轮会话上把整条 apply 路径跑在内存副本里——最多 11,013 个事件 / 130 轮，重放 687 条写入，全部被真实校验器接受、重新加载通过，改后的派生顺序是「前缀 + 改写回答 + 后续轮次」。
+- **诚实说明**：重放是同步 append（不调模型，毫秒级），没有 rerun 那套跨分钟的后台恢复流程；如果中途某条写入被校验器拒绝，响应会带 `replay.error` 与已写入条数，已经落地的副本保留，不会回滚成「什么都没有」。
 
 **0.2.20** —— 删掉「原样保存」时那条提示。只改提示，行为不变。
 
@@ -415,7 +428,7 @@ This plugin adds it:
 - clicking it opens an in-place editor below that message, pre-filled with the original text;
 - saving **replaces that one message in place**: only the old wording leaves the model context, the revised text takes its place, and every later turn is answered against the new version;
 - **the reply under it and the whole conversation after it stay exactly as they were** - nothing is re-run and nothing is cleared;
-- model replies are editable too: replacing one rolls back that answer and everything built on it (a changed answer invalidates what followed) and appends your text as a fresh reply;
+- model replies are editable too: the corrected answer is appended as a fresh reply and **everything that followed is replayed back behind it** - event by event, with fresh turn numbers and message ids - so a reply edit never drops the rest of the conversation;
 - with the sister plugin **dsh-rerun-turn** installed, the editor also offers a "**Re-run**" button: it saves your change first, then has that plugin regenerate the turn from the revised prompt (replaying what followed, so nothing after it is lost).
 
 ### Features
@@ -423,11 +436,11 @@ This plugin adds it:
 - **Official seam, log untouched.** A rollback appends one replacement event carrying `surfaceOp: { op: 'replace', startSeq, endSeq }`. Every original event stays in the session file; it simply stops entering `deriveMessages()`. This is the same contract `/compact` uses.
 - **The revision is the carrier.** A prompt edit lands a `user/message` replacement whose content **is** your revised text: it updates the model context and shows in the transcript in place of the old wording. The platform does not answer it as a new input (that was tried: *appending* a user message makes the platform reply, and the next save added another copy). Reply edits stay silent too: their carrier is an empty `developer/message` - the format admits only system-prompt sources on `system/message`, and an empty plugin-owned system node is exactly what used to make sessions unreadable (see below).
 - **A revised message carries every block it carried (0.2.19).** A block the user did not touch is copied verbatim (a structured clone of the original block object: attachment ids, names, sizes and every field a later platform adds), a block they removed is not written, and a newly picked payload is admitted through the platform's attachment store before anything is appended. Nothing in the module names a block type - the only block test is "does this block carry text" - so a block kind the platform adds later works with no change here. The editor draws one chip per non-text block (a thumbnail when its bytes are reachable, otherwise its name and size, plus a remove button) and offers an "Add an attachment" entry; with no store mounted it falls back to the old warning and no picker.
-- **The smallest window that is correct.** A prompt edit shadows exactly one node (`shadowed = [target.seq]`); a reply edit shadows the reply through the end of the surface - a changed answer invalidates everything built on it - which also keeps an assistant message (carrying its own tool_use blocks) and the tool/result it produced together. A dangling call/result pair is impossible.
+- **The smallest window that is correct, with a faithful replay.** A prompt edit shadows exactly one node (`shadowed = [target.seq]`); a reply edit shadows the reply through the end of the surface (a correction can only be appended, so the tail must leave first), and then replays every later turn back behind the correction with fresh turn numbers, fresh message ids and a `replayBy` / `replayId` / `originalSeq` marker. The walk is the same one `dsh-rerun-turn` performs after a rerun, and a parity test compares the two builders write for write. An assistant message (carrying its own tool_use blocks) and the tool/result it produced always leave together, so a dangling call/result pair is impossible.
 - **A rewritten message stays editable.** It still shows where the original stood, and hovering it offers the pencil again.
 - **Saving never calls the model.** It only writes the context. Regenerating a turn after the edit is a different operation, owned by the sister plugin **dsh-rerun-turn** (it shadows the turn, regenerates from the prompt the surface now shows, and replays the turns that followed); this plugin only forwards to it, through the "Re-run" button, when it is mounted.
 - **A save that changes nothing writes nothing** (0.2.18). The layer that decides what to write compares the draft with the live text **verbatim**, through the same parse the editor was prefilled from (`readMessageText`, the one behind `/state`’s `turns[].text`), and answers `unchanged: true` before appending anything: no replacement event, no synthetic turn, no appended answer, no loop-counter sync. The flag is not a refusal - the route still answers 200, and the editor still starts the re-run when that was the button the user pressed. Nothing is announced for it either (0.2.20 removed the notice this used to draw): the editor closes like any save, and the screen is exactly as it was.
-- **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The answer is rolled back together with everything after it, and the corrected text is **appended** as a fresh reply - the model goes on treating it as its own. `source.editedBy` records honestly that the plugin wrote those words.
+- **The model's replies are editable too.** A reply cannot be swapped in place: the format refuses `sourceEventSeqs` on an `assistant/message` (verified against the real validator). The correction is **appended** as a fresh reply - the model goes on treating it as its own - and the turns the rollback took leave the surface only to be **replayed** back behind it, in order, as fresh copies. `source.editedBy` records honestly that the plugin wrote those words; each replay event carries `replayBy`, `replayId` and `originalSeq`.
 - **One click applies** - no second confirmation by default. The editor is already an explicit action the user opened; with `confirm: true` the confirmation step states what this save will discard, while the input box itself stays clean.
 - **Bilingual UI** that follows the current DSH locale.
 - **Skin-friendly** - the editor paints its own opaque surface (`--dshet-panel`) instead of borrowing the theme's surface colours. A skin exists to make surfaces translucent so its artwork shows through, and it only compensates for *its own* elements; a plugin's class names are not on that list, so a panel that borrows those variables can end up fully transparent with text sitting straight on the art. The dark branch uses the official `body[data-ds-dark-theme]` hook (the same one `dsh-client-ui-theme` and several official UI packages use) and blends in with `backdrop-filter`.
@@ -579,7 +592,7 @@ The transcript only builds rows for **append surface events** (ui-chat's user an
 2. **The replacement event has the type of the target**: a `user/message` edit lands a `user/message` (a reply cannot be swapped in place — see 5);
 3. **`sourceEventSeqs` always lists the whole window**: the official validator demands complete coverage; one missing node and the append is refused;
 4. **Every replacement carries the semantic marker**: `source.editedBy === 'dsh-edit-turn'` — including the empty text-free `developer/message` carrier, so siblings can recognise rewrites by `editedBy` alone instead of inferring from the window shape;
-5. **A reply edit is a multi-node rollback plus an appended correction**, not an in-place swap: the old reply row keeping no entry is **by design** (the new row carries it). Do not add `sourceEventSeqs` to an `assistant/message` to keep the old row's entry — the official validator refuses it outright;
+5. **A reply edit is a multi-node rollback, an appended correction, and a replay of the tail**, not an in-place swap: the old reply row keeping no entry is **by design** (the new row carries it), and everything after it is re-appended with fresh identities and a replay marker. Do not add `sourceEventSeqs` to an `assistant/message` to keep the old row's entry — the official validator refuses it outright;
 6. **The block list is an optional, forward-compatible parameter**: `POST /apply` accepts `parts` (`[{ keep } | { add }]`), and **omitting it is exactly the 0.2.18 behaviour** (a text-only carrier), with the response's `dropped` stating whether that save left non-text blocks behind. `GET /state` answers `capabilities: { attachments, preview }` for what this deployment can admit and read, and `turns[].blocks` describes each block as `{ index, type, name?, mediaType?, bytes?, width?, height?, preview }` - read by field presence, never by type, so a sibling can do the same and a block kind the platform adds later needs no change anywhere;
 7. **The mapping is published**: `revisions[]` on `GET /dsh-edit-turn/state` gives `{ replacementSeq, startSeq, endSeq, shadowed }` (the field names the `POST /apply` response already used), and `hidden[]` lists `{ seq, turn, replacement }` per shadowed row. No sibling has to re-derive the ledger from the event stream.
 
