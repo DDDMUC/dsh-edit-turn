@@ -5,8 +5,8 @@
 > 官方机制是 append-only 的 **surface-replace**，比截断文件更安全且已被官方 compaction 与
 > `dsh-delete-turn` 在生产中使用。
 
-证据基线：本机 DSH 0.1.6-alpha.2，源码在
-`/Users/example/.npm/_npx/750cc96126099c02/node_modules/@deepseek-ai/`。
+证据基线：DSH 0.1.6-alpha.2，源码在
+`<DSH 安装目录>/node_modules/@deepseek-ai/`。
 
 ---
 
@@ -34,8 +34,7 @@
 - 截断无法解决"悬空 tool/result"——surface-replace 天然不会：我们**总是遮蔽到一个轮边界之后的最后一个
   surface 节点**，assistant 消息（内含 tool_use）与它的 tool/result 一起走。
 
-已验证的同类实现：`dsh-delete-turn` v0.1.1（本机
-`~/Documents/Default Project/dsh-delete-turn`）在同一 DSH 版本上用同一个契约落地；
+已验证的同类实现：`dsh-delete-turn` v0.1.1（同一工作区里的兄弟插件）在同一 DSH 版本上用同一个契约落地；
 官方 `dsh-command-compact` 的 compaction checkpoint 也是同形状的 `user/message` 替换事件。
 
 ## 2. 重跑：`ctx.sessionController.prompt()`
