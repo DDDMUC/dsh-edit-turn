@@ -232,7 +232,7 @@ class StubElement {
   }
 
   getBoundingClientRect() {
-    return { x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }
+    return this.rect ?? { x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }
   }
 
   get isConnected() {
@@ -725,6 +725,78 @@ test('the editor box grows with its text instead of leaving an empty half', asyn
   area.scrollHeight = 120
   area.fire('input')
   assert.equal(area.style.height, '122px', 'the measured height is applied')
+})
+
+test('a row near the bottom flips the editor above it so the buttons stay reachable', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
+  try {
+    globalThis.window.innerHeight = 200
+    globalThis.window.innerWidth = 180
+    row.rect = { x: 10, y: 150, left: 10, top: 150, right: 210, bottom: 180, width: 200, height: 30 }
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    const top = Number.parseInt(box.style.top, 10)
+    const height = box.getBoundingClientRect().height
+    assert.ok(top >= 8, `top ${top} keeps the box on screen`)
+    assert.ok(top + height <= 200, `top ${top} + ${height} fits above the fold`)
+    assert.ok(top < row.rect.bottom, 'the box is above the row, not below it')
+    assert.equal(box.style.width, '164px', 'the width is clamped to the viewport')
+    assert.equal(box.style.left, '8px', 'the left edge is clamped too')
+  } finally {
+    if (previous.height === undefined) delete globalThis.window.innerHeight
+    else globalThis.window.innerHeight = previous.height
+    if (previous.width === undefined) delete globalThis.window.innerWidth
+    else globalThis.window.innerWidth = previous.width
+  }
+})
+
+test('a row taller than the viewport pins the editor to the bottom, with its own scrollbar', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
+  try {
+    globalThis.window.innerHeight = 200
+    globalThis.window.innerWidth = 220
+    row.rect = { x: 0, y: -100, left: 0, top: -100, right: 200, bottom: 400, width: 200, height: 500 }
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    const top = Number.parseInt(box.style.top, 10)
+    const height = box.getBoundingClientRect().height
+    assert.equal(top, 200 - height - 8, 'the box is pinned to the bottom of the viewport')
+    const css = walk(harness.document.head).filter((node) => node.tagName === 'STYLE').map((node) => node.textContent).join('')
+    assert.match(css, /max-height:calc\(100vh - 16px\)/, 'the editor caps its own height')
+    assert.match(css, /\.dshet-footer\{position:sticky/, 'the footer stays visible while the box scrolls')
+  } finally {
+    if (previous.height === undefined) delete globalThis.window.innerHeight
+    else globalThis.window.innerHeight = previous.height
+    if (previous.width === undefined) delete globalThis.window.innerWidth
+    else globalThis.window.innerWidth = previous.width
+  }
+})
+
+test('a row scrolled above the viewport clamps the editor into view', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
+  try {
+    globalThis.window.innerHeight = 700
+    globalThis.window.innerWidth = 1000
+    row.rect = { x: 0, y: -1400, left: 0, top: -1400, right: 800, bottom: -1091, width: 800, height: 309 }
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    box.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 405, width: 800, height: 405 }
+    // A later placement pass sees the grown box and must keep it on screen.
+    harness.document.fireDocument('scroll', {})
+    const top = Number.parseInt(box.style.top, 10)
+    assert.ok(top >= 8 && top + 405 <= 700, `top ${top} keeps the grown box inside the viewport`)
+  } finally {
+    if (previous.height === undefined) delete globalThis.window.innerHeight
+    else globalThis.window.innerHeight = previous.height
+    if (previous.width === undefined) delete globalThis.window.innerWidth
+    else globalThis.window.innerWidth = previous.width
+  }
 })
 
 test('a rebuilt editor never steals focus from what the user is typing in', async () => {
