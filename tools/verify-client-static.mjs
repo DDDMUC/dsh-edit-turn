@@ -401,7 +401,7 @@ check(
 check(
   'the reused button reads its action off the element, not off a closure',
   clientSource.includes('const activate = button[ACTIVATE]') &&
-    clientSource.includes('button[ACTIVATE] = () => controller.open(entry.target)'),
+    /button\[ACTIVATE\] = \(event\) => controller\.open\(\{/.test(clientSource),
   'a captured controller is the retired one after a reload, which opens nothing',
 )
 check(

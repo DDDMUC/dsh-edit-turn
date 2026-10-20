@@ -734,6 +734,7 @@ test('a row near the bottom flips the editor above it so the buttons stay reacha
     globalThis.window.innerHeight = 200
     globalThis.window.innerWidth = 180
     row.rect = { x: 10, y: 150, left: 10, top: 150, right: 210, bottom: 180, width: 200, height: 30 }
+    byClass(row, 'dshet-action')[0].rect = { x: 150, y: 150, left: 150, top: 150, right: 178, bottom: 178, width: 28, height: 28 }
     byClass(row, 'dshet-action')[0].fire('pointerdown')
     render(harness, controller, snapshot)
     const box = editorIn(harness)
@@ -759,6 +760,7 @@ test('a row taller than the viewport pins the editor to the bottom, with its own
     globalThis.window.innerHeight = 200
     globalThis.window.innerWidth = 220
     row.rect = { x: 0, y: -100, left: 0, top: -100, right: 200, bottom: 400, width: 200, height: 500 }
+    byClass(row, 'dshet-action')[0].rect = { x: 0, y: 400, left: 0, top: 400, right: 28, bottom: 428, width: 28, height: 28 }
     byClass(row, 'dshet-action')[0].fire('pointerdown')
     render(harness, controller, snapshot)
     const box = editorIn(harness)
@@ -783,6 +785,7 @@ test('a row scrolled above the viewport clamps the editor into view', async () =
     globalThis.window.innerHeight = 700
     globalThis.window.innerWidth = 1000
     row.rect = { x: 0, y: -1400, left: 0, top: -1400, right: 800, bottom: -1091, width: 800, height: 309 }
+    byClass(row, 'dshet-action')[0].rect = { x: 0, y: -1400, left: 0, top: -1400, right: 28, bottom: -1372, width: 28, height: 28 }
     byClass(row, 'dshet-action')[0].fire('pointerdown')
     render(harness, controller, snapshot)
     const box = editorIn(harness)
