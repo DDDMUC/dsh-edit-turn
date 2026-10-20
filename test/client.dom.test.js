@@ -2909,6 +2909,36 @@ test('a landed text patch is drawn in place over the recorded reply text', async
   assert.equal(body.textContent, 'patched answer', 'the reader sees the projected text')
   assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
 
+  // React can re-render the assistant container and reset the attributes/style
+  // we set, while the text node we replaced stays. A later edit must still find
+  // that element and update it, not leave the previous projection on screen.
+  body.removeAttribute('data-dshet-patch')
+  body.style.whiteSpace = ''
+  const reply = patchState().replies[0]
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      replies: [{
+        ...reply,
+        text: 'second answer',
+        patched: true,
+        blocks: [{
+          index: 1,
+          kind: 'text',
+          text: 'second answer',
+          original: 'the original answer',
+          patched: true,
+        }],
+      }],
+      patches: [{ seq: 5, blockIndex: 1, kind: 'text', text: 'second answer' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(body.textContent, 'second answer', 'a later edit updates the remembered element')
+  assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
+
   // The patch is gone (a prompt rollback, or the plugin was disabled): the
   // host's recorded text is what the row must show again.
   globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
@@ -2947,4 +2977,124 @@ test('a patched reasoning block gets a note the model-visible text lives in', as
   assert.equal(summary.textContent, '思维链已改写（模型可见）')
   const body = walk(note).find((entry) => entry.tagName === 'PRE')
   assert.equal(body.textContent, 'the rewritten thought')
+})
+
+test('a reply rendered as bare text (no block element) is still patched in place', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const bare = harness.document.createElement('div')
+  bare.textContent = 'plain answer'
+  node.appendChild(bare)
+  root.appendChild(node)
+  row.appendChild(root)
+  // A button carrying the same text must be left alone: only the reply body is
+  // in scope, and our own chrome is excluded even when it shares the text.
+  const decoy = harness.document.createElement('button')
+  decoy.textContent = 'plain answer'
+  row.appendChild(decoy)
+
+  const reply = patchState().replies[0]
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      replies: [{
+        ...reply,
+        text: 'plain answer',
+        blocks: [{ index: 0, kind: 'text', text: 'plain answer', original: 'plain answer', patched: false }],
+      }],
+      patches: [{ seq: 5, blockIndex: 0, kind: 'text', text: 'patched answer' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(bare.textContent, 'patched answer')
+  assert.equal(bare.getAttribute('data-dshet-patch'), '5:0')
+  assert.equal(decoy.textContent, 'plain answer')
+})
+
+test('the process row that also covers the seq does not steal the patch from the assistant row', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  // The turn-process row is mounted first and its node reports the same seq
+  // through seqsFor; the old first-win map pointed the patch there.
+  const processRow = mountRow(harness.document, 'row-process')
+  processRow.setAttribute('data-chat-flow-kind', 'turn-process')
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  snapshot.nodes.set('row-process', { kind: 'turn-process', anchorSeq: 5, data: { seq: 5, turn: 1 } })
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const body = harness.document.createElement('div')
+  const paragraph = harness.document.createElement('p')
+  paragraph.textContent = 'the original answer'
+  body.appendChild(paragraph)
+  node.appendChild(body)
+  root.appendChild(node)
+  row.appendChild(root)
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      patches: [{ seq: 5, blockIndex: 1, kind: 'text', text: 'patched answer' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(body.textContent, 'patched answer')
+  assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
+})
+
+test('markdown emphasis in the recorded text does not defeat the rendered-text match', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const body = harness.document.createElement('div')
+  const paragraph = harness.document.createElement('p')
+  // The Markdown renderer consumes the emphasis markers; the recorded text
+  // still has them. Stripping them must not leave a space that changes `1。`.
+  paragraph.textContent = '第一行 1。\n第二行'
+  body.appendChild(paragraph)
+  node.appendChild(body)
+  root.appendChild(node)
+  row.appendChild(root)
+
+  const reply = patchState().replies[0]
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      replies: [{
+        ...reply,
+        text: '第一行 **2**。\n第二行',
+        patched: true,
+        blocks: [{
+          index: 1,
+          kind: 'text',
+          text: '第一行 **2**。\n第二行',
+          original: '第一行 **1**。\n第二行',
+          patched: true,
+        }],
+      }],
+      patches: [{ seq: 5, blockIndex: 1, kind: 'text', text: '第一行 **2**。\n第二行' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(body.textContent, '第一行 2。\n第二行')
+  assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
 })

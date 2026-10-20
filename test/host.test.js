@@ -17,9 +17,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { Session } from '@deepseek-ai/dsh-session'
+import { Session, appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { PLUGIN_ID, PLUGIN_VERSION, apply } from '../lib/index.js'
-import { PATCH_TYPE } from '../lib/patch.js'
+import { PATCH_TYPE, buildPatchData } from '../lib/patch.js'
 import { foldSurface } from '../lib/index.js'
 
 const SESSION_ID = 'session-11111111-2222-4333-8444-555555555555'
@@ -881,6 +881,20 @@ test('a live reload reuses the already registered projection instead of falling 
     assert.equal(state.status, 200, state.payload)
     assert.equal(state.json.mode, 'patch', 'the old registration is still good')
     assert.equal(h.projections.length, 0, 'no duplicate registration was attempted')
+  } finally {
+    await h.close()
+  }
+})
+
+test('/state publishes only patches whose target is still on the surface', async () => {
+  const h = await harness({ patch: true })
+  try {
+    appendPluginRecord(h.session, PATCH_TYPE, buildPatchData([
+      { seq: 999, blockIndex: 0, kind: 'text', text: 'stale patch' },
+    ]))
+    const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.status, 200, state.payload)
+    assert.deepEqual(state.json.patches, [], 'a retired target is not a live patch')
   } finally {
     await h.close()
   }

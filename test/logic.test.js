@@ -434,6 +434,27 @@ test('editableTurns lists human prompts in conversation order, minus the head', 
   assert.equal(turns[1].text, '第二问')
 })
 
+test('a prompt replacement inherits the turn it stands in for', () => {
+  const log = twoTurnLog()
+  log.push(
+    ev(12, 'user/message', {
+      id: 'u1-edited',
+      role: 'user',
+      content: [{ type: 'text', text: '第一问改' }],
+      source: { kind: 'user', editedBy: PLUGIN_ID },
+    }, {
+      surfaceOp: { op: 'replace', startSeq: 2, endSeq: 2 },
+      sourceEventSeqs: [2],
+    }),
+  )
+  const { nodes } = foldSurface(log)
+  const turns = editableTurns(log, nodes)
+  const replacement = turns.find((entry) => entry.seq === 12)
+  assert.ok(replacement, 'the replacement is on the surface and editable')
+  assert.equal(replacement.turn, 1, 'turn comes from the prompt it replaced, not null')
+  assert.deepEqual(turns.map((entry) => entry.turn), [1, 2])
+})
+
 test('editableTurns drops a prompt an earlier rollback shadowed', () => {
   const log = twoTurnLog()
   const first = planRollback(log, foldSurface(log).nodes, { seq: 2 })
