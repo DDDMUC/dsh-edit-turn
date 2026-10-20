@@ -19,6 +19,7 @@ import { test } from 'node:test'
 
 import { Session } from '@deepseek-ai/dsh-session'
 import { PLUGIN_ID, PLUGIN_VERSION, apply } from '../lib/index.js'
+import { PATCH_TYPE } from '../lib/patch.js'
 import { foldSurface } from '../lib/index.js'
 
 const SESSION_ID = 'session-11111111-2222-4333-8444-555555555555'
@@ -34,7 +35,7 @@ function buildTwoTurnLog(session) {
   session.append('turn/start', { turn: 1 })
   session.append(
     'system/message',
-    { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'plugin', plugin: 'stub-bundle' } } },
+    { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } },
     { surfaceOp: 'append' },
   )
   session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'original prompt' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
@@ -48,6 +49,36 @@ function buildTwoTurnLog(session) {
     { surfaceOp: 'append' },
   )
   session.append('assistant/message', { turn: 2, step: 1, message: modelMessage('a2', 'second answer'), stream: [] }, { surfaceOp: 'append' })
+  session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+}
+
+/** One turn with a reasoning block, answer text, then a second turn. */
+function buildReasoningLog(session) {
+  session.append('turn/start', { turn: 1 })
+  session.append('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } }, { surfaceOp: 'append' })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'Q1' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: {
+      id: 'a1',
+      role: 'assistant',
+      content: [
+        { type: 'thinking', text: 'OLD THOUGHT', signature: 'sig-1' },
+        { type: 'text', text: 'OLD ANSWER' },
+      ],
+      source: { kind: 'model', provider: 'p', model: 'm' },
+    },
+    stream: [],
+  }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  session.append('turn/start', { turn: 2 })
+  session.append('step/start', { turn: 2, step: 1 })
+  session.append('user/message', { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Q2' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('assistant/message', { turn: 2, step: 1, message: modelMessage('a2', 'LATER ANSWER'), stream: [] }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 2, step: 1 })
   session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
 }
 
@@ -70,6 +101,10 @@ async function harness(options = {}) {
   const prompts = []
   const toolCalls = []
   const routes = new Map()
+  const projections = []
+  const existingProjections = options.existingProjection === true
+    ? [{ type: PATCH_TYPE, project: () => new Map() }]
+    : []
 
   const ctx = {
     toolCalls,
@@ -77,7 +112,23 @@ async function harness(options = {}) {
       if (options.services && name in options.services) return options.services[name]
       switch (name) {
         case 'sessions':
-          return { get: () => session, flush: async () => {} }
+          return {
+            get: () => session,
+            flush: async () => {},
+            messageProjections: existingProjections,
+            ...(options.patch === true
+              ? {
+                  registerMessageProjection: (projection) => {
+                    if (existingProjections.some((entry) => entry.type === projection.type)) {
+                      throw new Error(`session message projection "${projection.type}" is already registered`)
+                    }
+                    existingProjections.push(projection)
+                    projections.push(projection)
+                    return () => {}
+                  },
+                }
+              : {}),
+          }
         case 'sessionQuery':
           return { readSession: async () => ({ events: session.snapshotEvents() }) }
         case 'sessionController':
@@ -134,6 +185,7 @@ async function harness(options = {}) {
     prompts,
     toolCalls,
     routes,
+    projections,
     port,
     close: () => new Promise((resolve) => server.close(resolve)),
   }
@@ -737,6 +789,103 @@ test('a corrected reply can be corrected again', async () => {
   }
 })
 
+test('editing a reply block appends one patch record and no turn', async () => {
+  const session = Session.create(SESSION_ID)
+  buildReasoningLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.kind, 'reply')
+    assert.equal(res.json.mode, 'patch')
+    assert.equal(res.json.applied, true)
+    assert.deepEqual(res.json.shadowed, [])
+    assert.equal(typeof res.json.recordSeq, 'number')
+
+    // One small record; no synthetic turn, no correction, no replay.
+    assert.equal(h.session.seq, before + 1)
+    const record = h.session.snapshotEvents().at(-1)
+    assert.equal(record.type, PATCH_TYPE)
+    assert.equal(record.ignorable, true)
+    assert.equal(record.surfaceOp, undefined)
+    assert.deepEqual(record.data.targets, [{ seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer' }])
+
+    // The host projection is what changes the model context: rebuild a session
+    // with the registered definition and read the same log.
+    const patched = Session.create('session-22222222-2222-4222-8222-222222222222', h.session.snapshotEvents(), undefined, 0, h.projections)
+    const target = patched.deriveMessages().find((message) => message.content.some((block) => block.type === 'thinking'))
+    assert.equal(target.content[0].text, 'OLD THOUGHT')
+    assert.equal(target.content[1].text, 'patched answer')
+    // The turn after it is untouched.
+    assert.equal(patched.deriveMessages().at(-1).content[0].text, 'LATER ANSWER')
+    // The recorded log still carries the original text for the original event.
+    const original = h.session.snapshotEvents().find((event) => event.seq === assistant.seq)
+    assert.equal(original.data.message.content[1].text, 'OLD ANSWER')
+
+    const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.json.mode, 'patch')
+    assert.equal(state.json.patches.length, 1)
+    assert.deepEqual(state.json.patches[0], { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer' })
+    const reply = state.json.replies.find((entry) => entry.seq === assistant.seq)
+    assert.equal(reply.blocks.length, 2)
+    assert.equal(reply.blocks[1].text, 'patched answer')
+    assert.equal(reply.blocks[1].original, 'OLD ANSWER')
+    assert.equal(reply.patched, true)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a reasoning block is editable and the answer beside it is untouched', async () => {
+  const session = Session.create(SESSION_ID)
+  buildReasoningLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: assistant.seq, blockIndex: 0, kind: 'reasoning', text: 'NEW THOUGHT' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.mode, 'patch')
+    assert.equal(res.json.target.kind, 'reasoning')
+
+    const patched = Session.create('session-33333333-3333-4333-8333-333333333333', h.session.snapshotEvents(), undefined, 0, h.projections)
+    const target = patched.deriveMessages().find((message) => message.content.some((block) => block.type === 'thinking'))
+    assert.equal(target.content[0].text, 'NEW THOUGHT')
+    assert.equal(target.content[0].signature, undefined)
+    assert.equal(target.content[1].text, 'OLD ANSWER')
+    // The later turn is untouched.
+    assert.equal(patched.deriveMessages().at(-1).content[0].text, 'LATER ANSWER')
+
+    // A second patch on the answer composes with the reasoning patch.
+    const text = await applyEdit(h.port, { sessionId: SESSION_ID, seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'NEW ANSWER' })
+    assert.equal(text.json.mode, 'patch')
+    const both = Session.create('session-44444444-4444-4444-8444-444444444444', h.session.snapshotEvents(), undefined, 0, h.projections)
+    const composed = both.deriveMessages().find((message) => message.content.some((block) => block.type === 'thinking'))
+    assert.equal(composed.content[0].text, 'NEW THOUGHT')
+    assert.equal(composed.content[1].text, 'NEW ANSWER')
+
+    const same = await applyEdit(h.port, { sessionId: SESSION_ID, seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'NEW ANSWER' })
+    assert.equal(same.json.applied, false)
+    assert.equal(same.json.unchanged, true)
+    assert.equal(h.session.snapshotEvents().filter((event) => event.type === PATCH_TYPE).length, 2)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a live reload reuses the already registered projection instead of falling back', async () => {
+  const h = await harness({ patch: true, existingProjection: true })
+  try {
+    const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.status, 200, state.payload)
+    assert.equal(state.json.mode, 'patch', 'the old registration is still good')
+    assert.equal(h.projections.length, 0, 'no duplicate registration was attempted')
+  } finally {
+    await h.close()
+  }
+})
+
 test('a reply with no text is not editable', async () => {
   const session = Session.create(SESSION_ID)
   buildTwoTurnLog(session)
@@ -979,7 +1128,7 @@ function buildBlockyLog(session, blocks = BLOCKS) {
   session.append('turn/start', { turn: 1 })
   session.append(
     'system/message',
-    { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'plugin', plugin: 'stub-bundle' } } },
+    { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } },
     { surfaceOp: 'append' },
   )
   session.append('user/message', { id: 'u1', role: 'user', content: blocks, source: { kind: 'user' } }, { surfaceOp: 'append' })

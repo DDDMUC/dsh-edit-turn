@@ -156,6 +156,9 @@ check('the initial state is empty', snapshot.editing === null && snapshot.notice
 // updating this list, removing one breaks the build here rather than in the UI.
 const EXPECTED_SNAPSHOT_KEYS = [
   'attachmentsOk',
+  'blockIndex',
+  'blockKind',
+  'blocks',
   'confirmStep',
   'confirming',
   'draft',
@@ -167,9 +170,12 @@ const EXPECTED_SNAPSHOT_KEYS = [
   'loaded',
   'notice',
   'parts',
+  'patchBySeq',
+  'patches',
   'pending',
   'replies',
   'repliesByMessage',
+  'replyMode',
   'revision',
   'revisions',
   'siblingRerun',
@@ -739,8 +745,9 @@ check(
 )
 check(
   'the editor warns only when the host cannot carry the blocks',
-  clientSource.includes('if (target.attachments > 0 && !chips)'),
-  'the old "rewriting drops them" warning belongs to a deployment with no attachment store',
+  clientSource.includes('target.attachments > 0 && !chips') &&
+    clientSource.includes("target.mode === 'reply' && target.patch === true"),
+  'the old "rewriting drops them" warning belongs to a deployment with no attachment store, and an in-place reply patch keeps its calls',
 )
 check(
   'a chip draws itself from its bytes and gives up quietly otherwise',

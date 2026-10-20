@@ -17,7 +17,7 @@
 // message) instead of the current short marker.
 //
 //   node tools/verify-surface-contract.mjs
-import { Session } from '@deepseek-ai/dsh-session'
+import { Session, appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { currentSessionMessageProjections } from '@deepseek-ai/dsh-session-format-catalog/message-projections'
 import {
   PLUGIN_ID,
@@ -33,6 +33,7 @@ import {
   planRollback,
   rollbackLedger,
 } from '../lib/index.js'
+import { PATCH_TYPE, buildPatchData, patchProjection } from '../lib/patch.js'
 
 const MARKER = `[${PLUGIN_ID}] test marker`
 
@@ -624,6 +625,56 @@ check(
   loadFailure(replySession) === null,
   String(loadFailure(replySession)),
 )
+
+// ---------------------------------------------------------------------------
+console.log('\n11. in-place reply patches: one record, no surface change, no replay')
+const patchSession = freshSession('000000000007')
+buildTwoTurnLog(patchSession)
+const patchEvents = patchSession.snapshotEvents()
+const patchFold = foldSurface(patchEvents)
+const firstReply = editableReplies(patchEvents, patchFold.nodes).find((entry) => entry.turn === 1)
+check('the first reply is editable', firstReply !== undefined && firstReply.seq === 4, JSON.stringify(firstReply))
+const recordSeq = appendPluginRecord(
+  patchSession,
+  PATCH_TYPE,
+  buildPatchData([{ seq: firstReply.seq, blockIndex: 0, kind: 'text', text: '补丁后的第一轮回答' }]),
+)
+const afterPatch = patchSession.snapshotEvents()
+check('one plugin record was appended', afterPatch.length === patchEvents.length + 1, `${afterPatch.length - patchEvents.length} events`)
+const record = afterPatch[recordSeq]
+check('the record is an ignorable, surface-free log event',
+  record.type === PATCH_TYPE && record.ignorable === true && record.surfaceOp === undefined,
+  JSON.stringify({ type: record.type, ignorable: record.ignorable, surfaceOp: record.surfaceOp }))
+check('the patch does not touch the surface',
+  JSON.stringify(foldSurface(afterPatch).nodes) === JSON.stringify(patchFold.nodes),
+  JSON.stringify(foldSurface(afterPatch).nodes))
+check('the log still loads without the projection',
+  loadFailure(patchSession) === null,
+  String(loadFailure(patchSession)))
+const projection = patchProjection()
+const patchedSession = Session.create('session-00000000-0000-4000-8000-patched00001', afterPatch, undefined, 0, [projection])
+const patchedTexts = texts(patchedSession.deriveMessages())
+check('the projection changes the model-visible reply only',
+  patchedTexts.includes('补丁后的第一轮回答') && !patchedTexts.includes('第一轮回答'), JSON.stringify(patchedTexts))
+check('the later turn and the tool result are untouched',
+  patchedTexts.includes('第二轮提问') && patchedTexts.includes('第二轮回答'),
+  JSON.stringify(patchedTexts))
+check('the recorded message keeps its original bytes',
+  afterPatch[firstReply.seq].data.message.content[0].text === '第一轮回答',
+  afterPatch[firstReply.seq].data.message.content[0].text)
+// A second record on another block composes; the first block stays patched.
+appendPluginRecord(patchSession, PATCH_TYPE, buildPatchData([{ seq: firstReply.seq, blockIndex: 1, kind: 'reasoning', text: 'THINK' }]))
+const composedSession = Session.create('session-00000000-0000-4000-8000-patched00002', patchSession.snapshotEvents(), undefined, 0, [projection])
+check('the second record is accepted', composedSession !== undefined)
+// The verifier's two-turn log has one text block; the reasoning target is
+// skipped by the projection (kind mismatch) instead of breaking the fold.
+check('a target whose block changed kind is skipped, not fatal',
+  texts(composedSession.deriveMessages()).includes('补丁后的第一轮回答'),
+  JSON.stringify(texts(composedSession.deriveMessages())))
+const noProjectionSession = Session.create('session-00000000-0000-4000-8000-patched00003', patchSession.snapshotEvents(), undefined, 0, [])
+check('without the projection the original reply comes back',
+  texts(noProjectionSession.deriveMessages()).includes('第一轮回答') && !texts(noProjectionSession.deriveMessages()).includes('补丁后的第一轮回答'),
+  JSON.stringify(texts(noProjectionSession.deriveMessages())))
 
 // ---------------------------------------------------------------------------
 console.log('\n10. guard rails')

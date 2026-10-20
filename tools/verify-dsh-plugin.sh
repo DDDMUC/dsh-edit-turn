@@ -211,6 +211,20 @@ expect "回环 Host 通过守卫"                   404 -H "Host: 127.0.0.1" "$B
 # path rather than 404-ing at the server, which proves the handler is mounted.
 ok "宿主半部已挂载并走通自己的会话查询与守卫"
 
+# The in-place reply path is a load-time capability: both host seams have to be
+# found and the projection registered. Probe it here, in the real profile, so a
+# missing `appendPluginRecord` or a failed registration cannot hide behind a
+# quiet fallback in the tests.
+DEBUG_JSON="$(curl -s -m 5 "$BASE$ROUTE/debug" 2>/dev/null)"
+case "$DEBUG_JSON" in
+  *'"mode":"patch"'*) ok "就地回复投影已在真实 profile 注册（mode=patch）" ;;
+  *) echo "--- /debug ---" >&2; echo "$DEBUG_JSON" >&2; fail "回复投影没有注册（mode != patch）" ;;
+esac
+case "$DEBUG_JSON" in
+  *'"pluginRecords":true'*) ok "宿主暴露了 appendPluginRecord" ;;
+  *) fail "宿主没有暴露 appendPluginRecord" ;;
+esac
+
 # --- 6. teardown ------------------------------------------------------------
 step "6/6 清理"
 stop_sandbox

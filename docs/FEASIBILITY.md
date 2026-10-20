@@ -136,3 +136,48 @@ slot 体系（`dsh-client-ui-slots`）提供三个可用位置：
 - 绝不 kill / restart 用户主 DSH（127.0.0.1:3080）。
 - 验证尽量不发消息（省额度）；能用事件流断言的地方不发模型请求。
 - 未经用户明确同意不 publish、不建公开仓库。
+
+## 8. 0.3.0：回复块的就地补丁（plugin record + message projection）
+
+0.2.x 的回复编辑受一个格式事实限制：`assistant/message` 不能携带 `sourceEventSeqs`，因此
+不能做 surface replacement；只能"回退到末尾 + 追加修正回答 + 逐事件重放后续轮次"。这保住了
+后续对话，但改一条中间回答仍然会让日志多出整段副本、换掉所有轮次号与 messageId，且工具调用
+和思维链留不住。
+
+0.3.0 改用宿主在 0.2.1-rc.2 已经提供的另一条**公开 seam**：
+
+- `appendPluginRecord(session, 'plugin:dsh-edit-turn/patch', data)`（`@deepseek-ai/dsh-session`
+  导出）：只往日志追加一条 `ignorable: true` 的插件记录，不碰 surface；
+- `ctx.sessions.registerMessageProjection({ type, project })`：注册一个**纯函数**投影，折叠会话时
+  把目标 seq 的模型可见消息改写。投影按事件类型注册，同一类型只能一个；它只应注册到**自己的**
+  事件类型上，绝不能注册到 `assistant/message`（那会让 assistant 事件走 `project` 分支，破坏
+  surface/遮蔽关系）；
+- 投影必须**绝不抛错**：一次抛错会让整个会话折叠失败（会话打不开）。畸形记录、不在 surface 上的
+  目标、类型已经不符的块，一律跳过；
+- 同一 seq 的多条记录按日志顺序叠加：以 `context.messages.get(seq)`（已投影消息）为 base，没有则
+  用记录的原始 message；一条记录里多个 target 先按 seq 分组、一次性应用；
+- 改 `reasoning` / `thinking` 时删除 `signature` / `thinkingSignature`：签名签的是旧文本，留着会被
+  provider 拒绝；
+- 记录写入后等一次 `sessions.flush`；宿主重启/重新打开会话时，投影仍在注册表里，所以补丁还在；
+- **投影的生命周期跟着宿主进程**：热重载时复用已注册的定义（按 type 查找），不重复注册；卸载插件并重启
+  宿主后投影不存在，记录被跳过，模型与 UI 都回到原文。只卸载不重启时模型仍按投影读取。这是与
+  surface 路径的明确取舍，已写进 README；需要永久改写时仍走提示词编辑。
+
+验证：
+
+- 纯函数单测（`test/patch.test.js`）：载荷校验、块选择、单条记录多 target、跨记录叠加、retired
+  target、签名删除、畸形记录不抛错；
+- 宿主集成（`test/host.test.js`）：一次保存只多一条记录（无 turn、无 correction、无 replay）、
+  `/state` 的 mode/patches/blocks、思维链保存与二次叠加、unchanged 不写；
+- 真实校验器（`tools/verify-surface-contract.mjs`）：记录是 `ignorable` 且无 surfaceOp、surface
+  不变、无投影时原文回来、有投影时目标块改写且后续轮次/tool 结果不动、第二条记录叠加；
+- 沙箱 profile（`tools/verify-dsh-plugin.sh`）：真实启动后 `/debug` 报 `mode: patch` 且
+  `pluginRecords: true`——证明投影确实在真实宿主里注册成功，而不是静默降级。
+
+**未验证/已知限制**：
+
+- 客户端正文覆盖采用宿主 `[data-slot="conversation.chat.node"]` + markdown 容器形状匹配（不写死
+  CSS module 哈希），匹配不到容器时不覆盖（模型上下文仍然正确）；思维链折叠时只显示注记，不强行
+  展开面板；
+- 投影注册随宿主进程存活：卸载插件后需重启宿主，记录才会被跳过、原文回来；只卸载不重启时模型仍按投影读取；
+- 宿主没有该 API 时自动退回重放；`replyMode: patch` 会直接拒绝而不是悄悄降级。

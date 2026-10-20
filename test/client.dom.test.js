@@ -75,6 +75,10 @@ class StubElement {
   }
 
   get textContent() {
+    // The browser aggregates descendants; the stub has to as well, or a
+    // container with a paragraph child looks empty to code that matches rows by
+    // their rendered text.
+    if (this.children.length > 0) return this._text + this.children.map((child) => child.textContent).join('')
     return this._text
   }
 
@@ -171,6 +175,14 @@ class StubElement {
 
   getAttribute(name) {
     return name in this.attributes ? this.attributes[name] : null
+  }
+
+  removeAttribute(name) {
+    delete this.attributes[name]
+    if (name.startsWith('data-')) {
+      const key = name.slice(5).replace(/-([a-z0-9])/g, (_match, char) => char.toUpperCase())
+      delete this.dataset[key]
+    }
   }
 
   /** Attribute presence: what a hide-attribution guard asks the DOM. */
@@ -298,6 +310,9 @@ function matchesAny(node, selector) {
 }
 
 function matches(node, selector) {
+  if (selector === '*') return true
+  const tag = /^([a-z][a-z0-9-]*)$/.exec(selector)
+  if (tag !== null) return node.tagName === tag[1].toUpperCase()
   // `.class:not([attr])` - a class plus the absence of an attribute. The
   // fallback path uses it to tell its own pencil apart from the strip's.
   const negated = /^\.([\w-]+):not\(\[([\w-]+)\]\)$/.exec(selector)
@@ -2716,3 +2731,220 @@ test('an unchanged save keeps the message and posts the same block list', async 
   assert.equal(host.row.dataset.dshetHidden, undefined, 'and nothing was hidden, because nothing was written')
 })
 
+
+// --- in-place reply patches -------------------------------------------------
+
+function patchState(overrides = {}) {
+  return {
+    ok: true,
+    hidden: [],
+    turns: [],
+    replies: [{
+      seq: 5,
+      turn: 1,
+      messageId: 'm-a1',
+      text: 'the original answer',
+      attachments: 0,
+      patched: false,
+      blocks: [
+        { index: 0, kind: 'reasoning', text: 'the silent thought', original: 'the silent thought', patched: false },
+        { index: 1, kind: 'text', text: 'the original answer', original: 'the original answer', patched: false },
+      ],
+    }],
+    patches: [],
+    mode: 'patch',
+    config: { confirm: false },
+    ...overrides,
+  }
+}
+
+function mountAssistantRow(document, key = 'row-r') {
+  const row = mountRow(document, key)
+  const snapshot = { nodes: new Map([[key, { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }]]) }
+  return { row, snapshot }
+}
+
+test('the reply editor offers reasoning and answer blocks and switches between them', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5,
+    mode: 'reply',
+    turn: 1,
+    messageId: 'm-a1',
+    text: 'the original answer',
+    attachments: 0,
+    blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  assert.ok(box, 'the editor opens')
+  const select = walk(box).find((node) => node.tagName === 'SELECT')
+  assert.ok(select, 'a reply with several blocks gets a picker')
+  assert.deepEqual(select.children.map((option) => option.textContent), ['思维链', '正文'])
+  assert.equal(select.value, '1', 'the answer is the default block')
+  let area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, 'the original answer')
+
+  select.value = '0'
+  select.fire('change')
+  render(harness, controller, snapshot)
+  area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, 'the silent thought', 'switching loads that block, not the reply text')
+  assert.equal(controller.getSnapshot().blockIndex, 0)
+  assert.equal(controller.getSnapshot().blockKind, 'reasoning')
+
+  // Pressing the same pencil again must not silently jump back to the answer
+  // block and leave the reasoning draft targeting it.
+  controller.open({
+    seq: 5,
+    mode: 'reply',
+    turn: 1,
+    messageId: 'm-a1',
+    text: 'the original answer',
+    attachments: 0,
+    blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  assert.equal(controller.getSnapshot().blockIndex, 0, 'the chosen block survives a re-open')
+  assert.equal(controller.getSnapshot().draft, 'the silent thought')
+})
+
+test('saving a reply block posts the block target, not a whole-message replacement', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  const calls = []
+  let applied = false
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init })
+    if (String(url).includes('/apply')) {
+      applied = true
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          kind: 'reply',
+          mode: 'patch',
+          applied: true,
+          shadowed: [],
+          recordSeq: 12,
+          target: { seq: 5, blockIndex: 1, kind: 'text', text: 'patched answer', original: 'the original answer' },
+        }),
+      }
+    }
+    if (applied) {
+      const blocks = patchState().replies[0].blocks.map((block) =>
+        block.index === 1 ? { ...block, text: 'patched answer', patched: true } : block)
+      return {
+        ok: true,
+        status: 200,
+        json: async () => patchState({
+          patches: [{ seq: 5, blockIndex: 1, kind: 'text', text: 'patched answer' }],
+          replies: [{ ...patchState().replies[0], blocks, text: 'patched answer', patched: true }],
+        }),
+      }
+    }
+    return { ok: true, status: 200, json: async () => patchState() }
+  }
+  await controller.load(true)
+  controller.open({
+    seq: 5,
+    mode: 'reply',
+    turn: 1,
+    messageId: 'm-a1',
+    text: 'the original answer',
+    attachments: 0,
+    blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  controller.setDraft('patched answer')
+  await controller.confirm()
+
+  const applies = calls.filter((call) => String(call.url).includes('/apply'))
+  assert.equal(applies.length, 1)
+  const body = JSON.parse(applies[0].init.body)
+  assert.equal(body.seq, 5)
+  assert.equal(body.blockIndex, 1)
+  assert.equal(body.kind, 'text')
+  assert.equal(body.text, 'patched answer')
+  assert.equal(body.parts, undefined, 'a reply patch is not a prompt carrier')
+  assert.equal(controller.getSnapshot().patches.length, 1)
+  assert.equal(controller.getSnapshot().patches[0].text, 'patched answer')
+  const reply = controller.getSnapshot().replies.get(5)
+  assert.equal(reply.blocks[1].text, 'patched answer')
+  assert.equal(reply.patched, true)
+})
+
+test('a landed text patch is drawn in place over the recorded reply text', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const body = harness.document.createElement('div')
+  const paragraph = harness.document.createElement('p')
+  paragraph.textContent = 'the original answer'
+  body.appendChild(paragraph)
+  node.appendChild(body)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      patches: [{ seq: 5, blockIndex: 1, kind: 'text', text: 'patched answer' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(body.textContent, 'patched answer', 'the reader sees the projected text')
+  assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
+
+  // The patch is gone (a prompt rollback, or the plugin was disabled): the
+  // host's recorded text is what the row must show again.
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(body.getAttribute('data-dshet-patch'), null)
+  assert.equal(body.textContent, 'the original answer')
+})
+
+test('a patched reasoning block gets a note the model-visible text lives in', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const paragraph = harness.document.createElement('p')
+  paragraph.textContent = 'the original answer'
+  node.appendChild(paragraph)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      patches: [{ seq: 5, blockIndex: 0, kind: 'reasoning', text: 'the rewritten thought' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  const note = harness.document.body.querySelector('.dshet-patch-note')
+  assert.ok(note, 'the reasoning patch is surfaced under the reply')
+  const summary = walk(note).find((entry) => entry.tagName === 'SUMMARY')
+  assert.equal(summary.textContent, '思维链已改写（模型可见）')
+  const body = walk(note).find((entry) => entry.tagName === 'PRE')
+  assert.equal(body.textContent, 'the rewritten thought')
+})
