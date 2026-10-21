@@ -874,6 +874,33 @@ test('a reasoning block is editable and the answer beside it is untouched', asyn
   }
 })
 
+test('one all-blocks save writes a single record with every edited target', async () => {
+  const session = Session.create(SESSION_ID)
+  buildReasoningLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [
+        { seq: assistant.seq, blockIndex: 0, kind: 'reasoning', text: 'NEW THOUGHT' },
+        { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'NEW ANSWER' },
+      ],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true)
+    assert.equal(res.json.targets.length, 2, 'both blocks travel in the answer')
+    assert.equal(h.session.snapshotEvents().filter((event) => event.type === PATCH_TYPE).length, 1, 'one record, not two')
+
+    const patched = Session.create('session-55555555-5555-4555-8555-555555555555', h.session.snapshotEvents(), undefined, 0, h.projections)
+    const target = patched.deriveMessages().find((message) => message.content.some((block) => block.type === 'thinking'))
+    assert.equal(target.content[0].text, 'NEW THOUGHT')
+    assert.equal(target.content[1].text, 'NEW ANSWER')
+  } finally {
+    await h.close()
+  }
+})
+
 test('a live reload reuses the already registered projection instead of falling back', async () => {
   const h = await harness({ patch: true, existingProjection: true })
   try {
@@ -895,6 +922,54 @@ test('/state publishes only patches whose target is still on the surface', async
     const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
     assert.equal(state.status, 200, state.payload)
     assert.deepEqual(state.json.patches, [], 'a retired target is not a live patch')
+  } finally {
+    await h.close()
+  }
+})
+
+test('/state publishes the editor style and defaults it to frame', async () => {
+  const chosen = await harness({ config: { editorStyle: 'bubble' } })
+  try {
+    const state = await raw(chosen.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.status, 200, state.payload)
+    assert.equal(state.json.config.editorStyle, 'bubble')
+  } finally {
+    await chosen.close()
+  }
+  const fallback = await harness({})
+  try {
+    const state = await raw(fallback.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    assert.equal(state.json.config.editorStyle, 'frame')
+  } finally {
+    await fallback.close()
+  }
+})
+
+test('the answer picker lists every step reasoning of the same turn', async () => {
+  const session = Session.create(SESSION_ID)
+  session.append('turn/start', { turn: 1 })
+  session.append('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } }, { surfaceOp: 'append' })
+  session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'Q' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('assistant/message', { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'thinking', text: 'STEP ONE THOUGHT' }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('step/start', { turn: 1, step: 2 })
+  session.append('assistant/message', { turn: 1, step: 2, message: { id: 'a2', role: 'assistant', content: [{ type: 'thinking', text: 'STEP TWO THOUGHT' }, { type: 'text', text: 'FINAL ANSWER' }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 2 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+  const h = await harness({ session, patch: true })
+  try {
+    const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
+    const replies = state.json.replies
+    const answer = replies.find((reply) => Array.isArray(reply.blocks) && reply.blocks.some((block) => block.kind === 'text'))
+    assert.ok(answer, 'the answer row is offered')
+    assert.deepEqual(
+      answer.blocks.map((block) => [block.kind, block.text]),
+      [['reasoning', 'STEP ONE THOUGHT'], ['reasoning', 'STEP TWO THOUGHT'], ['text', 'FINAL ANSWER']],
+      'every reasoning block of the turn is listed, in order, before the answer',
+    )
+    assert.equal(new Set(answer.blocks.map((block) => block.seq)).size, 2, 'the blocks name the two messages they live in')
   } finally {
     await h.close()
   }

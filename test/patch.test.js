@@ -45,6 +45,29 @@ test('editableBlocks lists text and reasoning in message order', () => {
   assert.equal(kindOfBlock({ type: 'thinking', text: '' }), 'reasoning')
 })
 
+test('every text and reasoning block is editable, whatever field carries it', () => {
+  const blocks = editableBlocks({
+    content: [
+      { type: 'reasoning', reasoning: 'R1' },
+      { type: 'text', text: 'T1' },
+      { type: 'thinking', thinking: 'R2' },
+      { type: 'text', text: 'T2' },
+      { type: 'tool-call', id: 'c1' },
+    ],
+  })
+  assert.deepEqual(blocks, [
+    { index: 0, kind: 'reasoning', text: 'R1' },
+    { index: 1, kind: 'text', text: 'T1' },
+    { index: 2, kind: 'reasoning', text: 'R2' },
+    { index: 3, kind: 'text', text: 'T2' },
+  ])
+  const patched = applyTargetsToMessage(
+    { content: [{ type: 'reasoning', reasoning: 'OLD' }] },
+    [{ seq: 1, blockIndex: 0, kind: 'reasoning', text: 'NEW' }],
+  )
+  assert.equal(patched.content[0].reasoning, 'NEW', 'the field the block used is the field that is rewritten')
+})
+
 test('buildPatchData validates shape, bounds and kind', () => {
   const data = buildPatchData([{ seq: 4, blockIndex: 1, kind: 'text', text: 'NEW' }])
   assert.deepEqual(data, { version: 1, targets: [{ seq: 4, blockIndex: 1, kind: 'text', text: 'NEW' }] })

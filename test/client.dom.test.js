@@ -716,90 +716,102 @@ test('Enter acts, Shift+Enter breaks the line, Escape leaves', async () => {
   assert.equal(editorIn(harness), null, 'Escape again closes the editor')
 })
 
-test('the editor box grows with its text instead of leaving an empty half', async () => {
+test('an in-place editor keeps the bubble height and lets the textarea scroll', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   byClass(row, 'dshet-action')[0].fire('pointerdown')
   render(harness, controller, snapshot)
   const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
-  // A real browser measures the content; the stub reports one from a set height.
   area.scrollHeight = 120
   area.fire('input')
-  assert.equal(area.style.height, '122px', 'the measured height is applied')
+  assert.equal(area.style.height, '120px', 'the textarea hugs its content')
+  const promptFooter = byClass(editorIn(harness), 'dshet-footer')[0]
+  assert.equal(promptFooter.children[promptFooter.children.length - 1].className, 'dshet-footer-actions', 'the user side puts the function keys on the right')
 })
 
-test('a row near the bottom flips the editor above it so the buttons stay reachable', async () => {
-  const { harness, controller, snapshot, row } = await readyController()
-  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
-  try {
-    globalThis.window.innerHeight = 200
-    globalThis.window.innerWidth = 180
-    row.rect = { x: 10, y: 150, left: 10, top: 150, right: 210, bottom: 180, width: 200, height: 30 }
-    byClass(row, 'dshet-action')[0].rect = { x: 150, y: 150, left: 150, top: 150, right: 178, bottom: 178, width: 28, height: 28 }
-    byClass(row, 'dshet-action')[0].fire('pointerdown')
-    render(harness, controller, snapshot)
-    const box = editorIn(harness)
-    const top = Number.parseInt(box.style.top, 10)
-    const height = box.getBoundingClientRect().height
-    assert.ok(top >= 8, `top ${top} keeps the box on screen`)
-    assert.ok(top + height <= 200, `top ${top} + ${height} fits above the fold`)
-    assert.ok(top < row.rect.bottom, 'the box is above the row, not below it')
-    assert.equal(box.style.width, '164px', 'the width is clamped to the viewport')
-    assert.equal(box.style.left, '8px', 'the left edge is clamped too')
-  } finally {
-    if (previous.height === undefined) delete globalThis.window.innerHeight
-    else globalThis.window.innerHeight = previous.height
-    if (previous.width === undefined) delete globalThis.window.innerWidth
-    else globalThis.window.innerWidth = previous.width
-  }
-})
-
-test('a row taller than the viewport pins the editor to the bottom, with its own scrollbar', async () => {
-  const { harness, controller, snapshot, row } = await readyController()
-  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
-  try {
-    globalThis.window.innerHeight = 200
-    globalThis.window.innerWidth = 220
-    row.rect = { x: 0, y: -100, left: 0, top: -100, right: 200, bottom: 400, width: 200, height: 500 }
-    byClass(row, 'dshet-action')[0].rect = { x: 0, y: 400, left: 0, top: 400, right: 28, bottom: 428, width: 28, height: 28 }
-    byClass(row, 'dshet-action')[0].fire('pointerdown')
-    render(harness, controller, snapshot)
-    const box = editorIn(harness)
-    const top = Number.parseInt(box.style.top, 10)
-    const height = box.getBoundingClientRect().height
-    assert.equal(top, 200 - height - 8, 'the box is pinned to the bottom of the viewport')
-    const css = walk(harness.document.head).filter((node) => node.tagName === 'STYLE').map((node) => node.textContent).join('')
-    assert.match(css, /max-height:calc\(100vh - 16px\)/, 'the editor caps its own height')
-    assert.match(css, /\.dshet-footer\{position:sticky/, 'the footer stays visible while the box scrolls')
-  } finally {
-    if (previous.height === undefined) delete globalThis.window.innerHeight
-    else globalThis.window.innerHeight = previous.height
-    if (previous.width === undefined) delete globalThis.window.innerWidth
-    else globalThis.window.innerWidth = previous.width
-  }
-})
-
-test('a row scrolled above the viewport clamps the editor into view', async () => {
+test('the center style renders a centred panel with an auto-growing textarea', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
   try {
     globalThis.window.innerHeight = 700
     globalThis.window.innerWidth = 1000
-    row.rect = { x: 0, y: -1400, left: 0, top: -1400, right: 800, bottom: -1091, width: 800, height: 309 }
-    byClass(row, 'dshet-action')[0].rect = { x: 0, y: -1400, left: 0, top: -1400, right: 28, bottom: -1372, width: 28, height: 28 }
+    controller.editorStyle = 'center'
     byClass(row, 'dshet-action')[0].fire('pointerdown')
     render(harness, controller, snapshot)
     const box = editorIn(harness)
-    box.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 405, width: 800, height: 405 }
-    // A later placement pass sees the grown box and must keep it on screen.
-    harness.document.fireDocument('scroll', {})
-    const top = Number.parseInt(box.style.top, 10)
-    assert.ok(top >= 8 && top + 405 <= 700, `top ${top} keeps the grown box inside the viewport`)
+    assert.equal(box.style.width, '984px', 'the panel takes the viewport width')
+    assert.equal(box.style.left, '8px', 'and is centred')
+    assert.equal(box.dataset.dshetInplace, undefined, 'center is not an in-place box')
+    const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+    area.scrollHeight = 120
+    area.fire('input')
+    assert.equal(area.style.height, '122px', 'the textarea grows with its content')
+    const footer = byClass(box, 'dshet-footer')[0]
+    assert.equal(footer.style.position, 'static', 'the controls get a flow row, not an overlay')
   } finally {
     if (previous.height === undefined) delete globalThis.window.innerHeight
     else globalThis.window.innerHeight = previous.height
     if (previous.width === undefined) delete globalThis.window.innerWidth
     else globalThis.window.innerWidth = previous.width
   }
+})
+
+test('a window resize re-places the editor instead of keeping the old geometry', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
+  try {
+    globalThis.window.innerHeight = 700
+    globalThis.window.innerWidth = 1000
+    controller.editorStyle = 'center'
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    render(harness, controller, snapshot)
+    assert.equal(editorIn(harness).style.width, '984px', 'the panel starts at the first viewport width')
+
+    globalThis.window.innerWidth = 700
+    harness.document.fireDocument('scroll')
+    assert.equal(editorIn(harness).style.width, '684px', 'a resize re-measures the viewport, not only the row')
+  } finally {
+    if (previous.height === undefined) delete globalThis.window.innerHeight
+    else globalThis.window.innerHeight = previous.height
+    if (previous.width === undefined) delete globalThis.window.innerWidth
+    else globalThis.window.innerWidth = previous.width
+  }
+})
+
+test('the bubble style is exactly the message block', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  const previous = { height: globalThis.window.innerHeight, width: globalThis.window.innerWidth }
+  try {
+    globalThis.window.innerHeight = 700
+    globalThis.window.innerWidth = 1000
+    controller.editorStyle = 'bubble'
+    const bubble = harness.document.createElement('div')
+    bubble.className = 'fake_bubble'
+    bubble.rect = { x: 557, y: 420, left: 557, top: 420, right: 865, bottom: 463, width: 308, height: 43 }
+    row.appendChild(bubble)
+    byClass(row, 'dshet-action')[0].fire('pointerdown')
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    assert.equal(box.style.width, '308px', 'bubble width')
+    assert.equal(box.style.left, '557px', 'bubble left')
+    assert.equal(box.style.top, '420px', 'bubble top')
+    assert.equal(box.style.height, '150px', 'minimum height for the buttons')
+    const frame = walk(box).find((node) => node.className === 'dshet-frame')
+    assert.equal(frame.style.display, 'none', 'the row frame is off in bubble mode')
+    const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+    assert.match(String(area.style.background), /dshet-panel|rgb|#/, 'the textarea is opaque so the original text cannot show through')
+  } finally {
+    if (previous.height === undefined) delete globalThis.window.innerHeight
+    else globalThis.window.innerHeight = previous.height
+    if (previous.width === undefined) delete globalThis.window.innerWidth
+    else globalThis.window.innerWidth = previous.width
+  }
+})
+
+test('the editor does not embed the style switcher; the settings page owns it', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+  assert.equal(byClass(editorIn(harness), 'dshet-style').length, 0, 'no style picker inside the dialog')
 })
 
 test('a rebuilt editor never steals focus from what the user is typing in', async () => {
@@ -2749,6 +2761,37 @@ test('a file the user picks becomes a chip and travels with the save', async () 
 })
 
 
+test('pasting a screenshot or dropping files joins the same chip list', async () => {
+  const harness = await loadBundle()
+  const snapshot = simpleRow(harness)
+  const box = await openEditor(harness, snapshot)
+  globalThis.FileReader = class {
+    readAsDataURL() {
+      this.result = 'data:image/png;base64,UERG'
+      this.onload()
+    }
+  }
+  try {
+    const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+    area.fire('paste', { clipboardData: { files: [{ name: 'paste.png', type: 'image/png', size: 4 }] } })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, harness.controller, snapshot)
+    const pasted = editorIn(harness)
+    assert.deepEqual(chipLabels(pasted), ['shot.png', 'notes.pdf', 'quote-card', 'paste.png'],
+      'a pasted screenshot becomes a chip')
+
+    pasted.fire('drop', { dataTransfer: { files: [{ name: 'drop.pdf', type: 'application/pdf', size: 3 }] } })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    render(harness, harness.controller, snapshot)
+    const dropped = editorIn(harness)
+    assert.deepEqual(chipLabels(dropped), ['shot.png', 'notes.pdf', 'quote-card', 'paste.png', 'drop.pdf'],
+      'a dropped file joins too')
+    assert.equal(dropped.dataset.dshetDrop, undefined, 'the drop highlight is cleared')
+  } finally {
+    delete globalThis.FileReader
+  }
+})
+
 test('a chip draws its thumbnail from the attachment route, and gives up when it cannot', async () => {
   const harness = await loadBundle()
   harness.stateOptions = { blocks: [{ ...BLOCKS[0], preview: true }, BLOCKS[1]] }
@@ -2839,6 +2882,323 @@ function mountAssistantRow(document, key = 'row-r') {
   return { row, snapshot }
 }
 
+test('every fixed placement stays between the conversation top and the composer', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  const conversation = harness.document.createElement('div')
+  conversation.setAttribute('data-slot', 'main.conversation')
+  conversation.rect = { x: 0, y: 60, left: 0, top: 60, right: 800, bottom: 900, width: 800, height: 840 }
+  harness.document.body.appendChild(conversation)
+  const composer = harness.document.createElement('div')
+  composer.className = 'composerSeat'
+  composer.rect = { x: 0, y: 500, left: 0, top: 500, right: 800, bottom: 560, width: 800, height: 60 }
+  harness.document.body.appendChild(composer)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  const box = editorIn(harness)
+  const top = Number.parseInt(box.style.top, 10)
+  const height = Number.parseInt(box.style.height, 10)
+  assert.equal(top, 68, 'not above the conversation top plus the margin')
+  assert.ok(top + height <= 492, `the bottom (${top + height}) never passes the composer top`)
+})
+
+test('the inline placement uses page coordinates and skips the viewport height cap', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  const previous = globalThis.localStorage
+  globalThis.localStorage = {
+    getItem(key) { return key === 'dsh-edit-turn/editorPlacement' ? 'inline' : null },
+    setItem() {},
+  }
+  try {
+    controller.open({
+      seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+      text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+    })
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    assert.equal(box.style.height, '1284px', 'the editor grows with the block plus the control band')
+    assert.equal(harness.document.querySelector('.dshet-layer').dataset.dshetInline, '1',
+      'the layer switches to page coordinates')
+  } finally {
+    if (previous === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = previous
+  }
+})
+
+test('the legacy placement frames the whole row and still hugs the content', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 180, y: 100, left: 180, top: 100, right: 980, bottom: 700, width: 800, height: 600 }
+  const body = harness.document.createElement('div')
+  body.className = 'fake_markdown'
+  body.rect = { x: 200, y: 150, left: 200, top: 150, right: 900, bottom: 450, width: 700, height: 300 }
+  row.appendChild(body)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  const previous = globalThis.localStorage
+  globalThis.localStorage = { getItem(key) { return key === 'dsh-edit-turn/editorPlacement' ? 'legacy' : null }, setItem() {} }
+  try {
+    controller.open({
+      seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+      text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+    })
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    assert.equal(box.style.width, '800px', 'the legacy frame is the whole row width')
+    assert.equal(box.style.height, '696px', 'the content plus the header offset and control band')
+    const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+    assert.equal(area.style.height, '600px', 'the textarea is the content height')
+    const footer = byClass(box, 'dshet-footer')[0]
+    assert.ok(footer, 'the controls are inside the covered band')
+  } finally {
+    if (previous === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = previous
+  }
+})
+
+test('a reply edit frames the selected block, not the whole assistant row', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 180, y: 100, left: 180, top: 100, right: 980, bottom: 700, width: 800, height: 600 }
+  const body = harness.document.createElement('div')
+  body.className = 'fake_markdown'
+  body.rect = { x: 200, y: 150, left: 200, top: 150, right: 900, bottom: 450, width: 700, height: 300 }
+  row.appendChild(body)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5,
+    mode: 'reply',
+    turn: 1,
+    messageId: 'm-a1',
+    text: 'the original answer',
+    attachments: 0,
+    blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  const box = editorIn(harness)
+  assert.equal(box.style.width, '800px', 'the frame widens to the conversation row')
+  assert.equal(box.style.left, '200px', 'at the block position')
+  assert.equal(box.style.top, '150px', 'at the block top')
+  assert.equal(box.style.height, '384px', 'the box ends right after the block plus the control band')
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.style.top, '38px', 'the text starts right under the top edge')
+  assert.equal(area.style.height, '300px', 'the textarea is exactly the content height')
+})
+
+test('the all-blocks page fills the whole conversation band, touching both edges', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 300, left: 0, top: 300, right: 800, bottom: 1500, width: 800, height: 1200 }
+  const conversation = harness.document.createElement('div')
+  conversation.setAttribute('data-slot', 'main.conversation')
+  conversation.rect = { x: 0, y: 60, left: 0, top: 60, right: 800, bottom: 900, width: 800, height: 840 }
+  harness.document.body.appendChild(conversation)
+  const composer = harness.document.createElement('div')
+  composer.className = 'composerSeat'
+  composer.rect = { x: 120, y: 500, left: 120, top: 500, right: 720, bottom: 560, width: 600, height: 60 }
+  harness.document.body.appendChild(composer)
+  const blocks = [
+    { seq: 41, index: 0, kind: 'reasoning', text: 'thought', original: 'thought', patched: false },
+    { seq: 41, index: 1, kind: 'text', text: 'answer', original: 'answer', patched: false },
+  ]
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/state')) {
+      return { ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'answer', blocks }] }) }
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  }
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'answer', attachments: 0, blocks })
+  render(harness, controller, snapshot)
+  const select = walk(editorIn(harness)).find((node) => node.tagName === 'SELECT')
+  select.value = 'all'
+  select.fire('change')
+  render(harness, controller, snapshot)
+  const box = editorIn(harness)
+  assert.equal(Number.parseInt(box.style.top, 10), 68, 'the top touches the conversation edge')
+  assert.equal(Number.parseInt(box.style.height, 10), 424, 'the bottom touches the composer edge')
+  assert.equal(Number.parseInt(box.style.left, 10), 120, 'the left edge lines up with the composer card')
+  assert.equal(Number.parseInt(box.style.width, 10), 600, 'and so does the width')
+  const allBox = byClass(box, 'dshet-all')[0]
+  assert.equal(allBox.style.overflowY, 'auto', 'and the one scrollbar lives on the container')
+})
+
+test('the all-blocks view lists every block and saves them in one request', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  const blocks = [
+    { seq: 41, index: 0, kind: 'reasoning', text: 'thought text', original: 'thought text', patched: false },
+    { seq: 41, index: 1, kind: 'text', text: 'answer text', original: 'answer text', patched: false },
+  ]
+  const requests = []
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: String(url), body: options && options.body ? String(options.body) : '' })
+    if (String(url).includes('/state')) {
+      return { ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'answer text', blocks }] }) }
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, applied: true, mode: 'patch', patch: true, recordSeq: 9, shadowed: [], targets: [] }) }
+  }
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'answer text', attachments: 0, blocks })
+  render(harness, controller, snapshot)
+  const select = walk(editorIn(harness)).find((node) => node.tagName === 'SELECT')
+  assert.deepEqual(select.children.map((option) => option.textContent), ['思维链', '正文', '全部'], 'the all-blocks entry is selectable from the start')
+  select.value = 'all'
+  select.fire('change')
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  const allBox = byClass(box, 'dshet-all')[0]
+  assert.ok(allBox, 'the all-blocks container is drawn')
+  const areas = walk(allBox).filter((node) => node.className === 'dshet-all-area')
+  assert.deepEqual(areas.map((area) => area.value), ['thought text', 'answer text'], 'every block has its own textarea')
+  assert.equal(byClass(allBox, 'dshet-all-line').length, 2, 'each block carries a light divider')
+  assert.equal(allBox.style.overflowY, 'auto', 'one scrollbar owns the whole page')
+  assert.equal(allBox.style.top, '6px', 'no 38px header band is wasted above the outline')
+  const nav = byClass(allBox, 'dshet-all-nav')[0]
+  assert.ok(nav, 'a sticky outline rides along with the scroll')
+  assert.deepEqual(walk(nav).filter((node) => node.tagName === 'BUTTON').map((button) => button.textContent), ['思维链', '正文'])
+  assert.deepEqual(areas.map((area) => area.style.overflow), ['hidden', 'hidden'], 'the block textareas never scroll themselves')
+  assert.deepEqual(areas.map((area) => area.style.position), ['static', 'static'], 'they stay in the flow under their label, not absolutely over it')
+
+  areas[1].value = 'answer edited'
+  areas[1].fire('input')
+  const save = byClass(box, 'dshet-btn').find((button) => button.textContent === '保存')
+  save.fire('pointerdown')
+  for (let attempt = 0; attempt < 10 && !requests.some((call) => call.url.includes('/apply')); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  const apply = requests.find((call) => call.url.includes('/apply'))
+  const body = JSON.parse(apply.body)
+  assert.deepEqual(body.targets, [{ seq: 41, blockIndex: 1, kind: 'text', text: 'answer edited' }],
+    'only the edited block travels, named by its own message')
+})
+
+test('turn-max height keeps the frame still while switching blocks, content mode follows it', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  const blocks = [
+    { seq: 41, index: 0, kind: 'reasoning', text: 'x'.repeat(100), original: 'x'.repeat(100), patched: false },
+    { seq: 41, index: 1, kind: 'text', text: 'short', original: 'short', patched: false },
+  ]
+  const create = harness.document.createElement.bind(harness.document)
+  harness.document.createElement = (tag) => {
+    const element = create(tag)
+    if (tag === 'textarea') {
+      Object.defineProperty(element, 'scrollHeight', {
+        configurable: true,
+        get() { return String(this.value ?? '').length * 2 + 20 },
+      })
+    }
+    return element
+  }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'short', blocks }] }) })
+  await controller.load(true)
+  try {
+    controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'short', attachments: 0, blocks })
+    render(harness, controller, snapshot)
+    let box = editorIn(harness)
+    assert.equal(box.style.height, '304px', 'the tallest block of the turn sets the box height')
+    const select = walk(box).find((node) => node.tagName === 'SELECT')
+    select.value = '41:0'
+    select.fire('change')
+    render(harness, controller, snapshot)
+    box = editorIn(harness)
+    assert.equal(box.style.height, '304px', 'switching to the long thought does not resize the box')
+
+    const previous = globalThis.localStorage
+    globalThis.localStorage = { getItem(key) { return key === 'dsh-edit-turn/editorHeight' ? 'content' : null }, setItem() {} }
+    try {
+      select.fire('change')
+      render(harness, controller, snapshot)
+      const short = editorIn(harness)
+      const shortSelect = walk(short).find((node) => node.tagName === 'SELECT')
+      shortSelect.value = '41:1'
+      shortSelect.fire('change')
+      render(harness, controller, snapshot)
+      assert.equal(editorIn(harness).style.height, '150px', 'content mode falls back to the current block')
+    } finally {
+      if (previous === undefined) delete globalThis.localStorage
+      else globalThis.localStorage = previous
+    }
+  } finally {
+    harness.document.createElement = create
+  }
+})
+
+test('several reasoning and text blocks are all listed and numbered', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  const blocks = [
+    { seq: 41, index: 0, kind: 'reasoning', text: 'think one', original: 'think one', patched: false },
+    { seq: 41, index: 1, kind: 'text', text: 'answer one', original: 'answer one', patched: false },
+    { seq: 42, index: 2, kind: 'reasoning', text: 'think two', original: 'think two', patched: false },
+    { seq: 42, index: 3, kind: 'text', text: 'answer two', original: 'answer two', patched: false },
+  ]
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'answer one', blocks }] }) })
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'answer one', attachments: 0, blocks })
+  render(harness, controller, snapshot)
+  assert.equal(controller.getSnapshot().blockKind, 'text', 'a fresh open lands on the answer text, not a thought')
+  assert.equal(controller.getSnapshot().targetSeq, 42, 'on the answer message of the turn')
+  const select = walk(editorIn(harness)).find((node) => node.tagName === 'SELECT')
+  assert.deepEqual(select.children.map((option) => option.textContent), ['思维链 1', '正文 1', '思维链 2', '正文 2', '全部'])
+  assert.deepEqual(select.children.map((option) => option.value), ['41:0', '41:1', '42:2', '42:3', 'all'], 'each option names its own message and block, plus the all view')
+  select.value = '42:2'
+  select.fire('change')
+  assert.equal(controller.getSnapshot().blockKind, 'reasoning')
+  assert.equal(controller.getSnapshot().targetSeq, 42, 'the selected block keeps the message it lives in')
+})
+
+test('a single-block reply still shows the block picker in the control band', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      replies: [{
+        ...patchState().replies[0],
+        text: 'only text',
+        blocks: [{ index: 0, kind: 'text', text: 'only text', original: 'only text', patched: false }],
+      }],
+    }),
+  })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'only text', attachments: 0,
+    blocks: [{ index: 0, kind: 'text', text: 'only text', original: 'only text', patched: false }],
+  })
+  render(harness, controller, snapshot)
+  const box = editorIn(harness)
+  const picker = byClass(box, 'dshet-pick')[0]
+  assert.ok(picker, 'the picker is there even with one block')
+  assert.equal(picker.parentElement.className, 'dshet-footer', 'inside the control band')
+  const select = walk(picker).find((node) => node.tagName === 'SELECT')
+  assert.deepEqual(select.children.map((option) => option.textContent), ['正文'])
+})
+
 test('the reply editor offers reasoning and answer blocks and switches between them', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
@@ -2860,7 +3220,17 @@ test('the reply editor offers reasoning and answer blocks and switches between t
   assert.ok(box, 'the editor opens')
   const select = walk(box).find((node) => node.tagName === 'SELECT')
   assert.ok(select, 'a reply with several blocks gets a picker')
-  assert.deepEqual(select.children.map((option) => option.textContent), ['思维链', '正文'])
+  assert.equal(box.style.height, '150px', 'the picker no longer takes a top row')
+  let pickerArea = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(pickerArea.style.top, '38px', 'the text starts right under the top edge')
+  const pickerWrap = select.parentElement
+  assert.equal(pickerWrap.className, 'dshet-pick', 'the picker keeps its wrapper')
+  assert.equal(pickerWrap.parentElement.className, 'dshet-footer', 'the picker moved into the control band')
+  assert.equal(pickerWrap.style.marginLeft, 'auto', 'and is pushed to its far right')
+  const replyFooter = pickerWrap.parentElement
+  assert.equal(replyFooter.children[0].className, 'dshet-footer-actions', 'the model side puts its keys on the left')
+  assert.equal(replyFooter.children[replyFooter.children.length - 1], pickerWrap, 'with the picker on the right')
+  assert.deepEqual(select.children.map((option) => option.textContent), ['思维链', '正文', '全部'])
   assert.equal(select.value, '1', 'the answer is the default block')
   let area = walk(box).find((node) => node.tagName === 'TEXTAREA')
   assert.equal(area.value, 'the original answer')

@@ -74,12 +74,16 @@ dsh plugin --profile web add /path/to/dsh-edit-turn
   config:
     confirm: false              # 默认 false：一次点击即执行；置 true 才要求二次确认
     replyMode: auto             # auto | patch | replay
+    editorStyle: frame          # frame | bubble | center
 ```
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `confirm` | `false` | 客户端保存后是否先要求一次确认。默认**关闭**（一次点击即执行：编辑器本身已是用户主动打开的动作；设为 `true` 时确认步里会写明这次保存会丢弃什么）； |
 | `replyMode` | `auto` | 回复编辑怎么落地。`auto`：宿主有 plugin record + message projection 就用就地补丁，否则退回重放；`patch`：强制就地补丁，缺能力时加载/保存直接报错；`replay`：始终使用 0.2.21 的回退 + 重放路径。提示词编辑不受影响，始终走 surface-replace。 |
+| `editorHeight` | `fill` | 编辑器高度。`fill`（默认）：普通块按一轮最大，「全部」时铺满对话区到输入框之间的整段高度；`max`：一轮最大；`content`：跟着当前块走。设置页可切换。 |
+| `editorPlacement` | `overlay` | 编辑器位置。`overlay`：悬浮在视口内，按当前块取框；`inline`：按页面坐标铺在消息上、跟随页面滚动，高度按内容展开；`legacy`：整行旧版，套整条 assistant 行。**浮层 / 整行旧版 / 居中默认夹紧在对话区内**：上不越过对话区顶部、下不压到输入框，长内容框内滚动；`inline` 保持页面坐标与页面滚动，不夹。 |
+| `editorStyle` | `frame` | 编辑器外观。`frame`：一圈描边套住整条消息行，正文输入框落在消息文字上、按钮在右上角（参考图）；`bubble`：编辑框精确等于消息气泡的 rect；`center`：居中大面板。插件页 `/#/panel/plugins/dsh-edit-turn/dsh-edit-turn` 现在有「编辑器样式」下拉（和 dsh-delete-turn 同一套 `plugins.row.config` 槽位），选择会记住；编辑器对话框里不再放样式下拉，样式只从这里设置。 |
 
 ### 工作原理
 
@@ -164,7 +168,7 @@ ctx.sessions.registerMessageProjection({
 | 运行中的实例是否真的挂载了本插件（只读路由守卫探针，无需 token） | `npm run probe:loaded [端口]` | 通过：`/state` 返 400、`/apply` 返 405 —— 这两个状态码只有本插件会返回 |
 | 浏览器半部到底问了什么、拿回了什么（只读诊断，含失败记录） | `GET /dsh-edit-turn/debug` | 通过：真实浏览器里确认客户端确实拿到 replies；并复现了旧 v3 会话的 session-not-found |
 | 官方 append **与读取**契约（真实校验器，进程内） | `npm run verify:contract` | 96 项通过（每段写入后都用加载器重读整份日志）：替换事件被接受、派生历史真的收缩、日志 append-only、工具结果与调用同进同退、空 developer 载体不产生模型消息、**连续两次回退都被接受**、**编辑模型回答的完整机制被接受**、**回复编辑后的尾部重放（后续提问/回答/tool 调用与结果按新 turn 号回到修正回答之后，顺序正确、日志仍可加载）**、**跨插件依赖的不变量（单节点窗口 / 同事件类型 / 全窗口 sourceEventSeqs / 每个替换都带 `editedBy` 标记 / 改写后的 `source.kind` 不是 `user` / 修正回复不带 `sourceEventSeqs`）**，以及**就地补丁：一条 ignorable 记录、surface 不变、去掉投影后原文回来、后续轮次与 tool 结果不动、第二条记录可叠加** |
-| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 213 项通过（含回复编辑的尾部重放用例：窗口/重放区间、新 turn 号与新 messageId、tool 调用与结果成对重映射、上一轮修正可再次编辑，以及与 `dsh-rerun-turn` builder 的逐字段对照；另含「文本没变 → 不写」的四条，以及块随消息一起改的 35 条：未动的块逐字节保留、删块少一块、文字位置不变、no-op 语义升级、附件服务缺失时降级且不写坏数据、自定义 `quote-card` 块的通用性、录用与拒绝、`/state` 的块描述与能力、附件字节路由、编辑器芯片/删除/添加/缩略图/降级警告） |
+| 纯逻辑 + 宿主集成 + 客户端 DOM 行为（真 HTTP、真校验器、桩服务、DOM 桩） | `npm test` | 227 项通过（含回复编辑的尾部重放用例：窗口/重放区间、新 turn 号与新 messageId、tool 调用与结果成对重映射、上一轮修正可再次编辑，以及与 `dsh-rerun-turn` builder 的逐字段对照；另含「文本没变 → 不写」的四条，以及块随消息一起改的 35 条：未动的块逐字节保留、删块少一块、文字位置不变、no-op 语义升级、附件服务缺失时降级且不写坏数据、自定义 `quote-card` 块的通用性、录用与拒绝、`/state` 的块描述与能力、附件字节路由、编辑器芯片/删除/添加/缩略图/降级警告） |
 | 客户端半部静态检查（注册、i18n 完整性、样式、皮肤可读性、版本三处同步、线协议、块契约） | `npm run verify:client` | 184 项全部通过（含 12 条块契约检查：能力上报、服务现场探测、录用是唯一建块路径、录用先于 append、**两侧都不特判块类型**、块逐字节复制、文字归位、`dropped` 上报、只在无服务时警告、芯片靠 `error` 事件自证） |
 | 实机前端产物校验（运行中的 DSH 是否在下发当前代码） | `npm run verify:live -- --token-file ~/path/to/dsh.log` | 全部通过（含**宿主节点形状锚点**） |
 | **真实浏览器渲染冒烟**（CDP 驱动已开着的标签页，只读） | `npm run verify:ui` | 全部通过：下发的字节就是刚改的字节、无槽位崩溃留下的空占位、回复铅笔在平台动作条里、被回滚的行保住动作条、**被回滚的用户行一定显示替代文本（消息不会凭空消失）**、**替代气泡一定排在时间/复制之上（顺序与正常消息一致）**、**改写后那颗铅笔一定在还活着的动作条末尾（已在原始会话、切走的会话、切回后三处现场确认）**、**回复铅笔一定排在动作条最左（复制之前，已现场确认）**、气泡上没有 `.dshet-floating` 压着文字、切走再切回入口仍在 |
@@ -249,6 +253,39 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
 ### 更新日志
+
+**0.5.0** —— 从「一个气泡的编辑器」长成「整轮可编辑 + 可导航的文档」。
+
+- **整轮所有块**：一条回答里每个 step 的 reasoning 与每个 text 都进 picker，同类自动编号（思维链 1 / 正文 1 …），每块带自己的 seq，保存时 patch 到它所在的消息。
+- **「全部」视图**：一页同时看到整轮所有块，每块一个自动增高的 textarea，上面一条轻量分割线 + 标签；顶部有 sticky 块导航（可点跳转），只有外层容器一个滚动条；宽度与 composer 卡片对齐。
+- **编辑器高度**：`fill`（默认，普通块按一轮最大；「全部」时铺满对话区顶部到输入框之间的整段高度）/ `max` / `content`，设置页可选。
+- **编辑器位置**：`overlay` / `inline` / `legacy`；除 `inline` 外默认夹紧在对话区顶部与输入框之间，识别不到时从视口底部预留 120px。
+- **输入体验**：粘贴图片/文件、拖拽文件进框，与左下角「+」进入同一 chip 列表。
+- **官方式图标**：取消 X / 重跑环形箭头 / 保存双勾，28×28、15px SVG、`#81858c`；「+」为官方 composer 同款 28×28 `#f5f6f7` 圆钮；「编辑哪一块」在底栏最右（文字仅无障碍可见）。
+- **性能**：滚动放置走 rAF 节流并跳过无变化帧；边界/高度缓存；MutationObserver 忽略插件自身层；DOM 注入改用 `useLayoutEffect` 并在按钮被 React 删除时同步补回。
+- **随窗口自适应**：`resize`/全屏切换/缩放会清缓存并重新放置；有 `ResizeObserver` 时也观察 body。
+- **宿主**：`/apply` 支持 `targets` 数组，一次保存写一条 patch 记录；`/state` 的回复块带 `seq`，reasoning 文本字段兼容 `text`/`reasoning`/`thinking`。
+- **测试**：`npm test` **228/228**、`npm run verify:contract` **96** 项、`npm run verify:client` **184** 项。
+
+
+- 编辑提示词时取**输入气泡**的宽度、左边界和位置（右对齐）；编辑回答时取**输出内容块**的宽度和位置。编辑框直接覆盖在被编辑的消息上，高度再向下吃到 row/action bar 底部并多留 48px 动作带，把官方那排复制/删除/分享按钮整条盖住。
+- **一圈描边套住整条消息行**：作者行、正文、宿主的点赞/菜单都在框内，正文输入框精确落在消息文字的位置上（输入气泡右对齐、回答内容块左对齐）。
+- **操作按钮在框内左下**：样式/取消/重跑/保存与「添加附件」排在同一行，从「+」右侧开始，底部对齐；图片 chip 在顶部，正文不再被按钮压住。**取消/重跑/保存都是官方式纯图标**：28×28、15px SVG、`stroke-width:1.2`、颜色 `#81858c`，取消 X、重跑环形箭头、保存双勾，文字只留在 aria-label / 隐藏标签里。
+- **取对行**：回答的 seq 同时被 assistant-step 行和带操作条的 turn-tail 行覆盖，之前后写的 turn-tail 把编辑框锚到了那条小操作条上，尺寸只有 120px；现在按行类型排序，assistant-step（提示词则是 user 行）优先。
+- **回复编辑按当前块取框**：正文框正文块、思维链框思维链块，textarea 填到框底，不再出现“大框小输入区+底部空白”。
+- **「全部」视图**：picker 里选「全部」后，这一轮所有思维链/正文同时铺在一页，每块一个自动增高的 textarea、上面一条轻量分割线 + 标签；**宽度与输入框卡片对齐**（从输入元素向上找第一个有圆角、有底色的 composer card，取它的 left/width；编辑框 `box-sizing:border-box`，不再超出）；**顶部有一条 sticky 块导航**（思维链 1 / 正文…，单行横向滚动、12px 胶囊，点一下滚到该块；「全部」不再预留 38px 顶部控制带，块间距也收紧到 6/8px），**只有外层容器有一个滚动条**，分割线只是视觉区分，textareas 自己不滚动（它们被就地样式强制 `position:static`，不再被 in-place 的 `textarea{position:absolute}` 规则拉去压住标签行）；保存时把改过的块合成**一条** patch 记录（`/apply` 接受 `targets`，每块带自己的 seq）。
+- **整轮的所有块都进 picker**：一轮里每个 step 的 assistant message 各自带一个 reasoning，答案行会把整轮所有 step 的 reasoning 和所有 text 都列出来，每个块带自己的 seq，保存时 patch 到它所在的那条消息；同类多块自动编号；同类多块自动编号（思维链 1、正文 1、思维链 2、正文 2）；reasoning 文本字段兼容 `text` / `reasoning` / `thinking`，按读到的字段写回。
+- **宽度放宽**：回复编辑用整条 conversation row 的宽度（不再被正文块窄框限制），textarea 同步用满；居中面板上限放宽到视口内 1400px。
+- **高度贴着最后一行**：浮层/内联/居中模式按内容高度收尾（框 = 正文内容 + 顶部偏移 + 46px 功能带），正文下面不再留空；带图片 chip 最小 190px、普通最小 150px。`legacy` 只是外框仍套整行，高度同样按实测内容收尾。
+- **功能键独占一条底栏**：footer 是 46px 高的独立带（自带背景，**不画分隔线**）；按消息方向排布——用户输入（右对齐）功能键在右、`+` 在左；模型输出（左对齐）功能键在左、picker 在右（回复只要有 block 就显示，单个「正文」也显示）；浮层/旧版 textarea 底部预留 64px，居中模式 footer 直接参与文档流（`position:static`），不再浮在文字上。
+- **随窗口自适应**：放置签名包含视口尺寸，`resize`（含全屏切换/缩放）会清掉对话区缓存并重新放置；有 `ResizeObserver` 时也监听 body 尺寸变化。
+- **夹紧边界更准**：顶部取「slot top」与「编辑行最近的可滚动祖先 top」的较大值；底部取所有 composer 包裹层里最靠下的那个 top（不再拿第一个匹配），识别不到时从视口底部预留 120px。
+- **性能**：滚动时 `placeEditor` 走 rAF 节流并跳过无变化帧；action bar / turn-tail 的全局查询只在 legacy 需要时做；对话区/输入框边界缓存 250ms；「一轮最大」的高度按块签名缓存；MutationObserver 忽略插件自己层的变更，打字不再触发整页重扫。
+- **高度可选**：设置页「编辑器高度」= 全部铺满（默认；普通块按一轮最大，选「全部」时自动铺满上下边界）/ 一轮最大 / 随内容。
+- **三个位置 + 默认夹紧**：设置页「编辑器位置」= 浮层 / 页面内联 / 整行旧版；除页面内联外都自动夹在「对话区顶部 ~ 输入框顶部」之间，长内容框内滚动。
+- **输入体验**：提示词框支持粘贴图片/文件、拖拽文件进框，和「+」进同一 chip 列表。
+- 说明：按用户要求，这一版只在工作区，不 commit / 不 push / 不 release / 不发 npm。
+- **测试**：`npm test` **227/227**、`npm run verify:contract` **96** 项、`npm run verify:client` **184** 项。
 
 **0.3.3** —— 编辑器锚定到刚按下的铅笔，位置不再跑到屏幕另一端。
 
@@ -571,12 +608,14 @@ editable and the editor warns that tool calls and reasoning cannot survive.
   config:
     confirm: false              # default: apply in one click; true restores the two-step flow
     replyMode: auto             # auto | patch | replay
+    editorStyle: frame          # frame | bubble | center
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
 | `confirm` | `false` | Whether the client asks for a second confirmation before applying. Off by default - one click applies, because the editor is already an explicit action the user opened; with `true` the confirmation step states what this save will discard. |
 | `replyMode` | `auto` | How a reply edit lands. `auto`: use the plugin-record projection when the host exposes it, otherwise the replay splice; `patch`: require the in-place path; `replay`: always use the historical replay path. Prompt edits are unaffected. |
+| `editorStyle` | `frame` | Editor presentation. `frame`: outline the whole message row with the textarea on the message text and actions top-right (reference UI); `bubble`: the editor is exactly the message bubble's rect; `center`: a large centred panel. Switch it in the plugin settings panel: `/#/panel/plugins/dsh-edit-turn/dsh-edit-turn`. |
 
 ### How it works
 

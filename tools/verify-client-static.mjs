@@ -108,11 +108,16 @@ check('the dictionary carries zh and en', Boolean(dictionaries[0] && dictionarie
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
 check('injects the official assistant-actions slot', injections.includes('conversation.chat.assistant-actions'), injections.join(','))
+check('injects the plugin manager row-config slot', injections.includes('plugins.row.config'), injections.join(','))
 
 // Two entries, two injection points. Picked by name so adding a third entry does
 // not silently re-point these checks at the wrong one.
 const byName = (name) => registrations.find((item) => item.definition.name === name) || { definition: {} }
-check('registers one entry per injection point', registrations.length === 2, `got ${registrations.length}`)
+check('registers one entry per injection point', registrations.length === 3, `got ${registrations.length}`)
+const rowConfigRegistration = byName('plugins.row.config')
+check('the row-config entry uses the manager key', rowConfigRegistration.definition.key === 'dsh-edit-turn#dsh-edit-turn', rowConfigRegistration.definition.key)
+check('the row-config entry renders a component', typeof rowConfigRegistration.component === 'function')
+
 const registration = byName('conversation.input.overlay')
 check('the overlay slot name matches its injection point', registration.definition.name === 'conversation.input.overlay')
 check('the overlay entry has a stable id', registration.definition.id === 'edit-turn')
@@ -573,7 +578,7 @@ check(
 check(
   'the box is repositioned when the page scrolls or resizes',
   clientSource.includes("document.addEventListener('scroll', keepPlaced") &&
-    clientSource.includes("window.addEventListener('resize', keepPlaced)"),
+    /window\.addEventListener\('resize', (keepPlaced|onResize)\)/.test(clientSource),
 )
 
 // The editor is an input box, not a fixed five-line slab: it grows with the
@@ -614,7 +619,7 @@ check(
     /\.dshet-editor:focus-within\{/.test(css) &&
     editorAreaRule.includes('background:transparent') &&
     editorAreaRule.includes('border:0') &&
-    /\.dshet-footer\{[^}]*justify-content:flex-end/.test(css),
+    /\.dshet-footer\{[^}]*justify-content:space-between/.test(css),
   editorAreaRule,
 )
 check(
