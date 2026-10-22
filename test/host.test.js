@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { Session, appendPluginRecord } from '@deepseek-ai/dsh-session'
-import { PLUGIN_ID, PLUGIN_VERSION, apply } from '../lib/index.js'
+import { PLUGIN_ID, PLUGIN_VERSION, apply, isProjectionUnavailable } from '../lib/index.js'
 import { PATCH_TYPE, buildPatchData } from '../lib/patch.js'
 import { foldSurface } from '../lib/index.js'
 
@@ -80,6 +80,14 @@ function buildReasoningLog(session) {
   session.append('assistant/message', { turn: 2, step: 1, message: modelMessage('a2', 'LATER ANSWER'), stream: [] }, { surfaceOp: 'append' })
   session.append('step/end', { turn: 2, step: 1 })
   session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+}
+
+/** A log whose last turn never closed: the session is still working. */
+function buildBusyLog(session) {
+  buildReasoningLog(session)
+  session.append('turn/start', { turn: 3 })
+  session.append('step/start', { turn: 3, step: 1 })
+  session.append('user/message', { id: 'u3', role: 'user', content: [{ type: 'text', text: 'Q3' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
 }
 
 // --- harness ----------------------------------------------------------------
@@ -789,6 +797,63 @@ test('a corrected reply can be corrected again', async () => {
   }
 })
 
+test('a reply edit lands while the turn is still running', async () => {
+  const session = Session.create(SESSION_ID)
+  buildBusyLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched mid-turn' })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.mode, 'patch')
+    // One ignorable record between the running turn's own events; the surface is
+    // untouched, so the model picks it up on its next fold.
+    assert.equal(h.session.seq, before + 1)
+    const record = h.session.snapshotEvents().at(-1)
+    assert.equal(record.type, PATCH_TYPE)
+    assert.equal(record.ignorable, true)
+  } finally {
+    await h.close()
+  }
+})
+
+test('a prompt rewrite still waits for a running turn', async () => {
+  const session = Session.create(SESSION_ID)
+  buildBusyLog(session)
+  const h = await harness({ session, patch: true })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, { sessionId: SESSION_ID, seq: 3, text: 'rewritten prompt' })
+    assert.equal(res.status, 409, res.payload)
+    assert.equal(res.json.code, 'busy')
+    assert.equal(h.session.seq, before, 'nothing was written')
+  } finally {
+    await h.close()
+  }
+})
+
+test('an all-blocks save lands while the turn is still running', async () => {
+  const session = Session.create(SESSION_ID)
+  buildBusyLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [
+        { seq: assistant.seq, blockIndex: 0, kind: 'reasoning', text: 'thought mid-turn' },
+        { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'answer mid-turn' },
+      ],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.mode, 'patch')
+    assert.deepEqual(res.json.targets.map((target) => target.text), ['thought mid-turn', 'answer mid-turn'])
+  } finally {
+    await h.close()
+  }
+})
+
 test('editing a reply block appends one patch record and no turn', async () => {
   const session = Session.create(SESSION_ID)
   buildReasoningLog(session)
@@ -899,6 +964,15 @@ test('one all-blocks save writes a single record with every edited target', asyn
   } finally {
     await h.close()
   }
+})
+
+test('the projection-gone refusal is recognised so the save can replay instead', () => {
+  assert.equal(
+    isProjectionUnavailable('session message projection "plugin:dsh-edit-turn/patch" was removed or replaced; restore the session with its owning plugin'),
+    true,
+  )
+  assert.equal(isProjectionUnavailable('the session is still working'), false)
+  assert.equal(isProjectionUnavailable(undefined), false)
 })
 
 test('a live reload reuses the already registered projection instead of falling back', async () => {

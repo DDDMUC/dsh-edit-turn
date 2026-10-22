@@ -615,7 +615,7 @@ check(
 const editorAreaRule = /\.dshet-editor textarea\{[^}]*\}/.exec(css)?.[0] ?? ''
 check(
   'the container is the composer shape',
-  /\.dshet-editor\{[^}]*border-radius:16px/.test(css) &&
+  /\.dshet-editor\{[^}]*border-radius:var\(--dshet-radius-panel/.test(css) &&
     /\.dshet-editor:focus-within\{/.test(css) &&
     editorAreaRule.includes('background:transparent') &&
     editorAreaRule.includes('border:0') &&
@@ -655,9 +655,35 @@ const usedVars = new Set([...css.matchAll(/var\((--dshet-[a-z0-9-]+)/g)].map((ma
 const undefinedVars = [...usedVars].filter((name) => !definedVars.has(name))
 check('every --dshet-* variable used is defined', undefinedVars.length === 0, undefinedVars.join(', '))
 const darkBlock = /body\[data-ds-dark-theme\]\{([^}]*)\}/.exec(css)?.[1] ?? ''
-const mustFlip = ['--dshet-panel', '--dshet-field', '--dshet-ink', '--dshet-ink-dim', '--dshet-line', '--dshet-shadow']
+// The surfaces must flip explicitly (a skin may leave them translucent, and then
+// this plugin's own palette is the only thing painting them). Ink, lines and
+// shadows no longer flip here: they are read from the theme's own tokens, which
+// flip with the theme by themselves.
+const mustFlip = ['--dshet-panel', '--dshet-field', '--dshet-hover', '--dshet-shadow']
 const missingInDark = mustFlip.filter((name) => !darkBlock.includes(`${name}:`))
 check('the dark branch overrides every surface variable that must flip', missingInDark.length === 0, missingInDark.join(', '))
+const tokenDriven = ['--dshet-ink', '--dshet-ink-dim', '--dshet-ink-soft', '--dshet-line', '--dshet-accent', '--dshet-bubble']
+const borrowed = tokenDriven.filter((name) => !new RegExp(`${name}:var\\(--dsw-`).test(css))
+check('ink, lines and accents follow the active theme tokens', borrowed.length === 0, borrowed.join(', '))
+const radiusTokens = ['--dshet-radius-panel', '--dshet-radius-xl', '--dshet-radius-md', '--dshet-radius-sm']
+const missingRadius = radiusTokens.filter((name) => !new RegExp(`${name}:var\\(--dsw-radius-`).test(css))
+check('radii follow the active theme tokens', missingRadius.length === 0, missingRadius.join(', '))
+check(
+  'a translucent skin keeps its hue and never its transparency',
+  clientSource.includes('function resolveSkinPalette') &&
+    clientSource.includes('const solid = (color) =>') &&
+    clientSource.includes('clearVar(\'--dshet-panel\')'),
+  'a plugin element has no artwork-aware text halo, so the surface colour is adopted at full opacity',
+)
+check(
+  'an in-place editor paints the skin surface, not a white fallback',
+  /function pageBackground\(\)[\s\S]{0,900}--dshet-panel/.test(clientSource),
+  'a skin that leaves body transparent (artwork behind it) otherwise gets a white box',
+)
+check(
+  'the rewritten prompt bubble wears the theme\'s own bubble colour',
+  /--dshet-bubble:var\(--dsw-specific-bubble/.test(css),
+)
 
 // --- 4. version sync ----------------------------------------------------------
 

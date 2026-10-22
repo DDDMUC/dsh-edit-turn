@@ -252,7 +252,55 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
    **「点了保存没反应」先看这里**：记录里有没有 `apply`。没有 → 点击丢在浏览器半边（此前的成因是宿主在 mousedown/mouseup 之间重建了行，按钮已改为 pointerdown 激活）；有 `apply` 但 `ok:false` → 宿主拒绝了，`code` 就是原因（`busy`/`stale`/...）。
 
+### 为什么没有 `replyMode: replace`（把回复也走 surface 替换）
+
+试过：像 `dsh-chat-thinking-editor` 那样 append 一条新的 `assistant/message`、用 replace op 遮蔽旧的那条，让宿主原生渲染。**当前宿主（0.2.1-rc.2）的 surface 校验直接拒绝**，两条独立规则：
+
+1. `session event "assistant/message" carries an invalid replace surfaceOp` —— replace op 的键必须是 `{op, startSeq, endSeq}`（对方的代码用 `{start, end}`）
+2. `assistant/message embeds its source stream and cannot carry sourceEventSeqs`，而同一校验又要求 `surface replace: sourceEventSeqs must include every shadowed surface node; missing N` —— 两条互相矛盾 ⇒ **assistant 消息不能被另一条 assistant 消息替换**
+
+### 为什么没有走 `conversation.chat.reasoning.body` 槽位渲染
+
+也试过：注册官方 `conversation.chat.reasoning.body`（assistant-step 的子槽，`kind: single`、`scope: session`，宿主默认实现 `priority: 100`，并转交工厂槽 `conversation.chat.reasoning.content` 画 markdown），用它原生渲染改写后的思维链。
+
+实测（真页面，2026-10-22）：**注册成功但拿不到槽位**——
+
+- 注入回调确实执行（在 `document.documentElement.dataset` 上留了标记，读到 `1`）
+- 组件从不渲染：`[data-dshet-reason-body]` 计数恒为 0
+- `priority: 200` / `priority: 50` / 不传（由 runner 分配负值）三种都试过，宿主默认实现始终是渲染者
+- 没有出现任何「registration refused」告警，说明注册被接受、但 `single` 槽位仍由宿主持有
+
+结论：**当前版本下第三方插件无法接管这个 single 子槽位**。所以「原生渲染」的两条路都封着：assistant 替换被 session 校验拒绝；思维链正文槽位不可顶替。界面侧只能继续用本插件的 DOM 补丁（已验证可用：`[data-dshet-patch]` 落在 `_text_*` 思维链节点上，内容为投影后的文本）。
+
+要真正摆脱 DOM 补丁，需要上游给投影一个原生渲染口，或者允许 assistant 替换、或允许插件 shadow 一个 single 子槽位。
+
 ### 更新日志
+
+**0.5.2（工作区）** —— 回复编辑不再等这一轮回复结束；编辑器跟着当前皮肤走。
+
+- **回复编辑不再被「正在回复中」挡住**：就地记录（patch）只 append 一条 `ignorable` 事件，不改任何 surface 节点，所以它可以在 agent 还在写的时候落盘 —— 模型下一次折叠就读到。宿主侧只在**会移动 surface** 的路径上保留忙时拒绝：改写提示词（surface replace）和 replay 兜底（遮蔽窗口 + 重放尾部）。客户端同步：回复就地编辑不再禁用保存、不再显示「该会话正在回复中」横幅；提示词编辑与 replay 路径照旧拦下并说明。
+- **测试**：回复编辑在未闭合的 turn 中保存成功、提示词改写仍被拒、整轮多块在忙时保存成功。
+
+- **颜色/圆角/阴影改用主题令牌**：文字、次级文字、三级文字、描边、主色、圆角（`--dsw-radius-panel/xl/lg/md/sm`）、阴影（`--dsw-shadow-lv3`）都读当前主题的令牌，取不到时退回本插件原来的值；悬停底色用 `color-mix` 从主题墨色算出来。
+- **面板底色取皮肤的“色相”，不取它的透明**：皮肤把界面画在插画上时会把表面色做成半透明（靠自己的文字描边保证可读），插件元素没有描边。现在运行时探测 `--dsw-alias-bg-layer-1/2`：把它的**颜色**原样拿来、透明度强制为 1，于是「中秋」这类**深色插画皮肤**得到的是同色系的深色面板，而不是插件自带的浅色面板（这类皮肤不设 `data-ds-dark-theme`，旧代码只能退回浅色）。
+- **调色板挂在 `body` 上**：主题令牌声明在 `body`，而自定义属性是在**定义处**作用域内做替换的 —— 原来挂在 `:root` 上，所有 `var(--dsw-*)` 都静默取了 fallback（实测：改了等于没改）。
+- **就地编辑器不再刷白底**：`pageBackground()` 原来读 `body` 背景，插画皮肤下 `body` 是透明的 → 退回 `#ffffff`，于是深色皮肤上出现一个白框。现在优先用已解析的 `--dshet-panel`（按上面规则一定不透明）。
+- **改写后的提示词气泡用皮肤自己的气泡色**（`--dsw-specific-bubble`），圆角用 `--dsw-radius-xl`，与真实用户气泡一致。
+- **测试**：`npm test` **241/241**、`npm run verify:contract` **96** 项、`npm run verify:client` **192** 项。
+
+**0.5.1（工作区）** —— 思维链就地画出来、保存不再“点不动”、同一个块可以反复编辑。
+
+- **删掉「思维链已改写（模型可见）」卡片**：reasoning 正文只要在 DOM 里就就地改写；没有正文时不再插入任何占位卡片。
+- **无限次编辑**：记录「上一次画上去的文本」，第二、第三次编辑同一个块时仍能找到元素并更新。
+- **projection 缺失不再 500**：宿主用 `... was removed or replaced` 拒绝时，单块回复保存自动降级走 replay 路径；「全部」多块保存返回 `projection-missing`，提示重启 DSH。
+- **忙时不再假死**：客户端从 `/state` 读 `busy`，会话还在回复时直接禁用保存并显示整条提示「该会话正在回复中…」，每 3 秒复查一次，回复结束自动解除。
+- **失败提示变醒目**：in-place 的 `.dshet-error` 从底栏左侧小字改成整条横幅（左右 8px、底 52px、带边框/阴影）。
+- **确认步不再死循环**：保存键处理函数改读实时 controller 状态；确认步给按钮加可见强调圈；`/apply` 增加 20 秒超时，宿主挂住时恢复按钮并报错。
+- **从「全部」切回单块不再残留**：选择器切回某一块时没有把 `allBlocks` 置回 false，重绘又画成「全部」视图、选择器却写着「正文」（两个输入框 + 单块选择）。现在切回单块会明确退出全部视图，`allBlocks` 也进了编辑器重建标记；选到不存在的块时同样退出全部视图并保留原先选中的块。
+- **思考行找对了**：官方把 reasoning 画在**它自己那一行**（flow key 带 `,reasoning` 分组），而按 seq 找到的行是**正文行** —— 旧代码只在那一行里找，所以思维链改写永远落不到 DOM（正文改写正常，因为正文就在那一行）。现在思维链的搜索改为**在整个会话里找“文本等于记录原文”的最深节点**，并和其它块一样登记 `data-dshet-patch`（可回退）。
+- **折叠的思考也能看到改写**：思考面板收起时正文根本不在 DOM 里，而头部那行 `思考 · <截断片段>` 是宿主按**记录的原文**画的 —— 于是改了模型上下文、界面却像没生效。现在保存后连**头部片段**一起按改写后的文本重画（保留宿主的省略号与截断长度、不碰它自己的标签）。
+- **长内容不再被底栏压住**：输入框高度原来只减了顶栏（`height - offsetTop - 8`），底部 40px 落在控制带下面 —— 框内能滚动，但最后几行永远被 X/保存那条带子盖住。现在按底栏实际高度（`offsetHeight`，取不到时用 46px 常量）预留，输入框正好停在控制带上方；内容更高时在框内滚动。
+- **测试**：`npm test` **235/235**、`npm run verify:contract` **96** 项、`npm run verify:client` **184** 项。
 
 **0.5.0** —— 从「一个气泡的编辑器」长成「整轮可编辑 + 可导航的文档」。
 

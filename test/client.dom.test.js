@@ -1162,6 +1162,62 @@ test('an empty draft is refused with a message, not silently', async () => {
   assert.equal(errors[0].textContent, '改写后的内容不能为空。')
 })
 
+test('a busy session blocks the save up front and says why', async () => {
+  const { harness, controller, snapshot, row } = await readyController()
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      ok: true,
+      hidden: [],
+      turns: [{ seq: 2, turn: 1, messageId: 'm-u1', text: 'original', attachments: 0 }],
+      replies: [],
+      patches: [],
+      mode: 'patch',
+      config: { confirm: false },
+      busy: true,
+    }),
+  })
+  await controller.load(true)
+  byClass(row, 'dshet-action')[0].fire('pointerdown')
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  const submit = byClass(box, 'dshet-btn-primary')[0]
+  assert.equal(submit.disabled, true, 'no dead click: the button is disabled while the turn runs')
+  const errors = byClass(box, 'dshet-error')
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。')
+})
+
+test('a reply edit saves while the turn is still running', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  const conversation = harness.document.createElement('div')
+  conversation.setAttribute('data-slot', 'main.conversation')
+  conversation.rect = { x: 0, y: 60, left: 0, top: 60, right: 800, bottom: 900, width: 800, height: 840 }
+  harness.document.body.appendChild(conversation)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ...patchState(), busy: true, config: { confirm: false } }),
+  })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  assert.ok(box, 'the editor is open')
+  assert.equal(byClass(box, 'dshet-error').length, 0, 'no waiting banner for an in-place reply edit')
+  const submit = byClass(box, 'dshet-btn-primary')[0]
+  assert.equal(submit.disabled, false, 'the in-place record lands while the agent is writing')
+})
+
 test('a host failure is shown in the editor and the button recovers', async () => {
   const { harness, controller, snapshot, row } = await readyController()
   globalThis.fetch = async () => ({ ok: false, status: 409, json: async () => ({ ok: false, code: 'busy', error: 'the session is still working' }) })
@@ -3000,6 +3056,42 @@ test('a reply edit frames the selected block, not the whole assistant row', asyn
   assert.equal(area.style.height, '300px', 'the textarea is exactly the content height')
 })
 
+test('a clamped editor keeps its field above the control band', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 300, left: 0, top: 300, right: 800, bottom: 1500, width: 800, height: 1200 }
+  const conversation = harness.document.createElement('div')
+  conversation.setAttribute('data-slot', 'main.conversation')
+  conversation.rect = { x: 0, y: 60, left: 0, top: 60, right: 800, bottom: 900, width: 800, height: 840 }
+  harness.document.body.appendChild(conversation)
+  const composer = harness.document.createElement('div')
+  composer.className = 'composerSeat'
+  composer.rect = { x: 120, y: 500, left: 120, top: 500, right: 720, bottom: 560, width: 600, height: 60 }
+  harness.document.body.appendChild(composer)
+  // A block far taller than the band: the box is clamped and the field has to
+  // scroll inside it - above the control band, never under it.
+  const long = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join('\n')
+  const blocks = [{ seq: 41, index: 1, kind: 'text', text: long, original: long, patched: false }]
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/state')) {
+      return { ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: long, blocks }] }) }
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  }
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: long, attachments: 0, blocks })
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  const boxHeight = Number.parseInt(box.style.height, 10)
+  const areaTop = Number.parseInt(area.style.top, 10)
+  const areaHeight = Number.parseInt(area.style.height, 10)
+  assert.ok(boxHeight >= 150, 'the box has the editor height')
+  assert.equal(areaTop + areaHeight, boxHeight - 46, 'the field ends where the control band starts, never under it')
+})
+
 test('the all-blocks page fills the whole conversation band, touching both edges', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
@@ -3037,6 +3129,44 @@ test('the all-blocks page fills the whole conversation band, touching both edges
   assert.equal(Number.parseInt(box.style.width, 10), 600, 'and so does the width')
   const allBox = byClass(box, 'dshet-all')[0]
   assert.equal(allBox.style.overflowY, 'auto', 'and the one scrollbar lives on the container')
+})
+
+test('leaving the all-blocks view through the picker restores the single editor', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  const blocks = [
+    { seq: 41, index: 0, kind: 'reasoning', text: 'thought text', original: 'thought text', patched: false },
+    { seq: 41, index: 1, kind: 'text', text: 'answer text', original: 'answer text', patched: false },
+  ]
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/state')) {
+      return { ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'answer text', blocks }] }) }
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  }
+  await controller.load(true)
+  controller.open({ seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1', text: 'answer text', attachments: 0, blocks })
+  render(harness, controller, snapshot)
+
+  const all = walk(editorIn(harness)).find((node) => node.tagName === 'SELECT')
+  all.value = 'all'
+  all.fire('change')
+  render(harness, controller, snapshot)
+  assert.ok(byClass(editorIn(harness), 'dshet-all')[0], 'the all-blocks view is up')
+
+  // Back to one block through the same picker, the way the user does it.
+  const select = walk(editorIn(harness)).find((node) => node.tagName === 'SELECT')
+  select.value = '41:1'
+  select.fire('change')
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  assert.equal(byClass(box, 'dshet-all').length, 0, 'the all-blocks container is gone')
+  assert.equal(walk(box).filter((node) => node.tagName === 'TEXTAREA').length, 1, 'exactly one field is left')
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.equal(area.value, 'answer text', 'and it holds the block that was picked')
+  assert.equal(controller.getSnapshot().allBlocks, false, 'the mode is single again')
 })
 
 test('the all-blocks view lists every block and saves them in one request', async () => {
@@ -3393,7 +3523,7 @@ test('a landed text patch is drawn in place over the recorded reply text', async
   assert.equal(body.textContent, 'the original answer')
 })
 
-test('a patched reasoning block gets a note the model-visible text lives in', async () => {
+test('a reasoning patch with no rendered body leaves no card behind', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
   const root = harness.document.createElement('div')
@@ -3416,12 +3546,169 @@ test('a patched reasoning block gets a note the model-visible text lives in', as
   await controller.load(true)
   render(harness, controller, snapshot)
 
-  const note = harness.document.body.querySelector('.dshet-patch-note')
-  assert.ok(note, 'the reasoning patch is surfaced under the reply')
-  const summary = walk(note).find((entry) => entry.tagName === 'SUMMARY')
-  assert.equal(summary.textContent, '思维链已改写（模型可见）')
-  const body = walk(note).find((entry) => entry.tagName === 'PRE')
-  assert.equal(body.textContent, 'the rewritten thought')
+  assert.equal(harness.document.body.querySelector('.dshet-patch-note'), null,
+    'the old "reasoning patched" card is gone')
+  assert.equal(harness.document.body.textContent.includes('思维链已改写'), false,
+    'and no text stands in for it')
+})
+
+test('an opaque skin lends the editor its own surfaces', async () => {
+  const previous = globalThis.getComputedStyle
+  const palette = new Map([
+    ['--dsw-alias-bg-layer-1', 'rgb(255, 255, 255)'],
+    ['--dsw-alias-bg-layer-2', 'rgb(250, 250, 250)'],
+    ['--dsw-alias-button-primary-fill', 'rgb(15, 17, 21)'],
+  ])
+  globalThis.getComputedStyle = (element) => ({
+    color: palette.get(String(element.style.color).replace(/^var\(/, '').replace(/\)$/, '')) ?? 'rgba(0, 0, 0, 0)',
+  })
+  try {
+    const harness = await loadBundle()
+    const style = harness.document.body.style
+    assert.equal(style['--dshet-panel'], 'rgba(255,255,255,1)', 'the skin surface is adopted')
+    assert.equal(style['--dshet-field'], 'rgba(250,250,250,1)', 'layer 2 becomes the field')
+    assert.equal(style['--dshet-on-accent'], '#fff', 'a dark accent fill takes light text')
+  } finally {
+    globalThis.getComputedStyle = previous
+  }
+})
+
+test('a translucent skin keeps its own hue at full opacity', async () => {
+  const previous = globalThis.getComputedStyle
+  const palette = new Map([
+    ['--dsw-alias-bg-layer-1', 'rgba(20, 20, 25, 0.52)'],
+    ['--dsw-alias-bg-layer-2', 'rgba(31, 31, 38, 0.58)'],
+    ['--dsw-alias-button-primary-fill', 'rgb(231, 180, 78)'],
+  ])
+  globalThis.getComputedStyle = (element) => ({
+    color: palette.get(String(element.style.color).replace(/^var\(/, '').replace(/\)$/, '')) ?? 'rgba(0, 0, 0, 0)',
+  })
+  try {
+    const harness = await loadBundle()
+    const style = harness.document.body.style
+    assert.equal(style['--dshet-panel'], 'rgba(20,20,25,1)', 'the skin hue is kept, its transparency is not')
+    assert.equal(style['--dshet-field'], 'rgba(31,31,38,1)')
+    assert.equal(style['--dshet-on-accent'], '#0f1115', 'a light accent fill takes dark text')
+  } finally {
+    globalThis.getComputedStyle = previous
+  }
+})
+
+test('the reasoning body is patched even when the host draws it in its own row', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  // The answer row carries the seq (rank 0); the reasoning part is a second row
+  // whose flow key adds the `,reasoning` group part, exactly as the host ships
+  // it. Scoping the search to the answer row missed it entirely.
+  const answerRow = mountRow(harness.document, 'row-answer')
+  const answerSlot = harness.document.createElement('div')
+  answerSlot.setAttribute('data-slot', 'conversation.chat.node')
+  const answer = harness.document.createElement('p')
+  answer.textContent = 'the original answer'
+  answerSlot.appendChild(answer)
+  answerRow.appendChild(answerSlot)
+
+  const reasonRow = mountRow(harness.document, '["row-answer","reasoning"]')
+  const reasonSlot = harness.document.createElement('div')
+  reasonSlot.setAttribute('data-slot', 'conversation.chat.node')
+  const thought = harness.document.createElement('span')
+  thought.className = '_text_hash'
+  thought.textContent = 'the silent thought'
+  reasonSlot.appendChild(thought)
+  reasonRow.appendChild(reasonSlot)
+
+  const snapshot = {
+    nodes: new Map([
+      ['row-answer', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }],
+      ['["row-answer","reasoning"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } }],
+    ]),
+  }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      patches: [{ seq: 5, blockIndex: 0, kind: 'reasoning', text: 'the rewritten thought' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(thought.textContent, 'the rewritten thought', 'the reasoning row shows the model-visible text')
+  assert.equal(thought.getAttribute('data-dshet-patch'), '5:0', 'and is tracked like any other patch')
+})
+
+test('a closed reasoning panel shows the edit in its own header snippet', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const summary = harness.document.createElement('span')
+  summary.className = 'reasoning-summary'
+  // What the host renders while the panel is closed: a truncation of the
+  // recorded text plus its own ellipsis. The body is not in the DOM at all.
+  summary.textContent = '思考 · the silent thought that goes on and on…'
+  const answer = harness.document.createElement('p')
+  answer.textContent = 'the original answer'
+  node.appendChild(summary)
+  node.appendChild(answer)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({
+      replies: [{ ...patchState().replies[0], text: 'the original answer', blocks: [
+        { index: 0, kind: 'reasoning', text: 'the silent thought that goes on and on and further still', original: 'the silent thought that goes on and on', patched: true },
+        { index: 1, kind: 'text', text: 'the original answer', original: 'the original answer', patched: false },
+      ] }],
+      patches: [{ seq: 5, blockIndex: 0, kind: 'reasoning', text: 'the silent thought that goes on and on and further still' }],
+    }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.ok(summary.textContent.includes('the silent thought that goes on and on'), 'the snippet now carries the model-visible text')
+  assert.ok(summary.textContent.endsWith('…'), 'and the host ellipsis is kept')
+  assert.ok(summary.textContent.startsWith('思考 · '), 'the label the host owns is untouched')
+})
+
+test('the same block can be edited again and again, each time in place', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const body = harness.document.createElement('div')
+  body.textContent = 'the original answer'
+  node.appendChild(body)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  const state = (text) => patchState({
+    replies: [{ ...patchState().replies[0], text: 'the original answer', patched: true, blocks: [
+      { index: 0, kind: 'reasoning', text: 'the silent thought', original: 'the silent thought', patched: false },
+      { index: 1, kind: 'text', text, original: 'the original answer', patched: true },
+    ] }],
+    patches: [{ seq: 5, blockIndex: 1, kind: 'text', text }],
+  })
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state('first revision') })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(body.textContent, 'first revision')
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state('second revision') })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(body.textContent, 'second revision', 'the second edit finds the element the first one rewrote')
+
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state('third revision') })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(body.textContent, 'third revision', 'and a third one still does')
 })
 
 test('a reply rendered as bare text (no block element) is still patched in place', async () => {
