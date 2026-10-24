@@ -237,6 +237,89 @@ const getState = async (port, id = SESSION_ID) => raw(port, { path: `/dsh-edit-t
 const applyEdit = async (port, body) =>
   raw(port, { method: 'POST', path: '/dsh-edit-turn/apply', body: JSON.stringify(body) })
 
+test('a session whose projection left the registry answers 409, not 500 with a stack', async () => {
+  // `SurfaceManager` refuses to derive a session once a projection it folded with
+  // is gone. That is a known state (the plugin was reloaded while the session was
+  // open), so it must answer 409 with the host's own words - and must not look
+  // like an internal fault in the log.
+  const h = await harness({ patch: true })
+  const errors = []
+  const original = console.error
+  console.error = (...args) => errors.push(args)
+  try {
+    const session = h.session
+    // The session has already folded with a projection that the registry no
+    // longer holds: exactly what a reload leaves behind.
+    const missing = { type: PATCH_TYPE, project: () => new Map() }
+    session.surface._state.projections.add(missing)
+    const answer = await raw(h.port, {
+      method: 'POST',
+      path: '/dsh-edit-turn/apply',
+      body: JSON.stringify({ sessionId: SESSION_ID, mode: 'reply', seq: 5, blockIndex: 1, kind: 'text', text: 'rewritten' }),
+    })
+    assert.equal(answer.status, 409)
+    assert.equal(answer.json.code, 'projection-missing')
+    assert.match(String(answer.json.error), /was removed or replaced/)
+    assert.equal(errors.length, 0, 'a known state is not logged as an internal error')
+  } finally {
+    console.error = original
+    await h.close()
+  }
+})
+
+test('a reloaded host half re-registers the SAME projection object, so live sessions keep folding', async () => {
+  // The host registry compares projection IDENTITY, and `SurfaceManager` throws
+  // once a projection a live session already folded with leaves the registry.
+  // A reload disposes the previous fiber (which splices the object out), so a
+  // freshly built object would leave every open session that carries a patch
+  // event unreadable: this plugin's routes answer 500, and so does any sibling
+  // that reads `session.surface.nodes`.
+  const registry = []
+  const sessions = {
+    messageProjections: registry,
+    registerMessageProjection: (projection) => {
+      if (registry.some((entry) => entry.type === projection.type)) {
+        throw new Error(`session message projection "${projection.type}" is already registered`)
+      }
+      registry.push(projection)
+      return () => {
+        registry.splice(registry.indexOf(projection), 1)
+      }
+    },
+  }
+  const stashed = globalThis.__DSH_EDIT_TURN_PATCH_PROJECTION__
+  delete globalThis.__DSH_EDIT_TURN_PATCH_PROJECTION__
+  const opened = []
+  try {
+    opened.push(await harness({ services: { sessions }, patch: true }))
+    const registered = registry[0]
+    assert.ok(registered, 'the first load registers the projection')
+    assert.equal(registered.type, PATCH_TYPE)
+
+    // The reload: the old fiber is disposed (the object leaves the registry),
+    // and a new instance loads.
+    registry.length = 0
+    opened.push(await harness({ services: { sessions }, patch: true }))
+    assert.equal(
+      registry[0],
+      registered,
+      'the reloaded instance hands back the SAME object, so a session that already folded with it stays readable',
+    )
+
+    // Control: a genuinely fresh process (no stash) builds its own definition.
+    delete globalThis.__DSH_EDIT_TURN_PATCH_PROJECTION__
+    registry.length = 0
+    opened.push(await harness({ services: { sessions }, patch: true }))
+    assert.notEqual(registry[0], registered, 'a fresh process builds its own definition')
+  } finally {
+    if (stashed === undefined) delete globalThis.__DSH_EDIT_TURN_PATCH_PROJECTION__
+    else globalThis.__DSH_EDIT_TURN_PATCH_PROJECTION__ = stashed
+    // The harness opens a real server per load; a leaked one keeps the runner
+    // alive after the last assertion.
+    for (const h of opened) await h.close()
+  }
+})
+
 // --- state ------------------------------------------------------------------
 
 test('GET /state reports the editable turns of a live session', async () => {
@@ -1098,7 +1181,7 @@ test('a busy session is refused', async () => {
   }
 })
 
-test('an unknown session id is a 404 and a malformed one a 400', async () => {
+test('a legal id with no log is an empty state; a malformed id is a 400', async () => {
   const h = await harness({
     services: {
       sessionQuery: { readSession: async () => undefined },
@@ -1106,12 +1189,25 @@ test('an unknown session id is a 404 and a malformed one a 400', async () => {
     },
   })
   try {
+    // No log for this id: an EMPTY session, not a failure. The panel used to
+    // print "状态加载失败，稍后重试。" for exactly this case.
     const missing = await getState(h.port)
-    assert.equal(missing.status, 404)
-    assert.equal(missing.json.code, 'session-not-found')
-    const malformed = await getState(h.port, 'not-a-session')
-    assert.equal(malformed.status, 400)
-    assert.equal(malformed.json.code, 'invalid')
+    assert.equal(missing.status, 200)
+    assert.equal(missing.json.ok, true)
+    assert.deepEqual(missing.json.replies, [], 'nothing to edit')
+    assert.deepEqual(missing.json.turns, [])
+    assert.equal(missing.json.busy, false)
+    // A NAMED session is a session: the GUI creates ids like this one, and DSH
+    // itself treats an id as an opaque string (`z.string().min(1)`).
+    const named = await getState(h.port, 'bili-whale')
+    assert.equal(named.status, 200, 'a named session id is well formed')
+    assert.equal(named.json.ok, true)
+    // Malformed stays refused - nothing that could leave a path or a URL.
+    for (const bad of ['../etc/passwd', 'a/b', 'a\\b', '.hidden', 'has space', 'x'.repeat(200)]) {
+      const malformed = await getState(h.port, bad)
+      assert.equal(malformed.status, 400, JSON.stringify(bad) + ' must be refused')
+      assert.equal(malformed.json.code, 'invalid')
+    }
     const absent = await raw(h.port, { path: '/dsh-edit-turn/state' })
     assert.equal(absent.status, 400)
   } finally {

@@ -278,6 +278,17 @@ class StubElement {
   matches(selector) {
     return matchesAny(this, selector)
   }
+
+  /**
+   * Node.contains. A plugin asks it to tell its own subtree from a stranger's
+   * ("is this sibling mine to hide?"), and a double without it would answer
+   * `undefined` - silently disabling the very guard under test.
+   */
+  contains(other) {
+    if (other === null || other === undefined) return false
+    if (other === this) return true
+    return walk(this).includes(other)
+  }
 }
 
 /** Pre-order (document order) traversal: a stack would reverse every sibling list. */
@@ -426,6 +437,9 @@ async function loadBundle(shared = null) {
       const slot = { value: typeof init === 'function' ? init() : init }
       return [slot.value, (next) => { slot.value = next }]
     },
+    // The plugin is otherwise DOM-only; this is used by the markdown bubble
+    // mount, which is the one React component it renders itself.
+    createElement: (type, props) => ({ type, props: props ?? {} }),
   }
   const cleanups = []
   // The runtime the host ships reads `config.key` without a null check, so a
@@ -441,10 +455,39 @@ async function loadBundle(shared = null) {
   }
   const jsx = assertConfig
   const jsxs = assertConfig
+  // Mounted markdown occurrences, so a test can see that the bubble went through
+  // the host renderer instead of the plain text node.
+  const mountedMarkdown = []
   const requireStub = (id) => {
     if (id === 'react') return react
     if (id === 'react/jsx-runtime') return { jsx, jsxs, Fragment: 'Fragment' }
+    if (id === 'react-dom/client') {
+      return {
+        createRoot: (host) => {
+          const record = { host, unmounted: false }
+          mountedMarkdown.push(record)
+          return {
+            render: (element) => {
+              record.element = element
+              // React manages the container's CHILDREN, not its class: the host
+              // element keeps the class the plugin gave it.
+              const rendered = host.ownerDocument === undefined ? null : null
+              const child = new StubElement('div')
+              child.className = 'markdown-rendered'
+              child.textContent = String(element?.props?.text ?? '')
+              host.textContent = ''
+              host.appendChild(child)
+            },
+            unmount: () => {
+              record.unmounted = true
+              host.textContent = ''
+            },
+          }
+        },
+      }
+    }
     if (id === '@deepseek-ai/dsh-client-ui-primitives') return {
+      MarkdownText: function MarkdownText() {},
       // The platform's own clipboard write, which its copy button (and now this
       // plugin, on a rewritten row) calls. Same shape - a promise for "accepted" -
       // and it records the text where the real one would put it.
@@ -505,6 +548,8 @@ async function loadBundle(shared = null) {
     // first, the way the host disposes a fiber.
     dispose: () => effectDisposers.splice(0).reverse().forEach((fn) => fn()),
     registrations,
+    // Every markdown occurrence mounted into a rewritten-prompt bubble.
+    mountedMarkdown,
   }
 }
 
@@ -901,6 +946,53 @@ test('a strayed revision bubble is reused, not duplicated', async () => {
   assert.equal(bubbles[0].textContent, 'revised prompt', 'and it carries the current wording')
 })
 
+test('a rewritten prompt is rendered as markdown when the markdown bubble plugin is installed', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const row = mountRow(harness.document)
+  const save = globalThis.__DSH_MARKDOWN_BUBBLE__
+  globalThis.__DSH_MARKDOWN_BUBBLE__ = { version: '0.1.5', seats: ['user', 'steering'] }
+  try {
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+    await controller.load(true)
+    render(harness, controller, { nodes: new Map([[ROW_KEY, { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+    const bubble = byClass(harness.document.body, 'dshet-revision')[0]
+    assert.ok(bubble, 'the rewritten prompt bubble is drawn')
+    const textNode = byClass(bubble, 'dshet-revision-text')[0]
+    assert.ok(textNode, 'the text lives in the revision text node')
+    assert.ok(byClass(textNode, 'markdown-rendered')[0], 'it went through the host markdown renderer')
+    assert.equal(textNode.textContent, 'revised prompt', 'and carries the rewritten wording')
+    assert.equal(harness.mountedMarkdown.length, 1, 'one markdown occurrence was mounted')
+    assert.equal(harness.mountedMarkdown[0].element.props.text, 'revised prompt', 'with the rewritten text')
+  } finally {
+    if (save === undefined) delete globalThis.__DSH_MARKDOWN_BUBBLE__
+    else globalThis.__DSH_MARKDOWN_BUBBLE__ = save
+  }
+})
+
+test('without the markdown bubble plugin the rewritten prompt stays plain text', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  mountRow(harness.document)
+  const save = globalThis.__DSH_MARKDOWN_BUBBLE__
+  delete globalThis.__DSH_MARKDOWN_BUBBLE__
+  try {
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+    await controller.load(true)
+    render(harness, controller, { nodes: new Map([[ROW_KEY, { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+    const bubble = byClass(harness.document.body, 'dshet-revision')[0]
+    assert.ok(bubble, 'the rewritten prompt bubble is drawn')
+    // Plain, because every OTHER user bubble on this page is plain: the host
+    // draws them with `white-space: pre-wrap`.
+    assert.equal(bubble.textContent, 'revised prompt', 'the wording is there')
+    assert.equal(harness.mountedMarkdown.length, 0, 'and nothing was mounted')
+  } finally {
+    if (save !== undefined) globalThis.__DSH_MARKDOWN_BUBBLE__ = save
+  }
+})
+
 test('rewriting the same prompt twice keeps the bubble and the pencil', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
@@ -985,6 +1077,34 @@ test('a rolled-back turn tail disappears instead of stacking an empty strip', as
   assert.equal(tail.row.dataset.dshetHidden, '1')
   assert.equal(tail.row.dataset.dshetKeepActions, undefined, 'a tail must not keep its strip')
   assert.equal(tail.row.style.display, 'none', 'the whole tail row is hidden')
+})
+
+test('hiding a row leaves another plugin\'s nodes alone (issue #1)', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-third')
+  // dsh-rewind-pro and friends inject their own controls into the same user row:
+  // one beside the action bar, one beside the slot. Neither carries this
+  // plugin's class names, so the old "hide every sibling that is not ours" walk
+  // swallowed them - present and clickable in the DOM, display:none on screen,
+  // and no console error to notice (DDDMUC/dsh-edit-turn#1).
+  const besideBar = harness.document.createElement('button')
+  besideBar.className = 'rewind_pro_button'
+  besideBar.textContent = '回溯'
+  host.bar.parentElement.appendChild(besideBar)
+  const besideSlot = harness.document.createElement('div')
+  besideSlot.className = 'rewind_pro_portal'
+  host.row.appendChild(besideSlot)
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, { nodes: new Map([['row-third', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) })
+
+  assert.equal(host.row.dataset.dshetHidden, '1', 'the rewritten prompt hides its row')
+  assert.equal(host.stack.style.display, 'none', 'the message content is what gets hidden')
+  assert.notEqual(besideBar.style.display, 'none', "another plugin's button beside the bar stays visible")
+  assert.notEqual(besideSlot.style.display, 'none', "another plugin's node beside the slot stays visible")
+  assert.equal(besideBar.dataset.dshetCollapsed, undefined, 'and is not marked as collapsed by us')
+  assert.equal(besideSlot.dataset.dshetCollapsed, undefined, 'same for the one beside the slot')
 })
 
 test('a host re-render of the row cannot take the editor with it', async () => {
@@ -2965,6 +3085,103 @@ test('every fixed placement stays between the conversation top and the composer'
   assert.ok(top + height <= 492, `the bottom (${top + height}) never passes the composer top`)
 })
 
+test('the editor follows the draft while typing: it grows with the text and shrinks back only to where the edit started', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  const create = harness.document.createElement.bind(harness.document)
+  harness.document.createElement = (tag) => {
+    const element = create(tag)
+    if (tag === 'textarea') {
+      Object.defineProperty(element, 'scrollHeight', {
+        configurable: true,
+        get() { return String(this.value ?? '').length * 2 + 20 },
+      })
+    }
+    return element
+  }
+  const blocks = [{ seq: 41, index: 1, kind: 'text', text: 'x'.repeat(40), original: 'x'.repeat(40), patched: false }]
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'x'.repeat(40), blocks }] }) })
+  await controller.load(true)
+  try {
+    controller.open({
+      seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+      text: 'x'.repeat(40), attachments: 0, blocks,
+    })
+    render(harness, controller, snapshot)
+    const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+    const opened = Number.parseInt(editorIn(harness).style.height, 10)
+    assert.equal(opened, 184, 'the box opens sized for its own content')
+
+    // More lines: the box grows with them.
+    area.value = 'x'.repeat(200)
+    area.fire('input')
+    render(harness, controller, snapshot)
+    const grown = Number.parseInt(editorIn(harness).style.height, 10)
+    assert.ok(grown > opened, `more lines grow the box (${opened} -> ${grown})`)
+
+    // Fewer lines: it shrinks back - but not below the height the edit opened at.
+    const smaller = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA')
+    smaller.value = 'x'.repeat(10)
+    smaller.fire('input')
+    render(harness, controller, snapshot)
+    assert.equal(
+      Number.parseInt(editorIn(harness).style.height, 10),
+      opened,
+      'deleting shrinks it back to where the edit started, never below',
+    )
+  } finally {
+    harness.document.createElement = create
+  }
+})
+
+test('a box with no room below grows upward instead of covering the composer', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  // The row sits low in the conversation: only 192px of room before the composer.
+  row.rect = { x: 0, y: 0, left: 0, top: 300, right: 800, bottom: 1200, width: 800, height: 1200 }
+  const conversation = harness.document.createElement('div')
+  conversation.setAttribute('data-slot', 'main.conversation')
+  conversation.rect = { x: 0, y: 60, left: 0, top: 60, right: 800, bottom: 900, width: 800, height: 840 }
+  harness.document.body.appendChild(conversation)
+  const composer = harness.document.createElement('div')
+  composer.className = 'composerSeat'
+  composer.rect = { x: 0, y: 500, left: 0, top: 500, right: 800, bottom: 560, width: 800, height: 60 }
+  harness.document.body.appendChild(composer)
+  const create = harness.document.createElement.bind(harness.document)
+  harness.document.createElement = (tag) => {
+    const element = create(tag)
+    if (tag === 'textarea') {
+      Object.defineProperty(element, 'scrollHeight', {
+        configurable: true,
+        get() { return String(this.value ?? '').length * 2 + 20 },
+      })
+    }
+    return element
+  }
+  const blocks = [{ seq: 41, index: 1, kind: 'text', text: 'x'.repeat(73), original: 'x'.repeat(73), patched: false }]
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState({ replies: [{ ...patchState().replies[0], text: 'x'.repeat(73), blocks }] }) })
+  await controller.load(true)
+  try {
+    controller.open({
+      seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+      text: 'x'.repeat(73), attachments: 0, blocks,
+    })
+    render(harness, controller, snapshot)
+    const box = editorIn(harness)
+    const top = Number.parseInt(box.style.top, 10)
+    const height = Number.parseInt(box.style.height, 10)
+    assert.equal(height, 250, 'the box is as tall as its content')
+    assert.equal(top, 242, 'the top moved up instead of the bottom crossing the composer')
+    assert.equal(top + height, 492, 'and the bottom sits exactly on the composer edge')
+    assert.ok(top >= 68, 'never above the conversation top plus the margin')
+  } finally {
+    harness.document.createElement = create
+  }
+})
+
 test('the inline placement uses page coordinates and skips the viewport height cap', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
@@ -3264,7 +3481,14 @@ test('turn-max height keeps the frame still while switching blocks, content mode
       shortSelect.value = '41:1'
       shortSelect.fire('change')
       render(harness, controller, snapshot)
-      assert.equal(editorIn(harness).style.height, '150px', 'content mode falls back to the current block')
+      // Content mode follows the block - but not below the height the editor
+      // OPENED at: that is the floor for the whole edit (save or cancel ends it),
+      // which is what "删到 5 行就变矮，但不会比最初那 3 行更矮" asks for.
+      assert.equal(
+        editorIn(harness).style.height,
+        '304px',
+        'content mode never shrinks below the height the edit opened at',
+      )
     } finally {
       if (previous === undefined) delete globalThis.localStorage
       else globalThis.localStorage = previous
@@ -3594,6 +3818,174 @@ test('a translucent skin keeps its own hue at full opacity', async () => {
   }
 })
 
+test('switching pages keeps an unsaved edit', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  const blocks = patchState().replies[0].blocks
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks,
+  })
+  render(harness, controller, snapshot)
+
+  const picker = () => byClass(editorIn(harness), 'dshet-select')[0]
+  const area = () => walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA' && !String(node.className).includes('dshet-all-area'))
+  const allAreaFor = (kind) => {
+    const sections = byClass(editorIn(harness), 'dshet-all-block')
+    for (const section of sections) {
+      const head = byClass(section, 'dshet-all-head')[0]
+      if (head !== undefined && String(head.textContent).includes(kind)) return byClass(section, 'dshet-all-area')[0]
+    }
+    return undefined
+  }
+
+  // The answer block is open by default (index 1); type into it.
+  assert.equal(area().value, 'the original answer')
+  area().value = '1'
+  area().fire('input')
+
+  // 正文 → 全部: the sub-page for 正文 shows what was typed.
+  picker().value = 'all'
+  picker().fire('change')
+  render(harness, controller, snapshot)
+  const allBody = allAreaFor('正文')
+  assert.ok(allBody, 'the 全部 page renders a 正文 sub-page')
+  assert.equal(allBody.value, '1', 'the 正文 sub-page carries the unsaved edit')
+
+  // Edit the 思维链 sub-page there, then go back to the 正文 page.
+  const allThought = allAreaFor('思维链')
+  allThought.value = 'thought draft'
+  allThought.fire('input')
+  picker().value = '5:1'
+  picker().fire('change')
+  render(harness, controller, snapshot)
+  assert.equal(area().value, '1', 'the 正文 page still carries its own draft')
+
+  // 正文 → 思维链 → 正文: both drafts survive the round trip.
+  picker().value = '5:0'
+  picker().fire('change')
+  render(harness, controller, snapshot)
+  assert.equal(area().value, 'thought draft', 'the 思维链 page carries the draft typed in 全部')
+  picker().value = '5:1'
+  picker().fire('change')
+  render(harness, controller, snapshot)
+  assert.equal(area().value, '1', 'and switching back does not wipe the 正文 draft')
+
+  // And a save sends the draft, not the recorded text.
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/apply')) calls.push(JSON.parse(init.body))
+    return { ok: true, status: 200, json: async () => ({ ok: true, kind: 'reply', applied: true, patch: true, shadowed: [] }) }
+  }
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(calls.length, 1, 'one save request')
+  assert.equal(calls[0].text, '1', 'the save sends the draft typed before the page switches')
+})
+
+test('a measuring pass cannot scroll the reader back to the top', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  const select = byClass(editorIn(harness), 'dshet-select')[0]
+  select.value = 'all'
+  select.fire('change')
+  render(harness, controller, snapshot)
+
+  const allBox = byClass(editorIn(harness), 'dshet-all')[0]
+  assert.ok(allBox, 'the all-blocks page is rendered')
+  let scrollTop = 420
+  Object.defineProperty(allBox, 'scrollTop', {
+    configurable: true,
+    get: () => scrollTop,
+    set: (value) => {
+      scrollTop = value
+    },
+  })
+
+  // A browser clamps a scroller when the document under it collapses: measuring
+  // a textarea (height: auto) is exactly that. Model it here, so a pass that
+  // forgets to put the position back fails the test.
+  const areas = byClass(allBox, 'dshet-all-area')
+  for (const area of areas) {
+    Object.defineProperty(area, 'scrollHeight', {
+      configurable: true,
+      get() {
+        if (area.style.height === 'auto') scrollTop = 0
+        return 300
+      },
+    })
+  }
+  for (const area of byClass(allBox, 'dshet-all-area')) area.fire('input')
+  assert.equal(allBox.scrollTop, 420, 'the measuring pass leaves the scroll position where it was')
+})
+
+test('a block textarea is sized to its settled height, not one line short', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+  // Switch to the all-blocks page, where every block gets its own textarea.
+  const select = byClass(editorIn(harness), 'dshet-select')[0]
+  select.value = 'all'
+  select.fire('change')
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  const areas = byClass(box, 'dshet-all-area')
+  assert.ok(areas.length > 0, 'the all-blocks page renders one textarea per block')
+
+  // A real textarea answers the first read after `height: auto` exactly one
+  // line short (the wrap lands after the style write); the second read is the
+  // truth. Without the second pass the element is pinned a line short with
+  // `overflow: hidden`, and the scroller around it cannot reveal that line.
+  const LINE = 23
+  for (const area of areas) {
+    let height = area.style.height === 'auto' ? 0 : Number.parseInt(area.style.height, 10) || 0
+    let readsAfterReset = 0
+    Object.defineProperty(area, 'scrollHeight', {
+      configurable: true,
+      get() {
+        if (area.style.height === 'auto') {
+          readsAfterReset += 1
+          return 300 - LINE // one line short on the first pass
+        }
+        if (readsAfterReset === 1) {
+          readsAfterReset = 2
+          return 300 // the settled height
+        }
+        return Math.max(300, Number.parseInt(area.style.height, 10) || 0)
+      },
+    })
+  }
+  const grown = byClass(box, 'dshet-all-area')
+  for (const area of grown) area.fire('input')
+  render(harness, controller, snapshot)
+  const settled = byClass(editorIn(harness), 'dshet-all-area')
+  for (const area of settled) {
+    assert.equal(area.style.height, '300px', 'the textarea is as tall as its content, not a line short')
+  }
+})
+
 test('the reasoning body is patched even when the host draws it in its own row', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
@@ -3635,6 +4027,285 @@ test('the reasoning body is patched even when the host draws it in its own row',
 
   assert.equal(thought.textContent, 'the rewritten thought', 'the reasoning row shows the model-visible text')
   assert.equal(thought.getAttribute('data-dshet-patch'), '5:0', 'and is tracked like any other patch')
+})
+
+test('saving another step\'s reasoning repaints it without a reload', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+
+  // The reasoning of a LATER step: same block index as the reply's own, a
+  // different seq, and the host draws it in its own row.
+  const laterThought = harness.document.createElement('span')
+  laterThought.className = '_text_later'
+  laterThought.textContent = 'the later step thought'
+  const laterRow = mountRow(harness.document, '["row-answer","reasoning","later"]')
+  laterRow.appendChild(laterThought)
+
+  const state = patchState({
+    replies: [
+      {
+        seq: 5,
+        turn: 1,
+        messageId: 'm-a1',
+        text: 'the original answer',
+        attachments: 0,
+        patched: false,
+        blocks: [
+          { index: 0, kind: 'reasoning', seq: 5, text: 'the silent thought', original: 'the silent thought', patched: false },
+          { index: 1, kind: 'text', seq: 5, text: 'the original answer', original: 'the original answer', patched: false },
+          { index: 0, kind: 'reasoning', seq: 9, text: 'the later step thought', original: 'the later step thought', patched: false },
+        ],
+      },
+    ],
+    patches: [],
+  })
+  const calls = []
+  // The state the host serves AFTER the write: the same reply list with the
+  // block marked patched, plus the new patch entry (this is what a refresh
+  // would have shown, and the whole point is that no refresh is needed).
+  const afterWrite = () =>
+    patchState({
+      replies: [
+        {
+          seq: 5,
+          turn: 1,
+          messageId: 'm-a1',
+          text: 'the original answer',
+          attachments: 0,
+          patched: true,
+          blocks: [
+            { index: 0, kind: 'reasoning', seq: 5, text: 'the silent thought', original: 'the silent thought', patched: false },
+            { index: 1, kind: 'text', seq: 5, text: 'the original answer', original: 'the original answer', patched: false },
+            { index: 0, kind: 'reasoning', seq: 9, text: 'the later step, rewritten', original: 'the later step thought', patched: true },
+          ],
+        },
+      ],
+      patches: [{ seq: 9, blockIndex: 0, kind: 'reasoning', text: 'the later step, rewritten' }],
+    })
+  let written = false
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/apply')) {
+      written = true
+      calls.push(JSON.parse(init.body))
+      // The host answers with the BLOCK's own seq, which is what the optimistic
+      // update has to key by.
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          kind: 'reply',
+          applied: true,
+          mode: 'patch',
+          patch: true,
+          target: { seq: 9, blockIndex: 0, kind: 'reasoning', text: 'the later step, rewritten', original: 'the later step thought' },
+          shadowed: [],
+        }),
+      }
+    }
+    return { ok: true, status: 200, json: async () => (written ? afterWrite() : state) }
+  }
+  await controller.load(true)
+  const nodes = new Map(snapshot.nodes)
+  nodes.set('["row-answer","reasoning","later"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } })
+  render(harness, controller, { nodes })
+
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: state.replies[0].blocks,
+  })
+  render(harness, controller, { nodes })
+
+  const picker = byClass(editorIn(harness), 'dshet-select')[0]
+  assert.ok(picker, 'the reply editor offers the page picker')
+  picker.value = '9:0'
+  picker.fire('change')
+  render(harness, controller, { nodes })
+  const area = walk(editorIn(harness)).find((node) => node.tagName === 'TEXTAREA' && !String(node.className).includes('dshet-all-area'))
+  assert.equal(area.value, 'the later step thought', 'the later step is the page being edited')
+  area.value = 'the later step, rewritten'
+  area.fire('input')
+  byClass(editorIn(harness), 'dshet-btn-primary')[0].fire('click')
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  render(harness, controller, { nodes })
+
+  assert.equal(calls.length, 1, 'one save request')
+  assert.equal(calls[0].targetSeq, 9, 'the request names the block\'s own seq')
+  assert.equal(
+    laterThought.textContent,
+    'the later step, rewritten',
+    'the reasoning body shows the edit immediately, with no page reload',
+  )
+  assert.equal(laterThought.getAttribute('data-dshet-patch'), '9:0', 'and is tracked under its own key')
+})
+
+test('a measuring pass cannot scroll the textarea back to the top', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot, row } = mountAssistantRow(harness.document)
+  row.rect = { x: 0, y: 0, left: 0, top: 0, right: 800, bottom: 1200, width: 800, height: 1200 }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => patchState() })
+  await controller.load(true)
+  controller.open({
+    seq: 5, mode: 'reply', turn: 1, messageId: 'm-a1',
+    text: 'the original answer', attachments: 0, blocks: patchState().replies[0].blocks,
+  })
+  render(harness, controller, snapshot)
+
+  const box = editorIn(harness)
+  const area = walk(box).find((node) => node.tagName === 'TEXTAREA')
+  assert.ok(area, 'the editor renders a textarea')
+
+  // Chromium drops a textarea's scroll position when `value` is assigned, even
+  // when the assignment is only a measuring detour ("turn max" writes every
+  // other block's text into the field). Model that, so a pass that forgets to
+  // put the position back fails here.
+  let scrollTop = 300
+  Object.defineProperty(area, 'scrollTop', {
+    configurable: true,
+    get: () => scrollTop,
+    set: (value) => {
+      scrollTop = value
+    },
+  })
+  let value = area._text ?? ''
+  Object.defineProperty(area, 'value', {
+    configurable: true,
+    get: () => value,
+    set: (next) => {
+      if (next !== value) scrollTop = 0
+      value = next
+    },
+  })
+
+  // Force the next layout to re-measure the whole turn (the cache key carries
+  // the field width and the block texts).
+  area.clientWidth = (area.clientWidth || 0) + 37
+  area.fire('input')
+  render(harness, controller, snapshot)
+  assert.equal(scrollTop, 300, 'the textarea keeps the reader\'s place across a measuring pass')
+})
+
+test('opening the thinking panel later still shows the edit: every copy of the reasoning is patched', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const { snapshot } = mountAssistantRow(harness.document)
+  // The host keeps the collapsed process row in the DOM with `display: none` and
+  // renders a SECOND body when the panel is opened. Patching only the remembered
+  // element left the copy the user was looking at showing the recorded text until
+  // a reload.
+  const collapsedRow = mountRow(harness.document, '["row-answer","reasoning"]')
+  const collapsed = harness.document.createElement('span')
+  collapsed.className = '_text_collapsed'
+  collapsed.textContent = 'the silent thought'
+  collapsedRow.appendChild(collapsed)
+
+  const snapshotWithReasoning = {
+    nodes: new Map([
+      ...snapshot.nodes,
+      ['["row-answer","reasoning"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } }],
+    ]),
+  }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () =>
+      patchState({
+        patches: [{ seq: 5, blockIndex: 0, kind: 'reasoning', text: 'the rewritten thought' }],
+      }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshotWithReasoning)
+  assert.equal(collapsed.textContent, 'the rewritten thought', 'the collapsed copy is patched')
+
+  // The panel opens: the host renders a fresh body with the RECORDED text, in a
+  // row of its own, while the collapsed one stays connected.
+  const openedRow = mountRow(harness.document, '["row-answer","reasoning","opened"]')
+  const opened = harness.document.createElement('span')
+  opened.className = '_text_opened'
+  opened.textContent = 'the silent thought'
+  openedRow.appendChild(opened)
+  const withOpened = {
+    nodes: new Map([
+      ...snapshotWithReasoning.nodes,
+      ['["row-answer","reasoning","opened"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } }],
+    ]),
+  }
+  render(harness, controller, withOpened)
+
+  assert.equal(opened.textContent, 'the rewritten thought', 'the freshly opened panel shows the edit too')
+  assert.equal(opened.getAttribute('data-dshet-patch'), '5:0', 'and carries the patch marker')
+  assert.equal(collapsed.textContent, 'the rewritten thought', 'the collapsed copy keeps it as well')
+})
+
+test('a patch for another step\'s reasoning lands on THAT block, not on the first one with the same index', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  // One reply entry carries its whole TURN: the answer row's own step, then two
+  // later steps whose reasoning is also "index 0". `find(index === 0)` used to
+  // hand the pass the first one, whose text is not what the patch recorded, so
+  // the patch matched nothing and the edit only appeared after a reload.
+  const answerRow = mountRow(harness.document, 'row-answer')
+  const answerSlot = harness.document.createElement('div')
+  answerSlot.setAttribute('data-slot', 'conversation.chat.node')
+  const answer = harness.document.createElement('p')
+  answer.textContent = 'the original answer'
+  answerSlot.appendChild(answer)
+  answerRow.appendChild(answerSlot)
+
+  const firstThought = harness.document.createElement('span')
+  firstThought.className = '_text_first'
+  firstThought.textContent = 'the first step thought'
+  const firstRow = mountRow(harness.document, '["row-answer","reasoning"]')
+  firstRow.appendChild(firstThought)
+
+  const laterThought = harness.document.createElement('span')
+  laterThought.className = '_text_later'
+  laterThought.textContent = 'the later step thought'
+  const laterRow = mountRow(harness.document, '["row-answer","reasoning","later"]')
+  laterRow.appendChild(laterThought)
+
+  const snapshot = {
+    nodes: new Map([
+      ['row-answer', { kind: 'assistant-step', anchorSeq: 5, data: { finalNode: { seq: 5 } } }],
+      ['["row-answer","reasoning"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } }],
+      ['["row-answer","reasoning","later"]', { kind: 'turn-process', data: { answerAnchorSeq: 5 } }],
+    ]),
+  }
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () =>
+      patchState({
+        replies: [
+          {
+            seq: 5,
+            turn: 1,
+            messageId: 'm-a1',
+            text: 'the original answer',
+            attachments: 0,
+            patched: false,
+            blocks: [
+              { index: 0, kind: 'reasoning', seq: 5, text: 'the first step thought', original: 'the first step thought', patched: false },
+              { index: 1, kind: 'text', seq: 5, text: 'the original answer', original: 'the original answer', patched: false },
+              { index: 0, kind: 'reasoning', seq: 9, text: 'the later step thought', original: 'the later step thought', patched: false },
+            ],
+          },
+        ],
+        // The patch targets the LATER step's reasoning (seq 9), which shares its
+        // block index with the first step's.
+        patches: [{ seq: 9, blockIndex: 0, kind: 'reasoning', text: 'the later step, rewritten' }],
+      }),
+  })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  assert.equal(laterThought.textContent, 'the later step, rewritten', 'the later step shows the edit')
+  assert.equal(laterThought.getAttribute('data-dshet-patch'), '9:0', 'and is tracked under its own key')
+  assert.equal(firstThought.textContent, 'the first step thought', 'the first step is untouched')
+  assert.equal(firstThought.getAttribute('data-dshet-patch'), null)
 })
 
 test('a closed reasoning panel shows the edit in its own header snippet', async () => {
