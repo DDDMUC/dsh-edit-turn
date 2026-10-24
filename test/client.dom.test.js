@@ -537,6 +537,9 @@ async function loadBundle(shared = null) {
   const t = (key) => (key in dict ? dict[key] : key in common ? common[key] : key)
   return {
     component,
+    // The module namespace the bundle built: what a composing bundle reads
+    // (ConfigCard) is visible here.
+    exports,
     controller: props.controller,
     t,
     document,
@@ -4500,4 +4503,16 @@ test('markdown emphasis in the recorded text does not defeat the rendered-text m
 
   assert.equal(body.textContent, '第一行 2。\n第二行')
   assert.equal(body.getAttribute('data-dshet-patch'), '5:1')
+})
+
+// The settings card is exported so a composing bundle (dsh-as-aistudio) can
+// render THE SAME component on its own page instead of re-implementing it.
+// Dropping the export would silently empty that page, so it is asserted here.
+test('exports the settings card for a composing bundle', async () => {
+  const { exports } = await loadBundle()
+  assert.equal(typeof exports.ConfigCard, 'function')
+  assert.equal(exports.ConfigCard.name, 'EditorStyleOption')
+  // The summary view is what the plugin row shows; the page is the form.
+  const summary = exports.ConfigCard({ view: 'summary', t: (key) => key })
+  assert.equal(typeof summary, 'string', 'summary renders an inline one-liner')
 })
