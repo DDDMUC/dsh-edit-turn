@@ -937,6 +937,66 @@ test('an all-blocks save lands while the turn is still running', async () => {
   }
 })
 
+test('an inserted block lands as one record and stays a draft until it has text', async () => {
+  const session = Session.create(SESSION_ID)
+  buildReasoningLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const before = h.session.seq
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [{ seq: assistant.seq, kind: 'text', text: 'a paragraph I added', insert: { id: 'ins-1', position: 1 } }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.mode, 'patch')
+    assert.equal(res.json.applied, true)
+    assert.equal(h.session.seq, before + 1, 'one record, no synthetic turn')
+    const record = h.session.snapshotEvents().at(-1)
+    assert.equal(record.type, PATCH_TYPE)
+    assert.deepEqual(record.data.targets, [
+      { seq: assistant.seq, kind: 'text', text: 'a paragraph I added', insert: { id: 'ins-1', position: 1 } },
+    ])
+    // No record for a blank draft: nothing was ever written, so nothing is
+    // removed and the log does not grow.
+    const blankSeq = h.session.seq
+    const blank = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [{ seq: assistant.seq, kind: 'text', text: '', insert: { id: 'ins-never', position: 0 } }],
+    })
+    assert.equal(blank.status, 200, blank.payload)
+    assert.equal(blank.json.applied, false)
+    assert.equal(blank.json.unchanged, true)
+    assert.equal(h.session.seq, blankSeq, 'a draft that was never written costs no record')
+  } finally {
+    await h.close()
+  }
+})
+
+test('clearing a block that was inserted removes it through a tombstone', async () => {
+  const session = Session.create(SESSION_ID)
+  buildReasoningLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const written = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [{ seq: assistant.seq, kind: 'reasoning', text: 'inserted thought', insert: { id: 'ins-2', position: 0 } }],
+    })
+    assert.equal(written.status, 200, written.payload)
+    const cleared = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [{ seq: assistant.seq, kind: 'reasoning', text: '', insert: { id: 'ins-2', position: 0 } }],
+    })
+    assert.equal(cleared.status, 200, cleared.payload)
+    assert.equal(cleared.json.applied, true, 'the removal is a real record')
+    const record = h.session.snapshotEvents().at(-1)
+    assert.equal(record.data.targets[0].removed, true)
+  } finally {
+    await h.close()
+  }
+})
+
 test('editing a reply block appends one patch record and no turn', async () => {
   const session = Session.create(SESSION_ID)
   buildReasoningLog(session)

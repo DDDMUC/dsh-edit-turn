@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  INSERT_INDEX_BASE,
   PATCH_TYPE,
   applyTargetsToMessage,
   buildPatchData,
@@ -70,7 +71,7 @@ test('every text and reasoning block is editable, whatever field carries it', ()
 
 test('buildPatchData validates shape, bounds and kind', () => {
   const data = buildPatchData([{ seq: 4, blockIndex: 1, kind: 'text', text: 'NEW' }])
-  assert.deepEqual(data, { version: 1, targets: [{ seq: 4, blockIndex: 1, kind: 'text', text: 'NEW' }] })
+  assert.deepEqual(data, { version: 2, targets: [{ seq: 4, blockIndex: 1, kind: 'text', text: 'NEW' }] })
   for (const bad of [
     null,
     {},
@@ -80,6 +81,11 @@ test('buildPatchData validates shape, bounds and kind', () => {
     { version: 1, targets: [{ seq: 1, blockIndex: 1.5, kind: 'text', text: 'x' }] },
     { version: 1, targets: [{ seq: 1, blockIndex: 0, kind: 'tool', text: 'x' }] },
     { version: 1, targets: [{ seq: 1, blockIndex: 0, kind: 'text', text: 3 }] },
+    { version: 3, targets: [{ seq: 1, blockIndex: 0, kind: 'text', text: 'x' }] },
+    // Inserts need a stable id and a position; a position alone is not an identity.
+    { version: 2, targets: [{ seq: 1, kind: 'text', text: 'x', insert: { position: 0 } }] },
+    { version: 2, targets: [{ seq: 1, kind: 'text', text: 'x', insert: { id: '', position: 0 } }] },
+    { version: 2, targets: [{ seq: 1, kind: 'text', text: 'x', insert: { id: 'a', position: -1 } }] },
   ]) {
     assert.throws(() => validatePatchData(bad), PATCH_TYPE)
   }
@@ -161,8 +167,8 @@ test('patchesOf keeps the latest patch per block and skips invalid records', () 
     ev(7, PATCH_TYPE, { broken: true }),
   ]
   const patches = patchesOf(events)
-  assert.equal(patches.get(3).get(0).text, 'TWO')
-  assert.equal(patches.get(3).get(1).text, 'THINK')
+  assert.equal(patches.get(3).replacements.get(0).text, 'TWO')
+  assert.equal(patches.get(3).replacements.get(1).text, 'THINK')
   assert.deepEqual(patchList(patches), [
     { seq: 3, blockIndex: 0, kind: 'text', text: 'TWO' },
     { seq: 3, blockIndex: 1, kind: 'reasoning', text: 'THINK' },
@@ -170,8 +176,75 @@ test('patchesOf keeps the latest patch per block and skips invalid records', () 
 })
 
 test('projectedBlocks reports the live text and what it replaced', () => {
-  const patches = new Map([[4, new Map([[1, { kind: 'text', text: 'NEW' }]])]])
+  const patches = new Map([[4, { replacements: new Map([[1, { kind: 'text', text: 'NEW' }]]), inserts: new Map() }]])
   const blocks = projectedBlocks(message(), 4, patches)
   assert.deepEqual(blocks[1], { index: 1, kind: 'text', text: 'NEW', original: 'OLD ANSWER', patched: true })
   assert.equal(blocks[0].patched, false)
+})
+
+// --- inserted blocks ---------------------------------------------------------
+
+test('an insert target carries a stable id and a position, not an index', () => {
+  const data = buildPatchData([{ seq: 4, kind: 'text', text: 'NEW', insert: { id: 'ins-1', position: 2 } }])
+  assert.deepEqual(data.targets[0], { seq: 4, kind: 'text', text: 'NEW', insert: { id: 'ins-1', position: 2 } })
+  // The same id again is an EDIT of that block, not a second one.
+  const again = buildPatchData([{ seq: 4, kind: 'text', text: 'NEWER', insert: { id: 'ins-1', position: 2 } }])
+  const patches = patchesOf([ev(4, PATCH_TYPE, data), ev(5, PATCH_TYPE, again)])
+  const inserts = [...patches.get(4).inserts.values()]
+  assert.equal(inserts.length, 1, 'one block, one identity')
+  assert.equal(inserts[0].text, 'NEWER')
+})
+
+test('inserts land at their position without moving the blocks they were resolved against', () => {
+  const original = message()   // [reasoning 'OLD THINK', text 'OLD ANSWER']
+  const withInsert = applyTargetsToMessage(original, [
+    { seq: 4, blockIndex: 1, kind: 'text', text: 'REPLACED' },
+    { seq: 4, kind: 'text', text: 'ADDED', insert: { id: 'a', position: 1 } },
+  ])
+  assert.deepEqual(withInsert.content.map((block) => block.text ?? block.type), ['OLD THINK', 'ADDED', 'REPLACED', 'tool-call'])
+  assert.equal(original.content.length, 3, 'the recorded message is not mutated')
+})
+
+test('two inserts at the same position keep the order they were created in', () => {
+  const out = applyTargetsToMessage(message(), [
+    { seq: 4, kind: 'text', text: 'FIRST', insert: { id: 'a', position: 1 } },
+    { seq: 4, kind: 'reasoning', text: 'SECOND', insert: { id: 'b', position: 1 } },
+  ])
+  assert.deepEqual(out.content.map((block) => block.text ?? block.type), ['OLD THINK', 'FIRST', 'SECOND', 'OLD ANSWER', 'tool-call'])
+})
+
+test('an insert past the end is appended, and a removed one is dropped', () => {
+  const out = applyTargetsToMessage(message(), [
+    { seq: 4, kind: 'text', text: 'TAIL', insert: { id: 'a', position: 99 } },
+    { seq: 4, kind: 'text', text: 'GONE', insert: { id: 'b', position: 0 }, removed: true },
+  ])
+  assert.deepEqual(out.content.map((block) => block.text ?? block.type), ['OLD THINK', 'OLD ANSWER', 'tool-call', 'TAIL'])
+})
+
+test('the projection shows inserted blocks where the user put them', () => {
+  const data = buildPatchData([
+    { seq: 4, blockIndex: 1, kind: 'text', text: 'REPLACED' },
+    { seq: 4, kind: 'text', text: 'ADDED', insert: { id: 'a', position: 1 } },
+  ])
+  const patches = patchesOf([ev(9, PATCH_TYPE, data)])
+  const blocks = projectedBlocks(message(), 4, patches)
+  assert.deepEqual(
+    blocks.map((block) => [block.kind, block.text]),
+    [['reasoning', 'OLD THINK'], ['text', 'ADDED'], ['text', 'REPLACED']],
+  )
+  // The inserted block is addressable: its index is outside the recorded range
+  // and it carries the id the next save must reuse.
+  assert.ok(blocks[1].index >= INSERT_INDEX_BASE, 'inserted blocks get a synthetic index')
+  assert.equal(blocks[1].insertId, 'a')
+})
+
+test('a record written by the previous release is still read', () => {
+  // Exactly what 0.5.4 wrote: version 1, plain block rewrites.
+  const v1 = { version: 1, targets: [{ seq: 4, blockIndex: 1, kind: 'text', text: 'FROM V1' }] }
+  const patches = patchesOf([ev(9, PATCH_TYPE, v1)])
+  assert.equal(patches.get(4).replacements.get(1).text, 'FROM V1')
+  assert.deepEqual(
+    projectedBlocks(message(), 4, patches).map((block) => block.text),
+    ['OLD THINK', 'FROM V1'],
+  )
 })
