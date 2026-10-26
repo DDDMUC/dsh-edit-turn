@@ -238,6 +238,14 @@ test('the projection shows inserted blocks where the user put them', () => {
   assert.equal(blocks[1].insertId, 'a')
 })
 
+test('an inserted block carries the position a later save has to name again', () => {
+  const data = buildPatchData([{ seq: 4, kind: 'text', text: 'ADDED', insert: { id: 'a', position: 2 } }])
+  const blocks = projectedBlocks(message(), 4, patchesOf([ev(9, PATCH_TYPE, data)]))
+  const inserted = blocks.find((block) => block.insertId === 'a')
+  assert.ok(inserted, 'the inserted block is on the list')
+  assert.equal(inserted.position, 2, 'without this the next save of that block is refused')
+})
+
 test('a record written by the previous release is still read', () => {
   // Exactly what 0.5.4 wrote: version 1, plain block rewrites.
   const v1 = { version: 1, targets: [{ seq: 4, blockIndex: 1, kind: 'text', text: 'FROM V1' }] }

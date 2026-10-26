@@ -1310,6 +1310,7 @@ test('a busy session blocks the save up front and says why', async () => {
   assert.equal(submit.disabled, true, 'no dead click: the button is disabled while the turn runs')
   const errors = byClass(box, 'dshet-error')
   assert.equal(errors.length, 1)
+  // Blocked before any request: there is no host sentence to append.
   assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。')
 })
 
@@ -1354,7 +1355,9 @@ test('a host failure is shown in the editor and the button recovers', async () =
 
   const errors = byClass(editorIn(harness), 'dshet-error')
   assert.equal(errors.length, 1)
-  assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。')
+  // This one reached the host: its own sentence is appended, which is what makes
+  // a real 400 diagnosable instead of a code the reader cannot act on.
+  assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。（the session is still working）')
   const submit = byClass(editorIn(harness), 'dshet-btn-primary')[0]
   assert.equal(submit.disabled, false, 'the user can retry')
   assert.equal(controller.getSnapshot().pending, false)
