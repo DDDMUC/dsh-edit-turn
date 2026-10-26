@@ -109,11 +109,16 @@ check('injects the per-session overlay slot', injections.includes('conversation.
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
 check('injects the official assistant-actions slot', injections.includes('conversation.chat.assistant-actions'), injections.join(','))
 check('injects the plugin manager row-config slot', injections.includes('plugins.row.config'), injections.join(','))
+check('injects the turn-tail slot (the fallback strip)', injections.includes('conversation.chat.turnTail'), injections.join(','))
 
-// Two entries, two injection points. Picked by name so adding a third entry does
-// not silently re-point these checks at the wrong one.
+// One entry per injection point. Picked by name so adding another entry does not
+// silently re-point these checks at the wrong one.
+//   assistant-actions  the pencil, in the host's own reply strip
+//   input.overlay      the editor
+//   row.config         the plugin manager row
+//   chat.turnTail      the fallback strip for a turn the host draws no strip for
 const byName = (name) => registrations.find((item) => item.definition.name === name) || { definition: {} }
-check('registers one entry per injection point', registrations.length === 3, `got ${registrations.length}`)
+check('registers one entry per injection point', registrations.length === 4, `got ${registrations.length}`)
 const rowConfigRegistration = byName('plugins.row.config')
 check('the row-config entry uses the manager key', rowConfigRegistration.definition.key === 'dsh-edit-turn#dsh-edit-turn', rowConfigRegistration.definition.key)
 check('the row-config entry renders a component', typeof rowConfigRegistration.component === 'function')

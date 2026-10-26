@@ -1443,6 +1443,134 @@ test('an unchanged row count does not re-ask the host', async () => {
   assert.equal(asked.length, 0, 'no redundant /state traffic while nothing changed')
 })
 
+// --- the fallback strip, for a turn the host draws no action row for ---------
+
+const TAIL_SLOT = 'conversation.chat.turnTail'
+
+/** Load a state with the given replies into the harness controller. */
+async function tailController(harness, replies) {
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ ok: true, hidden: [], turns: [], replies, patches: [], config: { confirm: false } }),
+  })
+  await harness.controller.load(true)
+}
+
+/** Render the tail entry for one turn. */
+function renderTail(harness, turn, lastTurn) {
+  const entry = harness.registrations.find((item) => item.definition && item.definition.name === TAIL_SLOT)
+  const props = entry.definition.inject(SESSION_ID)
+  // The host hands the last turn in the timeline; that is what decides whether
+  // the strip is always visible or only on hover.
+  const useChat = (select) => select({ timeline: { turnOrder: [1, 2, lastTurn] } })
+  return entry.component({ ...props, turn, seq: 4, openFile: () => {}, useChat, t: harness.t })
+}
+
+/** Every button in a rendered tree, flattened. */
+function buttonsOf(tree) {
+  const out = []
+  const visit = (node) => {
+    if (node === null || node === undefined || typeof node !== 'object') return
+    if (node.type === 'button') out.push(node)
+    const kids = node.props && node.props.children
+    if (Array.isArray(kids)) kids.forEach(visit)
+    else visit(kids)
+  }
+  visit(tree)
+  return out
+}
+
+test('the fallback strip is registered in the slot the broken branch still renders', async () => {
+  const harness = await loadBundle()
+  const entry = harness.registrations.find((item) => item.definition && item.definition.name === TAIL_SLOT)
+  assert.ok(entry, 'a turnTail entry is registered')
+  assert.equal(entry.definition.id, 'edit-turn-tail', 'an id of its own, never a shipped one')
+  assert.equal(typeof entry.definition.order, 'number')
+  const props = entry.definition.inject(SESSION_ID)
+  assert.equal(typeof props.controller, 'object', 'the entry gets the session controller')
+})
+
+test('the fallback strip draws a pencil and a copy button for a reply with no body', async () => {
+  const harness = await loadBundle()
+  // The case this exists for: the whole answer went into reasoning, so the turn
+  // has no closing text block.
+  await tailController(harness, [
+    { seq: 7, turn: 2, messageId: undefined, text: '', attachments: 0, blocks: [{ kind: 'reasoning', seq: 7, text: 'thinking it through' }] },
+  ])
+  const tree = renderTail(harness, 2, 2)
+  const buttons = buttonsOf(tree)
+  assert.equal(buttons.length, 2, 'exactly a pencil and a copy')
+  assert.equal(buttons[0].props['aria-label'], harness.t('action.edit-reply'))
+  assert.equal(buttons[1].props['aria-label'], harness.t('action.copy'))
+  assert.equal(tree.props.className, 'dshet-tail')
+})
+
+test('the fallback strip acts on the LAST reply of the turn', async () => {
+  const harness = await loadBundle()
+  await tailController(harness, [
+    { seq: 5, turn: 2, text: 'first step', attachments: 0, blocks: [{ kind: 'text', seq: 5, text: 'first step' }] },
+    { seq: 9, turn: 2, text: '', attachments: 0, blocks: [{ kind: 'reasoning', seq: 9, text: 'last step' }] },
+  ])
+  const opened = []
+  harness.controller.open = (payload) => opened.push(payload)
+  renderTail(harness, 2, 2)
+  const buttons = buttonsOf(renderTail(harness, 2, 2))
+  buttons[0].props.onClick({ preventDefault() {}, stopPropagation() {}, currentTarget: null })
+  assert.equal(opened.length, 1)
+  assert.equal(opened[0].seq, 9, 'the end of the turn, where the host would hang its own strip')
+  assert.equal(opened[0].mode, 'reply')
+})
+
+test('the fallback copy writes the answer, and the reasoning when there is none', async () => {
+  const harness = await loadBundle()
+  await tailController(harness, [
+    { seq: 9, turn: 2, text: '', attachments: 0, blocks: [{ kind: 'reasoning', seq: 9, text: 'the thinking' }] },
+  ])
+  harness.clipboard.length = 0
+  const buttons = buttonsOf(renderTail(harness, 2, 2))
+  buttons[1].props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(harness.clipboard, ['the thinking'], 'no body: the reasoning is what the turn said')
+
+  await tailController(harness, [
+    { seq: 9, turn: 2, text: 'the answer', attachments: 0, blocks: [{ kind: 'text', seq: 9, text: 'the answer' }, { kind: 'reasoning', seq: 9, text: 'the thinking' }] },
+  ])
+  harness.clipboard.length = 0
+  const withBody = buttonsOf(renderTail(harness, 2, 2))
+  withBody[1].props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(harness.clipboard, ['the answer'], 'a body wins over the reasoning')
+})
+
+test('the fallback strip follows the host reveal rule: latest always, older on hover', async () => {
+  const harness = await loadBundle()
+  await tailController(harness, [
+    { seq: 9, turn: 2, text: 'the answer', attachments: 0, blocks: [{ kind: 'text', seq: 9, text: 'the answer' }] },
+  ])
+  assert.equal(renderTail(harness, 2, 2).props['data-reveal'], 'always', 'the latest turn is always visible')
+  assert.equal(renderTail(harness, 2, 3).props['data-reveal'], 'hover', 'an older turn reveals on hover')
+})
+
+test('the fallback strip draws nothing for a turn this plugin cannot act on', async () => {
+  const harness = await loadBundle()
+  await tailController(harness, [
+    { seq: 9, turn: 2, text: 'the answer', attachments: 0, blocks: [{ kind: 'text', seq: 9, text: 'the answer' }] },
+  ])
+  assert.equal(renderTail(harness, 5, 5), null, 'no reply in that turn: no empty row')
+})
+
+test('one CSS rule keeps the fallback strip off every turn the host already drew a row for', async () => {
+  const harness = await loadBundle()
+  const tag = harness.document.head.children.find((child) => child.dataset && child.dataset.plugin === 'dsh-edit-turn')
+  assert.ok(tag, 'the stylesheet is injected')
+  // The gate is the host's own marker: `data-actions-reveal` is rendered on the
+  // tail container exactly on the branch that also renders the official strip.
+  assert.match(tag.textContent, /\[data-turn-tail\]\[data-actions-reveal\] \.dshet-tail\{display:none\}/)
+})
+
 // --- the reply entry, which lives in the official action strip ---------------
 
 test('the reply edit entry is registered in the assistant-actions strip', async () => {
