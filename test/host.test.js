@@ -973,6 +973,49 @@ test('an inserted block lands as one record and stays a draft until it has text'
   }
 })
 
+/** A closed turn whose assistant reply has NO text block - reasoning only. */
+function buildThinkingOnlyLog(session) {
+  session.append('turn/start', { turn: 1 })
+  session.append('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'SYS' }], source: { kind: 'system-prompt' } } }, { surfaceOp: 'append' })
+  session.append('step/start', { turn: 1, step: 1 })
+  session.append('user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'Q1' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  session.append('assistant/message', {
+    turn: 1,
+    step: 1,
+    message: {
+      id: 'a1',
+      role: 'assistant',
+      content: [{ type: 'thinking', text: 'ONLY THINKING', signature: 'sig-1' }],
+      source: { kind: 'model', provider: 'p', model: 'm' },
+    },
+    stream: [],
+  }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 1, step: 1 })
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+}
+
+test('a body block can be added to a reply that has no body yet', async () => {
+  // The whole reply went into reasoning: there is no text block to point at, and
+  // demanding one (the way a block REWRITE must) rejected the insertion with
+  // "the requested block changed kind". This is the case the feature exists for.
+  const session = Session.create(SESSION_ID)
+  buildThinkingOnlyLog(session)
+  const assistant = session.snapshotEvents().find((event) => event.type === 'assistant/message' && event.data.message.id === 'a1')
+  const h = await harness({ session, patch: true })
+  try {
+    const res = await applyEdit(h.port, {
+      sessionId: SESSION_ID,
+      targets: [{ seq: assistant.seq, kind: 'text', text: 'added body', insert: { id: 'ins-body', position: 1 } }],
+    })
+    assert.equal(res.status, 200, res.payload)
+    assert.equal(res.json.applied, true)
+    const record = h.session.snapshotEvents().at(-1)
+    assert.deepEqual(record.data.targets[0].insert, { id: 'ins-body', position: 1 })
+  } finally {
+    await h.close()
+  }
+})
+
 test('clearing a block that was inserted removes it through a tombstone', async () => {
   const session = Session.create(SESSION_ID)
   buildReasoningLog(session)
