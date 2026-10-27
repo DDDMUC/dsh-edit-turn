@@ -1315,52 +1315,8 @@ test('loopback host spellings are accepted and impostors are not', async () => {
 
 // --- tool -------------------------------------------------------------------
 
-test('the read-only tool is registered with a valid contract', async () => {
-  const h = await harness()
-  try {
-    assert.equal(h.toolCalls.length, 1)
-    const tool = h.toolCalls[0]
-    assert.equal(tool.name, 'edit_turn_targets')
-    assert.equal(typeof tool.execute, 'function')
-    assert.equal(typeof tool.output.render, 'function')
-    // `render` must return ContentBlock[], never a bare string.
-    const rendered = tool.output.render({}, 'hello')
-    assert.ok(Array.isArray(rendered))
-    assert.deepEqual(rendered[0], { type: 'text', text: 'hello' })
-    assert.ok(tool.parameters.properties.sessionId)
-    assert.ok(tool.parameters.properties.limit)
-  } finally {
-    await h.close()
-  }
-})
 
-test('the tool lists the editable turns and changes nothing', async () => {
-  const h = await harness()
-  try {
-    const before = h.session.seq
-    const tool = h.toolCalls[0]
-    const text = await tool.execute({ sessionId: SESSION_ID, limit: 10 }, {})
-    assert.equal(typeof text, 'string')
-    assert.match(text, /2 editable turn\(s\), 2 editable reply\/replies, idle/)
-    assert.match(text, /turn 1 \(seq 2/)
-    assert.match(text, /original prompt/)
-    assert.match(text, /reply \(seq 3/)
-    assert.match(text, /first answer/)
-    assert.match(text, /editing a turn replaces its wording in place/)
-    assert.equal(h.session.seq, before)
-  } finally {
-    await h.close()
-  }
-})
 
-test('the tool admits when it has no session to inspect', async () => {
-  const h = await harness()
-  try {
-    await assert.rejects(() => h.toolCalls[0].execute({}, {}), /no sessionId/)
-  } finally {
-    await h.close()
-  }
-})
 
 // --- blocks: a revised message carries everything it carried -----------------
 //

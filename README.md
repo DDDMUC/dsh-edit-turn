@@ -142,7 +142,6 @@ ctx.sessions.registerMessageProjection({
 | 路由 | `GET /dsh-edit-turn/state?sessionId=` | 可编辑轮次、已遮蔽行账本（`hidden` + `revisions`）、surface、忙碌状态；`mode` 是 `patch` 或 `replay`；`patches[]` 是已落地的就地补丁；回复项带 `blocks[]`（`index` / `kind` / 当前投影 `text` / `original` / `patched`） |
 | 路由 | `POST /dsh-edit-turn/apply` | 提示词：`{ sessionId, seq \| messageId \| turn, text, parts? }`；就地回复：再加 `blockIndex` + `kind`（`text` / `reasoning`）。写入改后内容；`parts` 是要保留/新增的块列表（`[{ keep } \| { add: { data, mediaType?, name? } }]`，缺省 = 老客户端的纯文字载体）；响应含 `applied` / `shadowed` / `replacementSeq` / `dropped` / `blocks`；改后文本与当前活文本一字不差**且块列表与原消息相同**时什么都不写，响应改为 `applied:false` + `unchanged:true` + `shadowed:[]`（`original` 是它比较的那份文本）。这是一个**标志，不是拒绝**：调用方自己决定下一步（编辑器的「重跑」正是靠它继续发起重跑） |
 | 路由 | `GET /dsh-edit-turn/attachment?sessionId=&seq=&index=` | 只读：该会话日志确实引用过的那个块的原始字节（芯片缩略图用）；回环 + 同源 + 只认本会话引用过的引用，取不到就 404（芯片退回显示名字）。它**只用于显示**，改写路径完全不经过它 |
-| 工具 | `edit_turn_targets` | 只读：列出该会话当前可编辑的轮次、回复与每条回复的可编辑块（供 agent 自查） |
 | 前端 | `conversation.input.overlay` | 每会话控制器：编辑入口、就地编辑器、被遮蔽行的隐藏账本 |
 
 ### 跨插件契约（给兄弟插件）
@@ -195,7 +194,7 @@ DSH_BIN=/path/to/dsh/lib/bin.js PORT=4123 DSH_HOME=/tmp/dsh-edit-turn-home bash 
 
 **「两支铅笔该落在哪儿」同样已被覆盖**，这是按你给的规范改的：用户行那颗笔排在**动作条的最右边**（时间、复制、以及兄弟插件后插进来的按钮之后），回复行那颗笔排在**动作条的最左边**（复制按钮之前）。两处都不是"换个插入点"能办到的，各自卡在一个宿主限制上：折叠行原先把笔塞进替代气泡的字外留白里（要悬停改写文本才看得见，也够不着"复制"）；回复笔受宿主注册的 slot 约束，DOM 上必然排在平台自己画的复制按钮之后。现在的做法是：①`renderRevision` 把改写后的笔**交给那条活下来的动作条**（`injectRowAction(row, editTarget, …)`），同时把它从气泡里摘掉，只有行彻底没有条可留时才退回气泡字外留白；`applyDom` 在行可见时**只在没有替代气泡站位时**才拆掉行上的笔——否则会把上一行刚放进去的笔拆走。②回复笔靠新增的 `.dshet-reply-action` 加 flex `order:-1` 冲到最左，因为那一格宿主是 `display:contents`，DOM 序永远只能第二，只有顺序属性改得动；用户笔同理——兄弟插件（`dsh-delete-turn`）会在任意时刻把垃圾桶**追加**进同一条动作条，DOM 插入序保不住右端，所以 `.dshet-action-host` 带 `order:9`，无论谁后插都在它左边。颜色也一并对齐平台：`.dshet-action` 改用平台的 `--dsw-alias-label-tertiary`（悬停 `--dsw-alias-label-primary`，留一个等于默认主题取值的兜底），不再用自己的蓝灰墨色——此前它比旁边的复制/垃圾桶更蓝，看起来像另一个控件；实测两者计算色都是 `rgb(129, 133, 140)`。测试上：原"铅笔在字外留白"的用例改写为「铅笔并进那条活下来的条的末尾、气泡里不再留笔」，无条用例补上"留白里仍有笔"，回复 entry 用例补 class 断言；静态检查加 4 条钉住这一批写法（含「气泡按内容收窄」），另加 1 条钉住 `order:9`，`verify:live` 加 2 个下发标记；`verify:ui` 的「行末尾的笔」断言改成**按布局量右边缘**（DOM 序不算数）并已在真机重载后跑通——现场那个用户条是 `时间 → 复制 → 垃圾桶 → 笔`，笔在最右（原始会话/切走的会话/切回后三处确认）。三处新写法各做过反向复现：把「笔交给动作条」「`.dshet-reply-action` class」「`applyDom` 的站位守卫」逐一还原，各有一个用例失败（守卫那处失败在「笔并进条末尾」用例上——它恰好也钉住了"刚放好又被拆走"这条回归）。当前 `npm run check` **105 项** + 契约 + 静态全绿。
 
-**开发前置**：`npm test` 与两个 `verify:*` 需要 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-tools` 可解析。本插件自身不依赖它们（宿主半部只 import `schemastery` 与 `dsh-tools`），测试需要一个装了 DSH 的 `node_modules`：
+**开发前置**：`npm test` 与两个 `verify:*` 需要 `@deepseek-ai/dsh-session` 与 `@deepseek-ai/dsh-settings` 可解析。本插件运行时不依赖它们（宿主半部只 import `schemastery` 与 `dsh-session`，后者由宿主提供），测试需要一个装了 DSH 的 `node_modules`：
 
 ```sh
 ln -s /path/to/dsh-install/node_modules ./node_modules
@@ -233,7 +232,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
    cd <插件目录> && rm -f node_modules && npm install --omit=dev --legacy-peer-deps
    ```
 
-   注意区分两类依赖：宿主提供的 **peer**（`dsh-tools`、`dsh-settings`）由 DSH 加载器解析，可以不装；**普通 dependencies**（如 `schemastery`）必须能解析到，加载器不会替你找。
+   注意区分两类依赖：宿主提供的 **peer**（`dsh-settings`、`dsh-session`）由 DSH 加载器解析，可以不装；**普通 dependencies**（如 `schemastery`）必须能解析到，加载器不会替你找。
 3. **加载了但没入口时**，用只读诊断路由看浏览器半部到底问了什么：
 
    ```sh
@@ -389,7 +388,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
   1. `lib/patch.js`：`PATCH_TYPE = 'plugin:dsh-edit-turn/patch'`，记录载荷 `{ version, targets: [{ seq, blockIndex, kind, text }] }`；`patchProjection()` 按 seq 分组、以「已投影消息」为 base 叠加多条记录，改思维链时删除 `signature` / `thinkingSignature`；
   2. `apply` 现场探测 `appendPluginRecord` 与 `ctx.sessions.registerMessageProjection`，成功才启用 patch 模式（`/debug` 的 `mode` 可查）；任一缺失退回重放，`replyMode: 'patch'` 则直接报错；
   3. `planRollback` 的回复分支在 patch 模式下只解析目标块（`blockIndex` / `kind`），不计算窗口、不碰 turn；`applyEdit` 只调一次 `appendPluginRecord` 再 flush；
-  4. `/state` 返回 `mode`、`patches[]`、每条回复的 `blocks[]`（`index` / `kind` / 当前投影 `text` / `original` / `patched`）；`edit_turn_targets` 工具也列出块。
+  4. `/state` 返回 `mode`、`patches[]`、每条回复的 `blocks[]`（`index` / `kind` / 当前投影 `text` / `original` / `patched`）。
 - **客户端**：回复编辑器加块选择器；保存只发 `blockIndex` / `kind` / `text`；正文补丁在宿主 markdown 容器里就地替换，思维链补丁在回复下方显示注记。原始行、动作条、工具卡片都不动。
 - **兼容**：没有投影能力的宿主继续走 0.2.21 重放；`replyMode: replay` 可强制旧路径；卸载插件并重启宿主后投影消失，模型与 UI 都回到记录里的原文——这是 overlay 机制与 surface 事件的取舍，README 的「工作原理」已写明。
 - **测试**：`npm test` **205/205**、`npm run verify:contract` **96** 项、`npm run verify:client` **184** 项；新增 9 条纯 patch 用例、3 条宿主 patch 用例（一条记录、无 turn、投影叠加、思维链签名去掉、unchanged 不写、热重载复用投影）、4 条客户端 DOM 用例（块选择器、保存载荷、正文就地显示、思维链注记），沙箱 `verify:profile` 新增「真实 profile 中 `mode=patch` 且 `appendPluginRecord` 可用」的探针。
@@ -572,7 +571,7 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 - `dsh.engines.dsh`: `>=0.1.6-alpha.2`（本插件依赖该版本的消息行定义与 surface 语义；`0.1.6-alpha.2` 与 `0.1.7-rc.1` 均已实测）。
 - 客户端依赖：`dsh-client-locale`、`dsh-client-ui-chat`、`dsh-client-ui-conversation`、`dsh-client-ui-primitives`。
-- 宿主依赖：`dsh-settings`、`dsh-tools`（peer）；`@deepseek-ai/schemastery`（直接依赖）。
+- 宿主依赖：`dsh-settings`、`dsh-session`（peer）；`@deepseek-ai/schemastery`（直接依赖）。
 
 ### License
 
@@ -772,7 +771,6 @@ first `session.append`, so a refused upload (too large, malformed bytes) answers
 | Route | `GET /dsh-edit-turn/state?sessionId=` | Editable turns, the hidden-row ledger (`hidden` + `revisions`), the surface, busy state |
 | Route | `POST /dsh-edit-turn/apply` | `{ sessionId, seq \| messageId \| turn, text, parts? }` → write the revised text; `parts` is the block list to keep and add (`[{ keep } \| { add: { data, mediaType?, name? } }]`; omitted means the text-only carrier an older client sends); the response carries `applied` / `shadowed` / `replacementSeq` / `dropped` / `blocks` |
 | Route | `GET /dsh-edit-turn/attachment?sessionId=&seq=&index=` | Read-only: the raw bytes of one block the session's own log cites (a chip's thumbnail). Loopback and same-origin only, and it serves nothing no session references; a miss answers 404 and the chip falls back to its label. Display only - the edit path never goes through it |
-| Tool | `edit_turn_targets` | Read-only: list the session's editable turns and their text |
 | Client | `conversation.input.overlay` | Per-session controller: edit entry, in-place editor, hidden-row ledger |
 
 ### Cross-plugin contract (for sibling plugins)
@@ -1011,9 +1009,10 @@ checks pin the container shape and the IME guard; `verify:live` carries the
 marker.
 
 **Development prerequisite:** `npm test` and both `verify:*` commands need
-`@deepseek-ai/dsh-session` and `@deepseek-ai/dsh-tools` to resolve. The plugin
+`@deepseek-ai/dsh-settings` and `@deepseek-ai/dsh-session` to resolve. The plugin
 itself does not depend on them (the host half imports only `schemastery` and
-`dsh-tools`), so tests need a `node_modules` from a DSH installation:
+`dsh-session`, the latter provided by the host), so tests need a `node_modules`
+from a DSH installation:
 
 ```sh
 ln -s /path/to/dsh-install/node_modules ./node_modules
@@ -1051,7 +1050,7 @@ Separate "the plugin never loaded" from "it loaded but nothing rendered" - the t
    cd <plugin dir> && rm -f node_modules && npm install --omit=dev --legacy-peer-deps
    ```
 
-   Mind the two kinds of dependency: **peers** provided by the host (`dsh-tools`, `dsh-settings`) are resolved by the DSH loader and need no install; **regular dependencies** (like `schemastery`) must resolve on their own - the loader will not find them for you.
+   Mind the two kinds of dependency: **peers** provided by the host (`dsh-settings`, `dsh-session`) are resolved by the DSH loader and need no install; **regular dependencies** (like `schemastery`) must resolve on their own - the loader will not find them for you.
 3. **"One session shows no edit entries at all while `/dsh-edit-turn/state` answers 404 in its console"**: that session is being **held by another DSH instance** (the desktop app has it open, or vice versa). A session can only belong to one instance at a time - host behaviour, not a plugin problem. Use it from that instance, or release it in the other one first. `verify:ui` notes and skips this case instead of failing.
 4. **"The history fails to load / one session is unreadable"** (`session-not-found`,
 with `SessionFormatError` in the console): this can be a log broken by the reply
@@ -1087,7 +1086,7 @@ byte-for-byte backup - truncates at the first event the reader refuses:
 
 - `dsh.engines.dsh`: `>=0.1.6-alpha.2` (this plugin relies on that release's message-row definitions and surface semantics, and was verified on it).
 - Client dependencies: `dsh-client-locale`, `dsh-client-ui-chat`, `dsh-client-ui-conversation`, `dsh-client-ui-primitives`.
-- Host dependencies: `dsh-settings`, `dsh-tools` (peers); `@deepseek-ai/schemastery` (direct).
+- Host dependencies: `dsh-settings`, `dsh-session` (peers); `@deepseek-ai/schemastery` (direct).
 
 ### License
 
