@@ -3919,6 +3919,82 @@ test('saving a reply block posts the block target, not a whole-message replaceme
   assert.equal(reply.patched, true)
 })
 
+test('a block the user added is drawn under that reply in the transcript', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  const body = harness.document.createElement('div')
+  const paragraph = harness.document.createElement('p')
+  paragraph.textContent = 'the recorded answer'
+  body.appendChild(paragraph)
+  node.appendChild(body)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  const state = (patches) => async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({ patches }),
+  })
+  globalThis.fetch = state([
+    { seq: 5, blockIndex: 1000000, insertId: 'ins-thought', kind: 'reasoning', text: 'a thought I added' },
+    { seq: 5, blockIndex: 1000001, insertId: 'ins-body', kind: 'text', text: 'a body I added' },
+  ])
+  await controller.load(true)
+  render(harness, controller, snapshot)
+
+  const added = byClass(harness.document.body, 'dshet-added')
+  const where = { rowHas: byClass(row, 'dshet-added').length, bodyHas: added.length }
+  assert.equal(added.length, 1, 'one container: ' + JSON.stringify(where))
+  assert.equal(where.rowHas, 1, 'and it sits in the row that owns the seq')
+  const blocks = byClass(added[0], 'dshet-added-block')
+  assert.deepEqual(blocks.map((block) => block.textContent), ['a thought I added', 'a body I added'])
+  assert.equal(blocks[0].className.includes('dshet-added-reasoning'), true, 'reasoning keeps its own look')
+  assert.equal(blocks[1].className.includes('dshet-added-text'), true)
+  assert.equal(paragraph.textContent, 'the recorded answer', "the host's own block is untouched")
+
+  // Taking the insertion away takes the drawn block with it: nothing of ours
+  // may linger once the record is gone.
+  globalThis.fetch = state([])
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(byClass(row, 'dshet-added').length, 0, 'no leftover node')
+})
+
+test('only the insertions that still exist are drawn', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const root = harness.document.createElement('div')
+  root.setAttribute('data-slot', 'main.conversation')
+  const node = harness.document.createElement('div')
+  node.setAttribute('data-slot', 'conversation.chat.node')
+  root.appendChild(node)
+  root.appendChild(node)
+  const { row, snapshot } = mountAssistantRow(harness.document)
+  row.appendChild(root)
+  const state = (patches) => async () => ({
+    ok: true,
+    status: 200,
+    json: async () => patchState({ patches }),
+  })
+  globalThis.fetch = state([
+    { seq: 5, blockIndex: 1000000, insertId: 'ins-a', kind: 'text', text: 'first' },
+    { seq: 5, blockIndex: 1000001, insertId: 'ins-b', kind: 'text', text: 'second' },
+  ])
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.deepEqual(byClass(row, 'dshet-added-block').map((b) => b.textContent), ['first', 'second'])
+
+  // ins-a was cleared (a tombstone), ins-b kept.
+  globalThis.fetch = state([{ seq: 5, blockIndex: 1000001, insertId: 'ins-b', kind: 'text', text: 'second' }])
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.deepEqual(byClass(row, 'dshet-added-block').map((b) => b.textContent), ['second'])
+})
+
 test('a landed text patch is drawn in place over the recorded reply text', async () => {
   const harness = await loadBundle()
   const controller = harness.controller
