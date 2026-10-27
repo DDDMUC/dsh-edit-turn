@@ -3946,18 +3946,33 @@ test('a block the user added is drawn under that reply in the transcript', async
   await controller.load(true)
   render(harness, controller, snapshot)
 
-  const added = byClass(harness.document.body, 'dshet-added')
-  const where = { rowHas: byClass(row, 'dshet-added').length, bodyHas: added.length }
-  assert.equal(added.length, 1, 'one container: ' + JSON.stringify(where))
-  assert.equal(where.rowHas, 1, 'and it sits in the row that owns the seq')
+  const added = byClass(row, 'dshet-added')
+  assert.equal(added.length, 1, 'one container, in the row that owns the seq')
   const blocks = byClass(added[0], 'dshet-added-block')
-  assert.deepEqual(blocks.map((block) => block.textContent), ['a thought I added', 'a body I added'])
-  assert.equal(blocks[0].className.includes('dshet-added-reasoning'), true, 'reasoning keeps its own look')
+  assert.equal(blocks.length, 2)
+  // The text lives in the body; a reasoning block also carries the section head
+  // the host itself uses (caret + 思考), so it must not be read from textContent.
+  const bodies = byClass(added[0], 'dshet-added-body')
+  assert.deepEqual(bodies.map((body) => body.textContent), ['a thought I added', 'a body I added'])
+  assert.equal(blocks[0].className.includes('dshet-added-reasoning'), true)
   assert.equal(blocks[1].className.includes('dshet-added-text'), true)
+  // Drawn the way the host draws its own reasoning: a caret and the word it uses.
+  const head = byClass(blocks[0], 'dshet-added-think')[0]
+  assert.ok(head, 'the reasoning block has a section head')
+  assert.equal(byClass(head, 'dshet-added-caret').length, 1, 'with the caret')
+  assert.equal(head.textContent, harness.t('added.thinking'), 'and the host\'s own word for it')
+  assert.equal(byClass(blocks[1], 'dshet-added-think').length, 0, 'a body block has no head')
   assert.equal(paragraph.textContent, 'the recorded answer', "the host's own block is untouched")
 
   // Taking the insertion away takes the drawn block with it: nothing of ours
   // may linger once the record is gone.
+  // Pressing the head folds the block, the way the host's own section folds.
+  head.fire('click')
+  assert.equal(blocks[0].getAttribute('data-collapsed'), '1', 'the head folds the text away')
+  assert.equal(head.getAttribute('aria-expanded'), 'false')
+  head.fire('click')
+  assert.equal(blocks[0].getAttribute('data-collapsed'), null, 'and unfolds it again')
+
   globalThis.fetch = state([])
   await controller.load(true)
   render(harness, controller, snapshot)
@@ -3986,13 +4001,13 @@ test('only the insertions that still exist are drawn', async () => {
   ])
   await controller.load(true)
   render(harness, controller, snapshot)
-  assert.deepEqual(byClass(row, 'dshet-added-block').map((b) => b.textContent), ['first', 'second'])
+  assert.deepEqual(byClass(row, 'dshet-added-body').map((b) => b.textContent), ['first', 'second'])
 
   // ins-a was cleared (a tombstone), ins-b kept.
   globalThis.fetch = state([{ seq: 5, blockIndex: 1000001, insertId: 'ins-b', kind: 'text', text: 'second' }])
   await controller.load(true)
   render(harness, controller, snapshot)
-  assert.deepEqual(byClass(row, 'dshet-added-block').map((b) => b.textContent), ['second'])
+  assert.deepEqual(byClass(row, 'dshet-added-body').map((b) => b.textContent), ['second'])
 })
 
 test('a landed text patch is drawn in place over the recorded reply text', async () => {
