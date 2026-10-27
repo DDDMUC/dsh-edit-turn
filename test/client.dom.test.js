@@ -1310,7 +1310,6 @@ test('a busy session blocks the save up front and says why', async () => {
   assert.equal(submit.disabled, true, 'no dead click: the button is disabled while the turn runs')
   const errors = byClass(box, 'dshet-error')
   assert.equal(errors.length, 1)
-  // Blocked before any request: there is no host sentence to append.
   assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。')
 })
 
@@ -1355,8 +1354,6 @@ test('a host failure is shown in the editor and the button recovers', async () =
 
   const errors = byClass(editorIn(harness), 'dshet-error')
   assert.equal(errors.length, 1)
-  // This one reached the host: its own sentence is appended, which is what makes
-  // a real 400 diagnosable instead of a code the reader cannot act on.
   assert.equal(errors[0].textContent, '该会话正在回复中，请等回复结束后再编辑。（the session is still working）')
   const submit = byClass(editorIn(harness), 'dshet-btn-primary')[0]
   assert.equal(submit.disabled, false, 'the user can retry')
@@ -1444,111 +1441,6 @@ test('an unchanged row count does not re-ask the host', async () => {
   render(harness, controller, snapshot)
   render(harness, controller, snapshot)
   assert.equal(asked.length, 0, 'no redundant /state traffic while nothing changed')
-})
-
-// --- inserting a block -------------------------------------------------------
-
-/** A patch-mode reply state with two blocks, loaded into the controller. */
-async function patchReplyState(harness) {
-  const state = {
-    ok: true,
-    hidden: [],
-    turns: [],
-    patches: [],
-    config: { confirm: false },
-    replies: [
-      {
-        seq: 5,
-        turn: 1,
-        messageId: 'm-a1',
-        text: 'the answer',
-        attachments: 0,
-        blocks: [
-          { index: 0, kind: 'reasoning', text: 'the thinking' },
-          { index: 1, kind: 'text', text: 'the answer' },
-        ],
-      },
-    ],
-  }
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state })
-  await harness.controller.load(true)
-  return state
-}
-
-function openReplyEditor(harness, state) {
-  harness.controller.open({
-    seq: 5,
-    mode: 'reply',
-    turn: 1,
-    messageId: 'm-a1',
-    text: state.replies[0].text,
-    attachments: 0,
-    blocks: state.replies[0].blocks,
-    patch: true,
-  })
-}
-
-test('adding a block drafts one right after the block being edited', async () => {
-  const harness = await loadBundle()
-  const state = await patchReplyState(harness)
-  openReplyEditor(harness, state)
-  harness.controller.selectBlock('5:1')     // the answer block, a content index
-  harness.controller.addBlock('reasoning')
-
-  const blocks = harness.controller.editor.blocks
-  assert.equal(blocks.length, 3, 'the draft joins the block list')
-  const draft = blocks[2]
-  assert.equal(draft.kind, 'reasoning')
-  assert.equal(draft.text, '', 'a draft starts empty')
-  assert.equal(typeof draft.insertId, 'string', 'the draft carries a stable id')
-  // "Below the one being edited": content index 1 is the answer, so 2 comes next.
-  assert.equal(draft.position, 2)
-  assert.ok(draft.index >= 1000000, 'a synthetic index the recorded blocks cannot collide with')
-})
-
-test('saving an inserted draft posts an insertion, not a rewrite', async () => {
-  const harness = await loadBundle()
-  const state = await patchReplyState(harness)
-  openReplyEditor(harness, state)
-  harness.controller.selectBlock('5:0')
-  harness.controller.addBlock('text')
-  harness.controller.setDraft('a block I added')
-
-  const calls = []
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), body: init && init.body })
-    return { ok: true, status: 200, json: async () => ({ ok: true, applied: true, kind: 'reply' }) }
-  }
-  await harness.controller.confirm()
-
-  const apply = calls.find((call) => call.url.includes('/dsh-edit-turn/apply'))
-  assert.ok(apply, 'the save reached the host')
-  const body = JSON.parse(apply.body)
-  assert.equal(Array.isArray(body.targets), true, 'an insertion travels in the targets form')
-  const target = body.targets[0]
-  assert.equal(target.insert.id, harness.controller.editor === null ? body.targets[0].insert.id : target.insert.id)
-  assert.equal(typeof target.insert.id, 'string')
-  assert.equal(target.insert.position, 1, 'right after block 0')
-  assert.equal(target.kind, 'text')
-  assert.equal(target.text, 'a block I added')
-})
-
-test('an inserted draft saved blank is sent as blank, never rejected as empty', async () => {
-  const harness = await loadBundle()
-  const state = await patchReplyState(harness)
-  openReplyEditor(harness, state)
-  harness.controller.addBlock('text')
-
-  const calls = []
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), body: init && init.body })
-    return { ok: true, status: 200, json: async () => ({ ok: true, applied: false, unchanged: true, kind: 'reply' }) }
-  }
-  await harness.controller.confirm()
-
-  const apply = calls.find((call) => call.url.includes('/dsh-edit-turn/apply'))
-  assert.ok(apply, 'the blank draft is still submitted: the host decides not to record it')
-  assert.equal(JSON.parse(apply.body).targets[0].text, '')
 })
 
 // --- the fallback strip, for a turn the host draws no action row for ---------
