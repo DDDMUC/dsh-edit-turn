@@ -90,6 +90,8 @@ export function foldSurface(events) {
   /** @type {number[]} */
   const nodes = []
   const dropped = new Set()
+  /** 被 replace 覆盖过的区间；落在这里面的事件都不再出现在界面上。 */
+  const ranges = []
   for (const event of events) {
     const op = event.surfaceOp
     if (op === undefined || op === null) continue
@@ -100,6 +102,9 @@ export function foldSurface(events) {
     if (typeof op === 'object' && op.op === 'replace') {
       const start = Number(op.startSeq)
       const end = Number(op.endSeq)
+      // 记下发起替换的那条事件的 seq：replace 只能遮蔽**它之前**的事件，
+      // 区间端点越界时不能把后面的事件也算成被覆盖。
+      ranges.push([start, end, event.seq])
       for (let i = nodes.length - 1; i >= 0; i -= 1) {
         const seq = nodes[i]
         if (seq >= start && seq <= end) {
@@ -107,7 +112,7 @@ export function foldSurface(events) {
           dropped.add(seq)
         }
       }
-      // 契约要求 replace 把它覆盖的节点列全；列出但不在这段里的，同样算摘掉。
+      // 契约要求 replace 把它覆盖的节点列全；列出的同样算摘掉。
       for (const seq of Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []) {
         const at = nodes.indexOf(seq)
         if (at >= 0) {
@@ -118,29 +123,21 @@ export function foldSurface(events) {
       nodes.push(event.seq)
     }
   }
-  return { visible: nodes, dropped }
+  // 覆盖范围内的**所有**事件都不可见，不只是表面节点：step/start、job/* 这类
+  // 没有 surfaceOp 的事件，只要落在被替换的区间里，就已经随那段历史一起从界面上
+  // 消失了——界面在那个位置画的是一条「压缩标记」行（chat bundle 里的
+  // CompactionItem），而不是原来的消息和过程面板。
+  const covered = new Set(dropped)
+  for (const event of events) {
+    for (const [start, end, at] of ranges) {
+      if (event.seq >= start && event.seq <= end && event.seq < at) {
+        covered.add(event.seq)
+        break
+      }
+    }
+  }
+  return { visible: nodes, dropped: covered }
 }
-
-/** 一条事件属于哪一步（turn:step），用于把工具调用与它的消息绑在一起。 */
-function stepKey(event) {
-  const data = event.data ?? {}
-  const turn = Number(data.turn)
-  const step = Number(data.step)
-  if (!Number.isFinite(turn) || !Number.isFinite(step)) return null
-  return `${turn}:${step}`
-}
-
-/** 消息类事件：会进入模型上下文的那几种。 */
-const MESSAGE_TYPES = new Set([
-  'user/message',
-  'assistant/message',
-  'system/message',
-  'developer/message',
-  'tool/result',
-])
-
-/** 保留但不算消息的结构事件：没有它们，折叠器不知道轮次从哪到哪。 */
-const STRUCTURE_TYPES = new Set(['turn/start', 'turn/end'])
 
 /** 账本要记的操作类型（来自四个组件写的记录）。 */
 const OPS_PREFIX = 'plugin:dsh-'
@@ -155,40 +152,19 @@ const OPS_PREFIX = 'plugin:dsh-'
  * @param {Set<number>} visibleSet - 折叠后可见的 seq 集合。
  * @returns {{ keep: boolean, why: string }}
  */
-function classify(event, visibleSet, visibleSteps) {
+function classify(event, covered) {
+  // 唯一可靠的判据：这条事件有没有被某次 replace 覆盖掉。
+  //
+  // 按类型猜是错的：step/start、job/* 看着像"元数据"，其实是界面上过程面板
+  // （已完成分析 / 思考 / 工具调用列表）的数据源；它们只有在被 replace 覆盖时
+  // 才该消失——而那一刻，界面在那个位置画的已经是「压缩标记」行。
+  if (covered.has(event.seq)) return { keep: false, why: '被 replace 覆盖（界面上已不在）' }
   const type = String(event.type ?? '')
-  if (STRUCTURE_TYPES.has(type)) return { keep: true, why: 'turn 边界' }
-  if (type === 'tool/call' || type === 'tool/result') {
-    // 工具调用和它的结果必须同进同出：留下调用却丢掉结果，模型会看到一个
-    // 永远等不到返回的工具调用，provider 直接报错。它们挂在同一个 (turn, step)
-    // 的 assistant 消息下，所以跟着那条消息走。
-    const step = stepKey(event)
-    if (step === null) return { keep: true, why: '工具事件（无法定位所属步）' }
-    return visibleSteps.has(step)
-      ? { keep: true, why: '可见步的工具事件' }
-      : { keep: false, why: '所属步已被遮蔽' }
-  }
-  if (MESSAGE_TYPES.has(type)) {
-    return visibleSet.has(event.seq)
-      ? { keep: true, why: '可见消息' }
-      : { keep: false, why: '被 replace 遮蔽' }
-  }
-  if (type.startsWith('compaction/')) {
-    return { keep: false, why: '宿主压缩书签（折进账本）' }
-  }
   if (type.startsWith(OPS_PREFIX)) {
-    // 补丁/重跑/删除的记录：内容会被折进消息、或转成账本条目。
+    // 我们自己的补丁/重跑/删除记录：内容会折进消息、或转成账本条目。
     return { keep: false, why: '操作记录（折进消息或账本）' }
   }
-  if (type === 'step/start' || type === 'step/end') return { keep: false, why: '步进元数据' }
-  if (type.startsWith('job/')) return { keep: false, why: '任务簿记' }
-  if (type === 'agent/inbox/spliced') return { keep: false, why: '拼接痕迹' }
-  if (type === 'session/end-seed') return { keep: false, why: '种子收尾' }
-  if (type === 'feedback/message-delete' || type === 'feedback/message-put' || type === 'feedback/record') {
-    return { keep: false, why: '反馈记录' }
-  }
-  // 其余一律留着：agent-preset/selected、approval/*、command/*、未知类型……
-  return { keep: true, why: '保留（不在可丢清单里）' }
+  return { keep: true, why: '界面仍会渲染' }
 }
 
 /**
@@ -243,22 +219,14 @@ export function estimate(file) {
   const { events, rawBytes, compressedBytes, header } = readLog(file)
   if (events.length === 0) throw new Error('日志里没有事件')
   const { visible, dropped } = foldSurface(events)
-  const visibleSet = new Set(visible)
-  // 可见的 (turn, step)：工具调用/结果据此决定去留。
-  const visibleSteps = new Set()
-  for (const event of events) {
-    if (!visibleSet.has(event.seq)) continue
-    if (event.type !== 'assistant/message') continue
-    const step = stepKey(event)
-    if (step !== null) visibleSteps.add(step)
-  }
+  const covered = dropped
 
   let keepRaw = 0
   let keepCount = 0
   const droppedByType = new Map()
   const keptByType = new Map()
   for (const event of events) {
-    const verdict = classify(event, visibleSet, visibleSteps)
+    const verdict = classify(event, covered)
     const line = Buffer.byteLength(JSON.stringify(event), 'utf8') + 1
     const bucket = verdict.keep ? keptByType : droppedByType
     bucket.set(event.type, (bucket.get(event.type) ?? 0) + 1)
@@ -396,6 +364,212 @@ function resolveLog(arg) {
 }
 
 // 路径里有空格时手工拼 file:// 会不相等，用 pathToFileURL 对齐编码。
+/**
+ * 无论被谁覆盖都保留的事件：这些是界面渲染「压缩标记」和会话元信息要用的，
+ * 体量可以忽略（这个会话里 64 条），丢了会让界面少一行标记或丢标题。
+ */
+const KEEP_ALWAYS = ['compaction/', 'session/']
+
+/**
+ * 生成压缩后的日志事件流。
+ *
+ * 关键约束：宿主校验"被引用的 seq 必须先存在"，所以不能一边删掉被 replace
+ * 覆盖的原文、一边留着那条 replace。做法是**每个被覆盖的区间留一个锚事件**
+ * （区间里最小的那条），把 replace 的范围重指到它；区间里其余的事件全部删除。
+ * 结果：契约仍然成立，派生历史（模型看到的）逐条不变，而体积塌掉。
+ *
+ * @param {object[]} events - 原日志事件（不含头部）。
+ * @returns {{ events: object[], dropped: number, anchors: number, mapping: Map<number, number> }}
+ */
+export function rewrite(events) {
+  const { dropped } = foldSurface(events)
+
+  // 第一遍：先算出"不靠锚也活下来"的事件。
+  const keep = new Set()
+  for (const event of events) {
+    const type = String(event.type ?? '')
+    const always = KEEP_ALWAYS.some((prefix) => type.startsWith(prefix))
+    if (!dropped.has(event.seq) || always) keep.add(event.seq)
+  }
+
+  // 第二遍：只有**活下来的** replace 才需要锚。
+  //
+  // 这条区分很关键：一条 replace 自己也可能被更晚的压缩覆盖、从而被删掉；
+  // 那时它引用的区间就没人再引用了，给它留锚只会让那段旧历史里的事件"复活"
+  // （实测：52 条这样复活的事件，正是第一版校验抓出来的差异）。
+  const anchors = new Set()
+  /** replace 的 seq → 它在新日志里要覆盖的 [最小, 最大]；null 表示区间已空。 */
+  const rangeFix = new Map()
+  // 迭代到不动点：锚事件本身可能也是一条 replace，它又会带来新的锚。
+  for (let round = 0; round < 5; round += 1) {
+    let added = false
+    for (const event of events) {
+      if (!keep.has(event.seq)) continue
+      const op = event.surfaceOp
+      if (op === undefined || op === null || typeof op !== 'object' || op.op !== 'replace') continue
+      const start = Number(op.startSeq)
+      const end = Number(op.endSeq)
+      let min = null
+      let max = null
+      for (const candidate of events) {
+        // 只算它**之前**的事件：replace 遮蔽不了还没写下的东西。
+        if (candidate.seq < start || candidate.seq > end || candidate.seq >= event.seq) continue
+        if (min === null || candidate.seq < min) min = candidate.seq
+        if (max === null || candidate.seq > max) max = candidate.seq
+      }
+      if (min === null) {
+        rangeFix.set(event.seq, null)
+        continue
+      }
+      rangeFix.set(event.seq, [min, max])
+      // 区间两端必须留下：宿主要求被引用的 seq 存在。留下它们不会让它们可见——
+      // 它们仍然落在这条 replace 的区间里。
+      if (!keep.has(min)) { keep.add(min); anchors.add(min); added = true }
+      if (max !== min && !keep.has(max)) { keep.add(max); anchors.add(max); added = true }
+    }
+    if (!added) break
+  }
+
+  const kept = []
+  let droppedCount = 0
+  for (const event of events) {
+    if (keep.has(event.seq)) kept.push(event)
+    else droppedCount += 1
+  }
+
+  // seq 连续重编，并把所有引用一起搬过去。
+  const mapping = new Map()
+  kept.forEach((event, index) => mapping.set(event.seq, index + 1))
+  const remap = (seq) => (mapping.has(seq) ? mapping.get(seq) : null)
+  const out = kept.map((event) => {
+    const next = { ...event, seq: mapping.get(event.seq) }
+    if (Array.isArray(event.sourceEventSeqs)) {
+      next.sourceEventSeqs = event.sourceEventSeqs.map(remap).filter((x) => x !== null)
+    }
+    if (event.surfaceOp !== undefined && event.surfaceOp !== null && typeof event.surfaceOp === 'object') {
+      const fixed = rangeFix.has(event.seq) ? rangeFix.get(event.seq) : null
+      if (fixed === null) {
+        // 区间里一条都不剩了：这条消息改成普通追加，否则它会因为失去表面标记
+        // 而从派生历史里整条消失。
+        next.surfaceOp = 'append'
+      } else {
+        next.surfaceOp = { ...event.surfaceOp, startSeq: remap(fixed[0]), endSeq: remap(fixed[1]) }
+      }
+    }
+    return next
+  })
+  return { events: out, dropped: droppedCount, anchors: anchors.size, mapping }
+}
+
+/**
+ * 派生历史：把日志折叠成"模型最终会读到的消息序列"，用内容做签名。
+ *
+ * 校验压缩是否安全，就看新旧两份日志算出来的这个序列是否逐条相同。
+ *
+ * @param {object[]} events - 事件（不含头部）。
+ * @returns {string[]} 每条消息的签名。
+ */
+export function derivedHistory(events) {
+  const { visible } = foldSurface(events)
+  const bySeq = new Map(events.map((e) => [e.seq, e]))
+  const signatures = []
+  for (const seq of visible) {
+    const event = bySeq.get(seq)
+    if (event === undefined) continue
+    const payload = event.data?.message ?? event.data ?? null
+    signatures.push(`${event.type}:${JSON.stringify(payload)}`)
+  }
+  return signatures
+}
+
+/**
+ * 把一份事件流写成日志字节（多帧 zstd，一行一事件）。
+ *
+ * @param {object|null} header - 头部记录。
+ * @param {object[]} events - 事件。
+ * @returns {Buffer} 文件内容。
+ */
+export function encodeLog(header, events) {
+  const lines = []
+  if (header !== null) lines.push(JSON.stringify(header))
+  for (const event of events) lines.push(JSON.stringify(event))
+  const frames = []
+  // 头部单独一帧，其余每 256 条一帧：和官方一样是多帧结构。
+  const chunks = [lines.slice(0, 1), ...chunk(lines.slice(1), 256)]
+  for (const chunkLines of chunks) {
+    if (chunkLines.length === 0) continue
+    frames.push(zlib.zstdCompressSync(Buffer.from(chunkLines.join('\n') + '\n', 'utf8')))
+  }
+  return Buffer.concat(frames)
+}
+
+/** 把数组切成固定大小的块。 */
+function chunk(items, size) {
+  const out = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
+
+/**
+ * 试写一份压缩后的日志到临时路径，并校验它和原日志"派生历史逐条相同"。
+ *
+ * 只写临时文件，**绝不碰原日志**。
+ *
+ * @param {string} file - 原日志。
+ * @param {string} target - 写到哪里。
+ */
+function emitReport(file, target) {
+  const original = readLog(file)
+  const before = derivedHistory(original.events)
+  const result = rewrite(original.events)
+  const after = derivedHistory(result.events)
+
+  // 结构不变量：seq 连续；引用的 seq 都存在。
+  const seqs = new Set(result.events.map((e) => e.seq))
+  let contiguous = true
+  for (let i = 1; i <= result.events.length; i += 1) {
+    if (!seqs.has(i)) { contiguous = false; break }
+  }
+  const missing = []
+  for (const event of result.events) {
+    const cited = [
+      ...(Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []),
+      ...(event.surfaceOp && typeof event.surfaceOp === 'object' && event.surfaceOp.op === 'replace'
+        ? [event.surfaceOp.startSeq, event.surfaceOp.endSeq] : []),
+    ]
+    for (const seq of cited) if (!seqs.has(Number(seq))) missing.push({ at: event.seq, cites: seq })
+  }
+
+  const identical = before.length === after.length && before.every((sig, i) => sig === after[i])
+  const bytes = encodeLog(original.header, result.events)
+  fs.writeFileSync(target, bytes)
+
+  console.log(`原日志    ${file}`)
+  console.log(`压缩前    ${original.events.length} 事件 / ${human(original.compressedBytes)}`)
+  console.log(`压缩后    ${result.events.length} 事件 / ${human(bytes.length)}（省 ${human(Math.max(0, original.compressedBytes - bytes.length))}）`)
+  console.log(`删除      ${result.dropped} 条；保留锚事件 ${result.anchors} 个（每段 replace 一个）`)
+  console.log(`结构      seq 连续=${contiguous ? '是' : '否'}，悬空引用=${missing.length === 0 ? '无' : missing.length + ' 处'}`)
+  console.log(`派生历史  原 ${before.length} 条 → 新 ${after.length} 条；逐条相同=${identical ? '是 ✔' : '否 ✘'}`)
+  if (!identical) {
+    for (let i = 0; i < Math.max(before.length, after.length); i += 1) {
+      if (before[i] !== after[i]) {
+        console.log(`  首个差异在第 ${i} 条：`)
+        console.log(`    原: ${String(before[i]).slice(0, 160)}`)
+        console.log(`    新: ${String(after[i]).slice(0, 160)}`)
+        break
+      }
+    }
+  }
+  console.log(`试写文件  ${target}`)
+}
+
+/** 试写的默认路径：临时目录，绝不覆盖原日志。 */
+function outPath(file, args) {
+  const at = args.indexOf('--out')
+  if (at >= 0 && args[at + 1] !== undefined) return args[at + 1]
+  return path.join(os.tmpdir(), `compact-${path.basename(path.dirname(file))}.jsonl.zstd`)
+}
+
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
 if (isMain) {
   const args = process.argv.slice(2)
@@ -422,9 +596,14 @@ if (isMain) {
         console.log(`合计：${compactable.length} 个值得压缩，预计省 ${human(saved)}`)
       }
     } else {
-      const report = estimate(resolveLog(positional[0]))
-      if (asJson) console.log(JSON.stringify(report, null, 2))
-      else printReport(report)
+      const file = resolveLog(positional[0])
+      if (args.includes('--emit')) {
+        emitReport(file, outPath(file, args))
+      } else {
+        const report = estimate(file)
+        if (asJson) console.log(JSON.stringify(report, null, 2))
+        else printReport(report)
+      }
     }
   } catch (error) {
     console.error(`失败：${error instanceof Error ? error.message : String(error)}`)
