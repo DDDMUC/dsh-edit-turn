@@ -570,6 +570,238 @@ function outPath(file, args) {
   return path.join(os.tmpdir(), `compact-${path.basename(path.dirname(file))}.jsonl.zstd`)
 }
 
+/**
+ * 列出一次会话里所有 replace（官方的压缩 + 我们插件的改写），逐条给出"在哪、
+ * 覆盖了什么、替代物是什么"，供人到界面上核对。
+ *
+ * @param {string} file - 日志文件。
+ * @returns {{ sessionId: string, title: string, rows: object[] }}
+ */
+export function listReplaces(file) {
+  const { events, header } = readLog(file)
+  const turns = []
+  let cur = null
+  for (const event of events) {
+    if (event.type === 'turn/start') cur = { turn: Number(event.data?.turn), start: event.seq, end: event.seq }
+    else if (event.type === 'turn/end' && cur !== null) { cur.end = event.seq; turns.push(cur); cur = null }
+  }
+  const turnOf = (seq) => {
+    const hit = turns.find((t) => seq >= t.start && seq <= t.end)
+    return hit === undefined ? null : hit.turn
+  }
+  let title = ''
+  for (const event of events) {
+    if (event.type === 'session/title' && typeof event.data?.title === 'string') title = event.data.title
+  }
+  const rows = []
+  for (const event of events) {
+    const op = event.surfaceOp
+    if (op === undefined || op === null || typeof op !== 'object' || op.op !== 'replace') continue
+    const start = Number(op.startSeq)
+    const end = Number(op.endSeq)
+    const covered = events.filter((e) => e.seq >= start && e.seq <= end && e.seq < event.seq)
+    const byType = {}
+    for (const e of covered) byType[e.type] = (byType[e.type] ?? 0) + 1
+    const coveredTurns = covered.map((e) => turnOf(e.seq)).filter((t) => t !== null)
+    const turnFrom = coveredTurns.length === 0 ? null : Math.min(...coveredTurns)
+    const turnTo = coveredTurns.length === 0 ? null : Math.max(...coveredTurns)
+    const content = event.data?.message?.content ?? event.data?.content ?? null
+    const texts = Array.isArray(content) ? content.filter((b) => typeof b?.text === 'string').map((b) => b.text) : []
+    rows.push({
+      seq: event.seq,
+      type: event.type,
+      atTurn: turnOf(event.seq),
+      covers: covered.length,
+      turnFrom,
+      turnTo,
+      byType,
+      summaryHead: texts.join(' ').replace(/\s+/g, ' ').slice(0, 120),
+      textChars: texts.join('').length,
+      single: covered.length <= 1,
+    })
+  }
+  return { sessionId: header?.id ?? '', title, rows }
+}
+
+/** 窗口的定义来自 dsh-session-pages：压缩 checkpoint 切窗。 */
+export const CHECKPOINT_KIND = 'compact-checkpoint'
+
+/**
+ * 这条事件是不是一个窗口开头的 checkpoint。
+ *
+ * @param {object} event - 日志事件。
+ * @returns {boolean} 是 checkpoint 时为 true。
+ */
+export function isCheckpoint(event) {
+  if (event === null || typeof event !== 'object') return false
+  if (event.type !== 'user/message') return false
+  const source = event.data === null || event.data === undefined ? undefined : event.data.source
+  return source !== null && source !== undefined && source.kind === CHECKPOINT_KIND
+}
+
+/** 对话区的行只来自 append 原文（宿主的原话：替换副本只给模型）。 */
+export function transcriptRows(events) {
+  const types = new Set(['system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result'])
+  return events.filter((e) => types.has(e.type) && e.surfaceOp === 'append').length
+}
+
+/** 按 checkpoint 切窗，返回每一窗的起止 seq。 */
+export function windowsOf(events) {
+  const sorted = [...events].sort((a, b) => a.seq - b.seq)
+  const marks = sorted.filter(isCheckpoint).map((e) => e.seq)
+  const windows = []
+  const first = sorted.length > 0 ? sorted[0].seq : 0
+  windows.push({ index: 1, startSeq: first, endSeq: marks.length > 0 ? marks[0] - 1 : null, checkpointSeq: null })
+  marks.forEach((seq, i) => {
+    windows.push({
+      index: i + 2,
+      startSeq: seq,
+      endSeq: i + 1 < marks.length ? marks[i + 1] - 1 : null,
+      checkpointSeq: seq,
+    })
+  })
+  return windows
+}
+
+/**
+ * 只保留最后 keep 个窗口，其余整段裁掉。
+ *
+ * 这是**销毁性**操作：被裁窗口的原文是对话区的源材料，删掉之后人也看不到了。
+ * 保留的"框"（系统提示词、工具声明、预设、权限）是会话级设置，裁掉模型就没了，
+ * 所以无论落在哪一窗都留下。
+ *
+ * @param {object[]} events - 原事件（不含头部）。
+ * @param {number} keep - 保留最后几窗。
+ * @returns {{ events: object[], cutSeq: number|null, windows: number, kept: number, dropped: number, frame: object[] }}
+ */
+export function keepLastWindows(events, keep) {
+  const windows = windowsOf(events)
+  if (windows.length <= keep) {
+    return { events, cutSeq: null, windows: windows.length, kept: events.length, dropped: 0, frame: [] }
+  }
+  const firstKept = windows.length - keep + 1
+  const cutSeq = windows[firstKept - 1].startSeq
+
+  // 会话级的"框"：这些事件决定模型看到什么系统提示词、有哪些工具、什么预设。
+  // 它们只出现在会话开头，裁掉就等于把设置也裁了。
+  const FRAME_KINDS = ['system/message', 'developer/message']
+  const frame = []
+  const frameSeen = new Set()
+  const keepLastOf = (type) => {
+    const hit = events.filter((e) => e.type === type && e.seq < cutSeq).pop()
+    if (hit !== undefined) frame.push(hit)
+  }
+  for (const type of FRAME_KINDS) {
+    const hit = events.find((e) => e.type === type && e.seq < cutSeq)
+    if (hit !== undefined && !frameSeen.has(hit.seq)) {
+      frame.push(hit)
+      frameSeen.add(hit.seq)
+    }
+  }
+  for (const type of ['request/header', 'agent-preset/selected', 'permission/preset', 'sandbox/mode', 'approval/policy', 'session/title']) {
+    keepLastOf(type)
+  }
+
+  const keepSeq = new Set(frame.map((e) => e.seq))
+  const out = []
+  let dropped = 0
+  for (const event of events) {
+    if (event.seq >= cutSeq || keepSeq.has(event.seq)) {
+      out.push(event)
+      continue
+    }
+    dropped += 1
+  }
+  return { events: out, cutSeq, windows: windows.length, kept: out.length, dropped, frame }
+}
+
+/**
+ * 重编 seq 并把所有引用搬过去；引用落空的 replace 降级为普通追加。
+ *
+ * @param {object[]} events - 已经选好的事件（按原顺序）。
+ * @returns {{ events: object[], mapping: Map<number, number> }}
+ */
+export function renumber(events) {
+  const mapping = new Map()
+  events.forEach((event, index) => mapping.set(event.seq, index + 1))
+  const remap = (seq) => (mapping.has(seq) ? mapping.get(seq) : null)
+  const out = events.map((event) => {
+    const next = { ...event, seq: mapping.get(event.seq) }
+    if (Array.isArray(event.sourceEventSeqs)) {
+      next.sourceEventSeqs = event.sourceEventSeqs.map(remap).filter((x) => x !== null)
+    }
+    if (event.surfaceOp !== undefined && event.surfaceOp !== null && typeof event.surfaceOp === 'object') {
+      const start = remap(Number(event.surfaceOp.startSeq))
+      const end = remap(Number(event.surfaceOp.endSeq))
+      if (start !== null && end !== null) next.surfaceOp = { ...event.surfaceOp, startSeq: start, endSeq: end }
+      else next.surfaceOp = 'append'
+    }
+    return next
+  })
+  return { events: out, mapping }
+}
+
+/**
+ * 只保留最后 keep 个窗口，试写到临时文件，并报告删了什么。
+ *
+ * @param {string} file - 原日志。
+ * @param {number} keep - 保留最后几窗。
+ * @param {string} target - 写到哪里（只写临时文件）。
+ */
+function trimReport(file, keep, target) {
+  const original = readLog(file)
+  const before = {
+    events: original.events.length,
+    bytes: original.compressedBytes,
+    windows: windowsOf(original.events).length,
+    transcript: transcriptRows(original.events),
+  }
+  const trimmed = keepLastWindows(original.events, keep)
+  if (trimmed.cutSeq === null) {
+    console.log(`只有 ${trimmed.windows} 个窗口，不需要裁。`)
+    return
+  }
+  const renamed = renumber(trimmed.events)
+  const after = {
+    events: renamed.events.length,
+    bytes: encodeLog(original.header, renamed.events).length,
+    transcript: transcriptRows(renamed.events),
+  }
+  const bytes = encodeLog(original.header, renamed.events)
+  fs.writeFileSync(target, bytes)
+
+  const seqs = new Set(renamed.events.map((e) => e.seq))
+  let contiguous = true
+  for (let i = 1; i <= renamed.events.length; i += 1) if (!seqs.has(i)) { contiguous = false; break }
+  let dangling = 0
+  for (const event of renamed.events) {
+    const refs = [...(Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : [])]
+    if (event.surfaceOp !== null && typeof event.surfaceOp === 'object') refs.push(event.surfaceOp.startSeq, event.surfaceOp.endSeq)
+    for (const ref of refs) if (ref !== undefined && !seqs.has(Number(ref))) dangling += 1
+  }
+  const firstKeptWindow = before.windows - keep + 1
+  const first = renamed.events.find((e) => isCheckpoint(e))
+  const checkpointText = (event) => {
+    const blocks = Array.isArray(event?.data?.content)
+      ? event.data.content
+      : Array.isArray(event?.data?.message?.content) ? event.data.message.content : []
+    return blocks.map((b) => (typeof b?.text === 'string' ? b.text : '')).join(' ')
+  }
+
+  console.log(`原日志    ${file}`)
+  console.log(`窗口      ${before.windows} 个 → 保留最后 ${keep} 个（裁掉第 1–${firstKeptWindow - 1} 窗）`)
+  console.log(`事件      ${before.events} → ${after.events}（删除 ${trimmed.dropped} 条）`)
+  console.log(`大小      ${human(before.bytes)} → ${human(after.bytes)}（省 ${human(Math.max(0, before.bytes - after.bytes))}）`)
+  console.log(`对话区    可见行 ${before.transcript} → ${after.transcript}  ← 人也将看不到被裁的窗口`)
+  console.log(`模型视图  从原第 ${firstKeptWindow} 窗的摘要起（保留 ${keep} 窗：摘要 + 各自的行）`)
+  if (first !== undefined) {
+    console.log(`           "${checkpointText(first).replace(/\s+/g, ' ').slice(0, 110)}…"`)
+  }
+  console.log(`结构      seq 连续=${contiguous ? '是' : '否'}，悬空引用=${dangling === 0 ? '无' : dangling + ' 处'}`)
+  console.log(`保留的框  ${trimmed.frame.map((e) => e.type).join(', ') || '(无)'}`)
+  console.log(`试写文件  ${target}`)
+}
+
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
 if (isMain) {
   const args = process.argv.slice(2)
@@ -597,7 +829,31 @@ if (isMain) {
       }
     } else {
       const file = resolveLog(positional[0])
-      if (args.includes('--emit')) {
+      if (args.includes('--replaces')) {
+        const { sessionId, title, rows } = listReplaces(file)
+        console.log(`会话 ${sessionId}`)
+        if (title !== '') console.log(`标题 ${title}`)
+        console.log(`replace 共 ${rows.length} 条：大范围（摘要）${rows.filter((r) => !r.single).length}，单点（修剪）${rows.filter((r) => r.single).length}\n`)
+        for (const r of rows) {
+          if (r.single) continue
+          console.log(`· seq ${r.seq} ${r.type}（发起于第 ${r.atTurn ?? '?'} 轮）`)
+          console.log(`  覆盖      第 ${r.turnFrom ?? '?'} 轮到第 ${r.turnTo ?? '?'} 轮，共 ${r.covers} 条事件`)
+          console.log(`             ${Object.entries(r.byType).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => k + '×' + v).join(' ')}`)
+          console.log(`  替代物    ${r.type}，${r.textChars} 字符：${r.summaryHead}`)
+          console.log('')
+        }
+        const prunes = rows.filter((r) => r.single)
+        if (prunes.length > 0) {
+          console.log(`单点修剪 ${prunes.length} 条（各覆盖 1 条旧工具输出，换成剪短版），例如：`)
+          for (const r of prunes.slice(0, 3)) {
+            console.log(`· seq ${r.seq}（第 ${r.atTurn ?? '?'} 轮）覆盖 seq ${r.coverSeq ?? '?'} → ${r.textChars} 字符`)
+          }
+        }
+      } else if (args.includes('--keep-windows')) {
+        const at = args.indexOf('--keep-windows')
+        const keep = Number(args[at + 1] ?? '3')
+        trimReport(file, keep, outPath(file, args))
+      } else if (args.includes('--emit')) {
         emitReport(file, outPath(file, args))
       } else {
         const report = estimate(file)
