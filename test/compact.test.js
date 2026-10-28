@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { foldSurface, rewrite, derivedHistory } from '../tools/compact-session.mjs'
+import { foldSurface, rewrite, derivedHistory, snapToTurnStart, renumberLifecycle, assertHostLoadable, planUnloadableDrops, seededHeaderFor, titleSurvivesCut, dropUnsatisfiableTitles } from '../tools/compact-session.mjs'
 
 /**
  * 造一份最小日志：一条用户消息、一条助手回复、再一条用户消息。
@@ -129,4 +129,109 @@ test('区间里一条都不剩时，替换降级为普通追加，消息不会�
   const result = rewrite(events)
   const texts = derivedHistory(result.events).join('|')
   assert.ok(texts.includes('lonely'), '消息仍然在派生历史里')
+})
+
+// ——— 宿主加载契约：压缩结果必须能从磁盘重新加载 ———
+//
+// 这一组对应 2026-10-29 那次事故：压缩把日志从"检查点"处切开，保留区从半轮开始，
+// 标题的 messageSeqs 指向被裁掉的用户消息，宿主报
+//   title messageSeqs must name an earlier event
+// 整份历史再也打不开。下面的用例把每条约束钉住。
+
+test('切点退到轮首：从检查点切会把一轮劈成两半', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, data: { turn: 1, step: 1 } },
+    { type: 'request/header', seq: 2, data: { header: { config: { provider: 'p', model: 'm' } } } },
+    { type: 'step/end', seq: 3, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: 4, data: { turn: 1 } },
+    { type: 'turn/start', seq: 5, data: { turn: 2 } },
+    { type: 'step/start', seq: 6, data: { turn: 2, step: 1 } },
+  ]
+  assert.equal(snapToTurnStart(events, 2), 0, '检查点落在第 1 轮里，切点退到第 1 轮的 turn/start')
+  assert.equal(snapToTurnStart(events, 5), 5, '正好落在轮首时不动')
+  assert.equal(snapToTurnStart(events, 6), 5, '落在轮中间时退到轮首')
+})
+
+test('轮次与步骤重编号：保留区的第一轮必须从 1 起', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 11 } },
+    { type: 'step/start', seq: 1, data: { turn: 11, step: 58 } },
+    { type: 'assistant/message', seq: 2, data: { turn: 11, step: 58, message: { role: 'assistant', content: [] } } },
+    { type: 'step/end', seq: 3, data: { turn: 11, step: 58 } },
+    { type: 'turn/end', seq: 4, data: { turn: 11 } },
+    { type: 'turn/start', seq: 5, data: { turn: 12 } },
+    { type: 'step/start', seq: 6, data: { turn: 12, step: 1 } },
+  ]
+  const out = renumberLifecycle(events)
+  assert.deepEqual(
+    out.map((e) => [e.data.turn, e.data.step]),
+    [[1, undefined], [1, 1], [1, 1], [1, 1], [1, undefined], [2, undefined], [2, 1]],
+  )
+  assert.deepEqual(out.map((e) => e.seq), [0, 1, 2, 3, 4, 5, 6], 'seq 不动')
+})
+
+test('自检拦住"从半轮开始"的日志', () => {
+  const events = [
+    { type: 'request/header', seq: 0, data: { header: { config: { provider: 'p', model: 'm' } } } },
+  ]
+  assert.throws(() => assertHostLoadable(null, events), /不在开启的轮次里/)
+})
+
+test('自检拦住悬空的标题引用', () => {
+  const events = [
+    { type: 'session/title', seq: 0, data: { title: 'x', messageSeqs: [3], source: { kind: 'fallback' } } },
+  ]
+  assert.throws(() => assertHostLoadable(null, events), /不早于自身/)
+})
+
+test('自检拦住 shadowedRange 与表面切片不一致的压缩记录', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, data: { turn: 1, step: 1 } },
+    { type: 'user/message', seq: 2, surfaceOp: 'append', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'a' }] } },
+    {
+      type: 'compaction/prune',
+      seq: 3,
+      data: { shadowedRange: { start: 2, end: 2 }, shadowedSeqs: [99] },
+    },
+  ]
+  assert.throws(() => assertHostLoadable(null, events), /shadowedSeqs 与表面切片不一致/)
+})
+
+test('自检拦住没有摘要的 compaction/end', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'compaction/start', seq: 1, data: { compactionId: 'c1', turn: 1 } },
+    { type: 'compaction/end', seq: 2, data: { compactionId: 'c1', turn: 1 } },
+  ]
+  assert.throws(() => assertHostLoadable(null, events), /没有对应的摘要/)
+})
+
+test('降级后 turn/step 对不上当前轮的 replace 副本会被剔掉', () => {
+  const events = [
+    { type: 'turn/start', seq: 0, data: { turn: 1 } },
+    { type: 'step/start', seq: 1, data: { turn: 1, step: 1 } },
+    // 旧轮工具输出的剪短副本：replace 的端点已经不在表面上了
+    { type: 'tool/result', seq: 2, surfaceOp: { op: 'replace', startSeq: 900, endSeq: 900 }, data: { turn: 7, step: 3, message: { role: 'tool', content: [] } } },
+  ]
+  const drops = planUnloadableDrops(events)
+  assert.equal(drops.has(2), true, '会被剔掉')
+  assert.equal(drops.has(1), false, '正常事件不受影响')
+})
+
+test('seeded 标记被裁掉时头部要改口', () => {
+  const header = { isSeeded: true, parentSession: 'session-x' }
+  assert.deepEqual(seededHeaderFor(header, []), { isSeeded: false, parentSession: 'session-x' })
+  const kept = [{ type: 'session/end-seed', seq: 0, data: { inherited: true } }]
+  assert.equal(seededHeaderFor(header, kept), header, '标记还在就不动头部')
+})
+
+test('标题：引用撑不住就不留，用户标题永远留得住', () => {
+  const fallback = { type: 'session/title', seq: 9, data: { title: 't', messageSeqs: [3], source: { kind: 'fallback' } } }
+  const user = { type: 'session/title', seq: 9, data: { title: 't', messageSeqs: [], source: { kind: 'user' } } }
+  assert.equal(titleSurvivesCut(fallback), false)
+  assert.equal(titleSurvivesCut(user), true)
+  const events = [fallback, user]
+  assert.deepEqual(dropUnsatisfiableTitles(events), [user])
 })
