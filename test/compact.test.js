@@ -79,8 +79,9 @@ test('重写：派生历史逐条不变、seq 连续、没有悬空引用', () =
   assert.deepEqual(derivedHistory(result.events), before, '模型读到的历史一字不变')
   assert.ok(result.events.length < events.length, '确实变短了')
 
+  // seq 从 0 开始：宿主按数组下标核对（events[i].seq === i）。
   const seqs = new Set(result.events.map((e) => e.seq))
-  for (let i = 1; i <= result.events.length; i += 1) assert.ok(seqs.has(i), `seq ${i} 存在`)
+  for (let i = 0; i < result.events.length; i += 1) assert.ok(seqs.has(i), `seq ${i} 存在`)
   for (const event of result.events) {
     for (const ref of Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []) {
       assert.ok(seqs.has(ref), `引用的 seq ${ref} 存在`)

@@ -107,7 +107,9 @@ export function foldSurface(events) {
       ranges.push([start, end, event.seq])
       for (let i = nodes.length - 1; i >= 0; i -= 1) {
         const seq = nodes[i]
-        if (seq >= start && seq <= end) {
+        // 只移除**排在它之前**的节点：replace 遮蔽不了还没写下的东西（宿主也要求
+        // startSeq/endSeq 必须引用更早的事件）。
+        if (seq >= start && seq <= end && seq < event.seq) {
           nodes.splice(i, 1)
           dropped.add(seq)
         }
@@ -392,43 +394,8 @@ export function rewrite(events) {
     if (!dropped.has(event.seq) || always) keep.add(event.seq)
   }
 
-  // 第二遍：只有**活下来的** replace 才需要锚。
-  //
-  // 这条区分很关键：一条 replace 自己也可能被更晚的压缩覆盖、从而被删掉；
-  // 那时它引用的区间就没人再引用了，给它留锚只会让那段旧历史里的事件"复活"
-  // （实测：52 条这样复活的事件，正是第一版校验抓出来的差异）。
-  const anchors = new Set()
-  /** replace 的 seq → 它在新日志里要覆盖的 [最小, 最大]；null 表示区间已空。 */
-  const rangeFix = new Map()
-  // 迭代到不动点：锚事件本身可能也是一条 replace，它又会带来新的锚。
-  for (let round = 0; round < 5; round += 1) {
-    let added = false
-    for (const event of events) {
-      if (!keep.has(event.seq)) continue
-      const op = event.surfaceOp
-      if (op === undefined || op === null || typeof op !== 'object' || op.op !== 'replace') continue
-      const start = Number(op.startSeq)
-      const end = Number(op.endSeq)
-      let min = null
-      let max = null
-      for (const candidate of events) {
-        // 只算它**之前**的事件：replace 遮蔽不了还没写下的东西。
-        if (candidate.seq < start || candidate.seq > end || candidate.seq >= event.seq) continue
-        if (min === null || candidate.seq < min) min = candidate.seq
-        if (max === null || candidate.seq > max) max = candidate.seq
-      }
-      if (min === null) {
-        rangeFix.set(event.seq, null)
-        continue
-      }
-      rangeFix.set(event.seq, [min, max])
-      // 区间两端必须留下：宿主要求被引用的 seq 存在。留下它们不会让它们可见——
-      // 它们仍然落在这条 replace 的区间里。
-      if (!keep.has(min)) { keep.add(min); anchors.add(min); added = true }
-      if (max !== min && !keep.has(max)) { keep.add(max); anchors.add(max); added = true }
-    }
-    if (!added) break
-  }
+  // 第二遍：把活下来的 replace 的区间端点对齐到真正的表面节点（并把端点纳入保留）。
+  alignReplaceRanges(events, keep)
 
   const kept = []
   let droppedCount = 0
@@ -436,29 +403,8 @@ export function rewrite(events) {
     if (keep.has(event.seq)) kept.push(event)
     else droppedCount += 1
   }
-
-  // seq 连续重编，并把所有引用一起搬过去。
-  const mapping = new Map()
-  kept.forEach((event, index) => mapping.set(event.seq, index + 1))
-  const remap = (seq) => (mapping.has(seq) ? mapping.get(seq) : null)
-  const out = kept.map((event) => {
-    const next = { ...event, seq: mapping.get(event.seq) }
-    if (Array.isArray(event.sourceEventSeqs)) {
-      next.sourceEventSeqs = event.sourceEventSeqs.map(remap).filter((x) => x !== null)
-    }
-    if (event.surfaceOp !== undefined && event.surfaceOp !== null && typeof event.surfaceOp === 'object') {
-      const fixed = rangeFix.has(event.seq) ? rangeFix.get(event.seq) : null
-      if (fixed === null) {
-        // 区间里一条都不剩了：这条消息改成普通追加，否则它会因为失去表面标记
-        // 而从派生历史里整条消失。
-        next.surfaceOp = 'append'
-      } else {
-        next.surfaceOp = { ...event.surfaceOp, startSeq: remap(fixed[0]), endSeq: remap(fixed[1]) }
-      }
-    }
-    return next
-  })
-  return { events: out, dropped: droppedCount, anchors: anchors.size, mapping }
+  const result = renumber(kept)
+  return { events: result.events, dropped: droppedCount, anchors: 0, mapping: result.mapping, refsFixed: result.refsFixed }
 }
 
 /**
@@ -527,7 +473,7 @@ function emitReport(file, target) {
   // 结构不变量：seq 连续；引用的 seq 都存在。
   const seqs = new Set(result.events.map((e) => e.seq))
   let contiguous = true
-  for (let i = 1; i <= result.events.length; i += 1) {
+  for (let i = 0; i < result.events.length; i += 1) {
     if (!seqs.has(i)) { contiguous = false; break }
   }
   const missing = []
@@ -684,25 +630,54 @@ export function keepLastWindows(events, keep) {
 
   // 会话级的"框"：这些事件决定模型看到什么系统提示词、有哪些工具、什么预设。
   // 它们只出现在会话开头，裁掉就等于把设置也裁了。
-  const FRAME_KINDS = ['system/message', 'developer/message']
+  // 系统提示词要取"原日志里真正可见的那一条"。
+  //
+  // 会话中途系统提示词可能被重写过（宿主允许用 system/message 精确替换 node 0），
+  // 于是日志里会躺着多条 system/message：早期那条已被遮蔽，真正生效的是后来的。
+  // 按"第一条"取会把被遮蔽的那条复活，模型上下文里就出现两份系统提示词。
+  const originalVisible = foldSurface(events).visible
+  const visibleSet = new Set(originalVisible)
+  // 必须挑**非空**的那条：日志里还有成对的空 `developer/message` 标记，
+  // 它们不产生任何模型消息；挑错了模型就丢了系统提示词。
+  const effectiveSystem = originalVisible
+    .map((seq) => events.find((e) => e.seq === seq))
+    .find(
+      (e) =>
+        e !== undefined &&
+        (e.type === 'system/message' || e.type === 'developer/message') &&
+        textLengthOf(e) > 0,
+    )
   const frame = []
-  const frameSeen = new Set()
+  if (effectiveSystem !== undefined) frame.push(effectiveSystem)
+  const frameSeen = new Set(frame.map((e) => e.seq))
   const keepLastOf = (type) => {
     const hit = events.filter((e) => e.type === type && e.seq < cutSeq).pop()
     if (hit !== undefined) frame.push(hit)
   }
-  for (const type of FRAME_KINDS) {
-    const hit = events.find((e) => e.type === type && e.seq < cutSeq)
-    if (hit !== undefined && !frameSeen.has(hit.seq)) {
-      frame.push(hit)
-      frameSeen.add(hit.seq)
-    }
-  }
+  void visibleSet
   for (const type of ['request/header', 'agent-preset/selected', 'permission/preset', 'sandbox/mode', 'approval/policy', 'session/title']) {
     keepLastOf(type)
   }
 
   const keepSeq = new Set(frame.map((e) => e.seq))
+  const bySeq = new Map(events.map((e) => [e.seq, e]))
+  // developer/message 用 `headerSeq` 精确指向它那一次请求的 request/header；
+  // 宿主的校验要求那条 header 必须还在、且排在它之前。裁掉就等于把这条消息废掉。
+  // 这里迭代到不动点：被留下的 header 不会再引用别的东西，所以最多两轮。
+  for (let round = 0; round < 4; round += 1) {
+    let added = false
+    for (const event of events) {
+      const referenced = event.data?.headerSeq
+      if (event.seq < cutSeq && !keepSeq.has(event.seq)) continue
+      if (!Number.isSafeInteger(referenced)) continue
+      if (keepSeq.has(referenced)) continue
+      const header = bySeq.get(referenced)
+      if (header === undefined) continue
+      keepSeq.add(referenced)
+      added = true
+    }
+    if (!added) break
+  }
   const out = []
   let dropped = 0
   for (const event of events) {
@@ -712,33 +687,230 @@ export function keepLastWindows(events, keep) {
     }
     dropped += 1
   }
-  return { events: out, cutSeq, windows: windows.length, kept: out.length, dropped, frame }
+  // 活下来的 replace 的区间端点必须落在保留集里的表面节点上。
+  const { anchors } = alignReplaceRanges(events, keepSeq)
+  const finalOut = []
+  let finalDropped = 0
+  for (const event of events) {
+    if (event.seq >= cutSeq || keepSeq.has(event.seq)) finalOut.push(event)
+    else finalDropped += 1
+  }
+  void out
+  void dropped
+  const extra = [...keepSeq]
+    .filter((seq) => !frame.some((e) => e.seq === seq))
+    .map((seq) => bySeq.get(seq))
+    .filter((e) => e !== undefined)
+  return {
+    events: finalOut,
+    cutSeq,
+    windows: windows.length,
+    kept: finalOut.length,
+    dropped: finalDropped,
+    frame: [...frame, ...extra],
+    anchors: anchors.size,
+  }
+}
+
+/**
+ * 把 `sourceEventSeqs` 规范化成宿主契约要的形状。
+ *
+ * 契约（`assertSourceEventReferences`）：非空数组、每一项都是非负安全整数、不重复。
+ * 实测本机的日志里有 3 条由 dsh-rerun-turn 写下的记录把第一个元素写成了数组
+ * （`[[11119,11121],11125,…]`），宿主的严格校验器会直接拒绝 —— 界面能打开是因为
+ * 加载路径容错，但这样的数据在 fork / relocate / 严格 adopt 时会被拒。
+ *
+ * @param {unknown} raw - 原始的 sourceEventSeqs。
+ * @returns {number[]|null} 规范化后的数组；空则返回 null（字段应删除）。
+ */
+export function normalizeRefs(raw) {
+  if (!Array.isArray(raw)) return null
+  const flat = []
+  for (const item of raw) {
+    if (Array.isArray(item)) {
+      for (const inner of item) flat.push(inner)
+    } else {
+      flat.push(item)
+    }
+  }
+  const seen = new Set()
+  const out = []
+  for (const value of flat) {
+    const seq = Number(value)
+    if (!Number.isSafeInteger(seq) || seq < 0) continue
+    if (seen.has(seq)) continue
+    seen.add(seq)
+    out.push(seq)
+  }
+  return out.length === 0 ? null : out
 }
 
 /**
  * 重编 seq 并把所有引用搬过去；引用落空的 replace 降级为普通追加。
  *
  * @param {object[]} events - 已经选好的事件（按原顺序）。
- * @returns {{ events: object[], mapping: Map<number, number> }}
+ * @returns {{ events: object[], mapping: Map<number, number>, refsFixed: number }}
  */
+/** 会进入表面的消息类型（宿主 SURFACE_EVENT_TYPES）。 */
+const SURFACE_TYPES = new Set([
+  'system/message',
+  'developer/message',
+  'user/message',
+  'assistant/message',
+  'tool/result',
+])
+
+/**
+ * 一条事件承载的文本长度（零宽字符不算内容）。
+ *
+ * @param {object} event - 日志事件。
+ * @returns {number} 去掉零宽字符后的字符数。
+ */
+export function textLengthOf(event) {
+  const blocks = Array.isArray(event?.data?.content)
+    ? event.data.content
+    : Array.isArray(event?.data?.message?.content) ? event.data.message.content : []
+  let text = ''
+  for (const block of blocks) if (typeof block?.text === 'string') text += block.text
+  return text.replace(/[\u200b\u200c\u200d\ufeff]/g, '').trim().length
+}
+
+/** 这条事件是不是一个表面节点（宿主的 `state.nodes` 成员）。 */
+export function isSurfaceNode(event) {
+  if (event === null || typeof event !== 'object') return false
+  if (!SURFACE_TYPES.has(event.type)) return false
+  return event.surfaceOp !== undefined && event.surfaceOp !== null
+}
+
+/**
+ * 把每个"活下来的" replace 的区间端点对齐到真正的表面节点，并把这些端点纳入保留集。
+ *
+ * 宿主的 `replacementRange` 用 `state.nodes.indexOf(startSeq)` 定位端点，端点必须
+ * 是表面节点，否则直接抛错；被遮蔽集合则是**表面序列的切片**，不是"seq 落在区间内"。
+ * 所以区间两端要选范围内第一个/最后一个表面节点，而不是范围内最小/最大的 seq
+ * （后者可能是 step/start 这种非表面事件）。
+ *
+ * @param {object[]} events - 原事件（按 seq 升序）。
+ * @param {Set<number>} keep - 已决定保留的 seq 集合（会被就地补充）。
+ * @returns {{ degraded: Set<number>, anchors: Set<number> }}
+ */
+export function alignReplaceRanges(events, keep) {
+  const degraded = new Set()
+  const anchors = new Set()
+  const drop = new Set()
+  const isReplace = (e) => e.surfaceOp !== undefined && e.surfaceOp !== null && typeof e.surfaceOp === 'object'
+  for (let round = 0; round < 6; round += 1) {
+    let added = false
+    for (const event of events) {
+      if (!keep.has(event.seq) || !isReplace(event)) continue
+      const start = Number(event.surfaceOp.startSeq)
+      const end = Number(event.surfaceOp.endSeq)
+      const candidates = events.filter(
+        (e) => e.seq >= start && e.seq <= end && e.seq < event.seq && isSurfaceNode(e) && keep.has(e.seq),
+      )
+      if (candidates.length === 0) {
+        // 区间里一个表面节点都不剩：这条 replace 引用不到任何东西，降级为普通追加，
+        // 否则它会因为端点不在表面而被宿主拒绝。
+        //
+        // 如果它的内容本来就是空的（静默替换载体是 1 个零宽字符），降级只会往模型
+        // 上下文里塞一条空消息，那就干脆删掉。
+        // 非空的：留在保留集里，`renumber` 会因为端点不在表面而把它降级成
+        // 普通追加 —— 内容必须留下，悄悄删掉摘要会让模型少一段记忆。
+        if (textLengthOf(event) === 0) drop.add(event.seq)
+        continue
+      }
+      const min = candidates.reduce((a, b) => (a.seq < b.seq ? a : b))
+      const max = candidates.reduce((a, b) => (a.seq > b.seq ? a : b))
+      event.surfaceOp = { op: 'replace', startSeq: min.seq, endSeq: max.seq }
+      for (const anchor of [min, max]) {
+        if (!keep.has(anchor.seq)) {
+          keep.add(anchor.seq)
+          anchors.add(anchor.seq)
+          added = true
+        }
+      }
+    }
+    if (!added) break
+  }
+  for (const seq of drop) keep.delete(seq)
+  return { degraded, anchors, drop }
+}
+
+/** 会进入表面的消息类型（宿主 SURFACE_EVENT_TYPES）。 */
 export function renumber(events) {
+  // seq 从 0 开始：宿主按数组下标核对（`planSurfaceEvent` 要求 events[i].seq === i），
+  // 而日志里第一条事件的 seq 就是 0。
   const mapping = new Map()
-  events.forEach((event, index) => mapping.set(event.seq, index + 1))
+  events.forEach((event, index) => mapping.set(event.seq, index))
   const remap = (seq) => (mapping.has(seq) ? mapping.get(seq) : null)
   const out = events.map((event) => {
     const next = { ...event, seq: mapping.get(event.seq) }
-    if (Array.isArray(event.sourceEventSeqs)) {
-      next.sourceEventSeqs = event.sourceEventSeqs.map(remap).filter((x) => x !== null)
+    // developer/message 的 `headerSeq` 是按 seq 指向 request/header 的引用，也要搬。
+    if (Number.isSafeInteger(event.data?.headerSeq)) {
+      const moved = remap(event.data.headerSeq)
+      next.data = { ...event.data }
+      if (moved === null) delete next.data.headerSeq
+      else next.data.headerSeq = moved
     }
     if (event.surfaceOp !== undefined && event.surfaceOp !== null && typeof event.surfaceOp === 'object') {
-      const start = remap(Number(event.surfaceOp.startSeq))
-      const end = remap(Number(event.surfaceOp.endSeq))
-      if (start !== null && end !== null) next.surfaceOp = { ...event.surfaceOp, startSeq: start, endSeq: end }
+      const startSeq = remap(Number(event.surfaceOp.startSeq))
+      const endSeq = remap(Number(event.surfaceOp.endSeq))
+      if (startSeq !== null && endSeq !== null) next.surfaceOp = { ...event.surfaceOp, startSeq, endSeq }
       else next.surfaceOp = 'append'
     }
     return next
   })
-  return { events: out, mapping }
+
+  // 模拟宿主的折叠，逐条算出这条 replace 应该引用什么。
+  //
+  // 宿主的算法（`replacementRange`）：用 `state.nodes.indexOf(startSeq)` 定位端点，
+  // 被遮蔽集合是**表面序列的切片** `nodes.slice(startIdx, endIdx + 1)` —— 不是"seq
+  // 落在区间内"。照搬原引用会把非法数据带进新日志（实测：本机有 3 条 rerun 记录把
+  // 范围写成嵌套数组、还漏了区间内的节点）。重算之后，输出的日志反而比原来更合规。
+  const nodes = []
+  let refsFixed = 0
+  for (const event of out) {
+    const op = event.surfaceOp
+    if (op === undefined || op === null) {
+      // 非表面事件：引用只要求扁平、不重复、都排在它之前。
+      if (event.sourceEventSeqs !== undefined) {
+        const flat = normalizeRefs(event.sourceEventSeqs)
+        const moved = flat === null ? [] : flat.filter((seq) => seq < event.seq)
+        if (moved.length === 0) delete event.sourceEventSeqs
+        else event.sourceEventSeqs = moved
+        if (flat === null || flat.length !== moved.length) refsFixed += 1
+      }
+      continue
+    }
+    if (op === 'append') {
+      if (event.sourceEventSeqs !== undefined) {
+        const flat = normalizeRefs(event.sourceEventSeqs)
+        const moved = flat === null ? [] : flat.filter((seq) => seq < event.seq)
+        if (moved.length === 0) delete event.sourceEventSeqs
+        else event.sourceEventSeqs = moved
+        if (flat === null || flat.length !== moved.length) refsFixed += 1
+      }
+      nodes.push(event.seq)
+      continue
+    }
+    const startIdx = nodes.indexOf(op.startSeq)
+    const endIdx = nodes.indexOf(op.endSeq)
+    if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) {
+      // 端点不在表面上：这条 replace 引用不到任何东西，降级为普通追加，
+      // 否则宿主会直接抛 "start seq not found in surface"。
+      event.surfaceOp = 'append'
+      delete event.sourceEventSeqs
+      nodes.push(event.seq)
+      refsFixed += 1
+      continue
+    }
+    const shadowed = nodes.slice(startIdx, endIdx + 1)
+    const before = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []
+    if (before.length !== shadowed.length || before.some((value, i) => value !== shadowed[i])) refsFixed += 1
+    event.sourceEventSeqs = [...shadowed]
+    nodes.splice(startIdx, endIdx - startIdx + 1, event.seq)
+  }
+  return { events: out, mapping, refsFixed }
 }
 
 /**
@@ -762,17 +934,12 @@ function trimReport(file, keep, target) {
     return
   }
   const renamed = renumber(trimmed.events)
-  const after = {
-    events: renamed.events.length,
-    bytes: encodeLog(original.header, renamed.events).length,
-    transcript: transcriptRows(renamed.events),
-  }
   const bytes = encodeLog(original.header, renamed.events)
   fs.writeFileSync(target, bytes)
 
   const seqs = new Set(renamed.events.map((e) => e.seq))
   let contiguous = true
-  for (let i = 1; i <= renamed.events.length; i += 1) if (!seqs.has(i)) { contiguous = false; break }
+  for (let i = 0; i < renamed.events.length; i += 1) if (!seqs.has(i)) { contiguous = false; break }
   let dangling = 0
   for (const event of renamed.events) {
     const refs = [...(Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : [])]
@@ -788,16 +955,22 @@ function trimReport(file, keep, target) {
     return blocks.map((b) => (typeof b?.text === 'string' ? b.text : '')).join(' ')
   }
 
+  // 模型视图：宿主按 surface 折叠，而压缩是累积的（后一个 checkpoint 覆盖前一个），
+  // 所以模型通常只看得见最后一个摘要 + 它之后的尾部。裁掉更早的窗口对它毫无影响，
+  // 这个对照就是证据。
+  const visibleBefore = foldSurface(original.events).visible.length
+  const visibleAfter = foldSurface(renamed.events).visible.length
+
   console.log(`原日志    ${file}`)
   console.log(`窗口      ${before.windows} 个 → 保留最后 ${keep} 个（裁掉第 1–${firstKeptWindow - 1} 窗）`)
-  console.log(`事件      ${before.events} → ${after.events}（删除 ${trimmed.dropped} 条）`)
-  console.log(`大小      ${human(before.bytes)} → ${human(after.bytes)}（省 ${human(Math.max(0, before.bytes - after.bytes))}）`)
-  console.log(`对话区    可见行 ${before.transcript} → ${after.transcript}  ← 人也将看不到被裁的窗口`)
-  console.log(`模型视图  从原第 ${firstKeptWindow} 窗的摘要起（保留 ${keep} 窗：摘要 + 各自的行）`)
+  console.log(`事件      ${before.events} → ${renamed.events.length}（删除 ${trimmed.dropped} 条）`)
+  console.log(`大小      ${human(before.bytes)} → ${human(bytes.length)}（省 ${human(Math.max(0, before.bytes - bytes.length))}）`)
+  console.log(`对话区    可见行 ${before.transcript} → ${transcriptRows(renamed.events)}  ← 人也将看不到被裁的窗口`)
+  console.log(`模型视图  可见节点 ${visibleBefore} → ${visibleAfter}${visibleBefore === visibleAfter ? '（完全不变）' : ''}`)
   if (first !== undefined) {
-    console.log(`           "${checkpointText(first).replace(/\s+/g, ' ').slice(0, 110)}…"`)
+    console.log(`          从原第 ${firstKeptWindow} 窗的摘要起："${checkpointText(first).replace(/\s+/g, ' ').slice(0, 90)}…"`)
   }
-  console.log(`结构      seq 连续=${contiguous ? '是' : '否'}，悬空引用=${dangling === 0 ? '无' : dangling + ' 处'}`)
+  console.log(`结构      seq 连续=${contiguous ? '是' : '否'}，悬空引用=${dangling === 0 ? '无' : dangling + ' 处'}，重算引用 ${renamed.refsFixed} 条`)
   console.log(`保留的框  ${trimmed.frame.map((e) => e.type).join(', ') || '(无)'}`)
   console.log(`试写文件  ${target}`)
 }
