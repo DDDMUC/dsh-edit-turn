@@ -24,6 +24,7 @@ import path from 'node:path'
 import zlib from 'node:zlib'
 import os from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { execFileSync } from 'node:child_process'
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
@@ -975,6 +976,77 @@ function trimReport(file, keep, target) {
   console.log(`试写文件  ${target}`)
 }
 
+/**
+ * 会话是否正被某个进程持有（`session.lock` 被打开）。
+ *
+ * 宿主在内存里打开会话时会持有这把锁；这时候改文件会被它后续的写入覆盖，
+ * 所以必须拒绝。
+ *
+ * @param {string} logFile - 日志文件路径。
+ * @returns {boolean} 被持有时为 true。
+ */
+function isSessionLocked(logFile) {
+  const lock = path.join(path.dirname(logFile), 'session.lock')
+  if (!fs.existsSync(lock)) return false
+  try {
+    const out = execFileSync('lsof', ['--', lock], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    // lsof 无持有时只打印表头，或什么都不打印。
+    const lines = out.trim().split('\n').filter((line) => line.trim() !== '' && !line.startsWith('COMMAND'))
+    return lines.length > 0
+  } catch {
+    // lsof 找不到、或没有持有者时会以非零退出。
+    return false
+  }
+}
+
+/**
+ * 真正落盘：备份原文件（改名保留）、写新文件（临时名 → rename）。
+ *
+ * 任何一步失败都不会留下半成品：新文件先写到同目录的临时名，成功后才 rename
+ * 覆盖原名；备份就是把原文件改名，内容一字未动。
+ *
+ * @param {string} logFile - 原日志。
+ * @param {number} keep - 保留最后几窗。
+ * @returns {object} 结果摘要。
+ */
+export function applyTrim(logFile, keep) {
+  if (isSessionLocked(logFile)) {
+    throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
+  }
+  const original = readLog(logFile)
+  const trimmed = keepLastWindows(original.events, keep)
+  if (trimmed.cutSeq === null) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
+  const renamed = renumber(trimmed.events)
+
+  const seqs = new Set(renamed.events.map((e) => e.seq))
+  for (let i = 0; i < renamed.events.length; i += 1) {
+    if (!seqs.has(i)) throw new Error(`内部错误：seq ${i} 缺失`)
+  }
+  for (const event of renamed.events) {
+    const refs = [...(Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : [])]
+    if (event.surfaceOp !== null && typeof event.surfaceOp === 'object') refs.push(event.surfaceOp.startSeq, event.surfaceOp.endSeq)
+    for (const ref of refs) {
+      if (ref !== undefined && !seqs.has(Number(ref))) throw new Error(`内部错误：seq ${event.seq} 引用不存在的 ${ref}`)
+    }
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const backup = `${logFile}.precompact-${stamp}`
+  const staging = `${logFile}.staging-${stamp}`
+  fs.writeFileSync(staging, encodeLog(original.header, renamed.events))
+  fs.renameSync(logFile, backup)
+  fs.renameSync(staging, logFile)
+  return {
+    backup,
+    before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
+    after: { events: renamed.events.length, bytes: fs.statSync(logFile).size },
+    dropped: trimmed.dropped,
+    refsFixed: renamed.refsFixed,
+    transcript: { before: transcriptRows(original.events), after: transcriptRows(renamed.events) },
+    model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamed.events).visible.length },
+  }
+}
+
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
 if (isMain) {
   const args = process.argv.slice(2)
@@ -1022,6 +1094,18 @@ if (isMain) {
             console.log(`· seq ${r.seq}（第 ${r.atTurn ?? '?'} 轮）覆盖 seq ${r.coverSeq ?? '?'} → ${r.textChars} 字符`)
           }
         }
+      } else if (args.includes('--apply')) {
+        const at = args.indexOf('--keep-windows')
+        const keep = at >= 0 ? Number(args[at + 1] ?? '3') : 3
+        const result = applyTrim(resolveLog(positional[0]), keep)
+        console.log(`已裁剪    ${resolveLog(positional[0])}`)
+        console.log(`窗口      ${result.before.windows} 个 → 保留最后 ${keep} 个`)
+        console.log(`事件      ${result.before.events} → ${result.after.events}（删除 ${result.dropped} 条）`)
+        console.log(`大小      ${human(result.before.bytes)} → ${human(result.after.bytes)}`)
+        console.log(`对话区    可见行 ${result.transcript.before} → ${result.transcript.after}`)
+        console.log(`模型视图  可见节点 ${result.model.before} → ${result.model.after}${result.model.before === result.model.after ? '（完全不变）' : ''}`)
+        console.log(`重算引用  ${result.refsFixed} 条`)
+        console.log(`备份      ${result.backup}`)
       } else if (args.includes('--keep-windows')) {
         const at = args.indexOf('--keep-windows')
         const keep = Number(args[at + 1] ?? '3')
