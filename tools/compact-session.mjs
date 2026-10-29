@@ -1295,6 +1295,9 @@ export function planUnloadableDrops(events) {
  * @param {(seq: number) => number|null} remap - 旧 seq → 新 seq。
  * @returns {{ value: unknown, drop: boolean }} 处理后的子树与是否需要丢弃该事件。
  */
+/** 不以 `Seq` 结尾、但同样是本会话 seq 的字段（我们自己的插件写的）。 */
+const SEQ_FIELD_NAMES = new Set(['logFrom', 'logTo', 'rerunTurnEnd'])
+
 function remapSeqFields(value, remap) {
   if (Array.isArray(value)) {
     const out = []
@@ -1319,7 +1322,14 @@ function remapSeqFields(value, remap) {
       const moved = item
         .map((seq) => (Number.isSafeInteger(seq) ? remap(seq) : null))
         .filter((seq) => seq !== null)
-      if (moved.length > 0) out[key] = moved
+      // 字段必须留下（可以是空数组）：格式层要求 `title messageSeqs requires an array`，
+      // 删掉字段和留下非法值一样会被拒。
+      out[key] = moved
+      continue
+    }
+    if (SEQ_FIELD_NAMES.has(key) && Number.isSafeInteger(item)) {
+      const moved = remap(item)
+      if (moved !== null) out[key] = moved
       continue
     }
     if (/Seq$/.test(key) && Number.isSafeInteger(item)) {
@@ -1346,15 +1356,74 @@ export function renumber(events) {
   // 宿主规定表面 node 0 是系统提示词。日志里它可能是一条"替换 node 0"的
   // system/message；裁掉被替换的 node 0 之后这条替换就没了落点，而且它原本
   // 排在很后面（那一窗的位置）。搬最前 + 改 append 两头都满足。
-  const sysIndex = events.findIndex(
+  // 重排：格式层规定一大批事件（`request/header`、`request/context`、`session/title`、
+  // compaction/*、消息……）必须落在"已打开的 turn"里，而 `system/message` 还额外要求
+  // turn+step 完全匹配（`requireStep`）。所以：
+  //
+  //   能在 turn 之前的 = 格式层不管的类型（权限/沙箱/预设这些设置，以及我们的插件记录）
+  //   其余全部挪进第一对 turn/start + step/start 之后，系统提示词排在最前
+  //
+  // turn/start、step/start 都不是表面节点，所以系统提示词仍然是第一个表面节点。
+  const RELATIONSHIP_TYPES = new Set([
+    'system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result',
+    'assistant/attempt', 'turn/start', 'turn/end', 'step/start', 'step/end', 'tool/call',
+    'request/header', 'request/context', 'tool/ptc-dispatch-start', 'tool/ptc-dispatch',
+    'llm/retry', 'llm/retry-started', 'session/title', 'session/title-llm-request',
+    'command/run', 'command/done', 'compaction/start', 'compaction/summary', 'compaction/end',
+    'compaction/prune', 'session/end-seed',
+  ])
+  const head = events.filter((e) => !RELATIONSHIP_TYPES.has(e.type))
+  const body = events.filter((e) => RELATIONSHIP_TYPES.has(e.type))
+
+  const sysIndex = body.findIndex(
     (e) => (e.type === 'system/message' || e.type === 'developer/message') && textLengthOf(e) > 0,
   )
   let ordered = events
-  if (sysIndex > 0) {
-    const sys = { ...events[sysIndex], surfaceOp: 'append' }
-    ordered = [sys, ...events.slice(0, sysIndex), ...events.slice(sysIndex + 1)]
-  } else if (sysIndex === 0 && events[0].surfaceOp !== 'append') {
-    ordered = [{ ...events[0], surfaceOp: 'append' }, ...events.slice(1)]
+  if (sysIndex >= 0) {
+    const sysEvent = body[sysIndex]
+    const turnStart = body.find((e) => e.type === 'turn/start')
+    const stepStart = turnStart === undefined
+      ? undefined
+      : body.find((e) => e.type === 'step/start' && e.seq > turnStart.seq)
+    const sys = {
+      ...sysEvent,
+      surfaceOp: 'append',
+      data: {
+        ...sysEvent.data,
+        ...(turnStart === undefined ? {} : { turn: turnStart.data?.turn }),
+        ...(stepStart === undefined ? {} : { step: stepStart.data?.step }),
+      },
+    }
+    const rest = body.filter((_, index) => index !== sysIndex)
+    const anchor = stepStart ?? turnStart
+    if (anchor === undefined) {
+      ordered = [...head, sys, ...rest]
+    } else {
+      const at = rest.findIndex((e) => e.seq === anchor.seq)
+      ordered = [...head, ...rest.slice(0, at + 1), sys, ...rest.slice(at + 1)]
+    }
+  } else {
+    ordered = [...head, ...body]
+  }
+
+  // 收尾：body 里可能还有排在第一条 turn/start **之前**的事件（例如为"这一窗的工具
+  // 声明"强制保留的那条 request/header）。它们同样必须在已打开的 turn 里，所以搬到
+  // 第一条 turn/start 之后、系统提示词旁边。
+  const firstTurnAt = ordered.findIndex((e) => e.type === 'turn/start')
+  if (firstTurnAt > 0) {
+    const strays = ordered.slice(0, firstTurnAt).filter((e) => RELATIONSHIP_TYPES.has(e.type))
+    if (strays.length > 0) {
+      const straysSet = new Set(strays.map((e) => e.seq))
+      const kept = ordered.filter((e) => !straysSet.has(e.seq))
+      const anchorAt = kept.findIndex((e) => e.type === 'step/start' || e.type === 'turn/start')
+      const insertAt = anchorAt < 0 ? 0 : anchorAt + 1
+      // 系统提示词要留在最前：strays 插到它后面。
+      const sysAt = kept.findIndex(
+        (e) => (e.type === 'system/message' || e.type === 'developer/message') && textLengthOf(e) > 0,
+      )
+      const at = sysAt >= 0 && sysAt >= insertAt ? sysAt + 1 : insertAt
+      ordered = [...kept.slice(0, at), ...strays, ...kept.slice(at)]
+    }
   }
 
   // ── 1) seq 从 0 起连续重编 ───────────────────────────────────────────────
@@ -1365,22 +1434,28 @@ export function renumber(events) {
   // ── 2) 轮次 / 步骤重编号 ─────────────────────────────────────────────────
   //
   // 裁掉前 10 轮之后，日志里的 turn 还从 11 起、step 从 58 起；宿主按 1 起读。
+  // 轮次按 **turn/start 的顺序**编号（不是按任何事件出现顺序：重排之后，排在最前的
+  // 设置/job 记录还带着被裁窗口的旧 turn 号，会先把 1、2、3 占掉）。
   const turnMap = new Map()
-  const stepMap = new Map()
   let nextTurn = 1
   for (const event of ordered) {
-    const turn = event.data?.turn
-    if (!Number.isSafeInteger(turn)) continue
-    if (!turnMap.has(turn)) turnMap.set(turn, nextTurn++)
+    if (event.type !== 'turn/start') continue
+    const old = event.data?.turn
+    if (Number.isSafeInteger(old) && !turnMap.has(old)) turnMap.set(old, nextTurn++)
+  }
+  const mapTurn = (turn) => (turnMap.has(turn) ? turnMap.get(turn) : 1)
+  const stepMap = new Map()
+  for (const event of ordered) {
+    const oldTurn = event.data?.turn
     const step = event.data?.step
-    if (Number.isSafeInteger(step)) {
-      let perTurn = stepMap.get(turn)
-      if (perTurn === undefined) {
-        perTurn = new Map()
-        stepMap.set(turn, perTurn)
-      }
-      if (!perTurn.has(step)) perTurn.set(step, perTurn.size + 1)
+    if (!Number.isSafeInteger(oldTurn) || !Number.isSafeInteger(step)) continue
+    const newTurn = mapTurn(oldTurn)
+    let perTurn = stepMap.get(newTurn)
+    if (perTurn === undefined) {
+      perTurn = new Map()
+      stepMap.set(newTurn, perTurn)
     }
+    if (!perTurn.has(step)) perTurn.set(step, perTurn.size + 1)
   }
 
   const out = []
@@ -1391,12 +1466,12 @@ export function renumber(events) {
       const data = { ...event.data }
       let touched = false
       if (Number.isSafeInteger(data.turn)) {
-        data.turn = turnMap.get(data.turn)
+        data.turn = mapTurn(data.turn)
         touched = true
       }
       if (Number.isSafeInteger(data.step)) {
-        const perTurn = stepMap.get(event.data.turn)
-        if (perTurn !== undefined) {
+        const perTurn = stepMap.get(mapTurn(event.data.turn))
+        if (perTurn !== undefined && perTurn.has(event.data.step)) {
           data.step = perTurn.get(event.data.step)
           touched = true
         }
@@ -1518,7 +1593,39 @@ export function renumber(events) {
   // ── 5) 按宿主算法重算 sourceEventSeqs ───────────────────────────────────
   const nodes = []
   let refsFixed = 0
+  let compactionDropped2 = 0
+  const finalKept = []
+  /** 摘要被丢掉的 compactionId：start/end/prune 也要一起丢，否则宿主报
+   *  "successful compaction/end requires one summary"。 */
+  const brokenCompactions = new Set()
   for (const event of rebuilt) {
+    if (typeof event.data?.compactionId === 'string' && brokenCompactions.has(event.data.compactionId)) {
+      compactionDropped2 += 1
+      continue
+    }
+    // compaction 的记账字段必须与"这一刻的表面"逐条对齐：校验器要求
+    // shadowedRange 的两端都在当前表面里，且 shadowedSeqs **正好等于**两者之间的
+    // 切片（`shadowedSeqs do not name an exact current surface span`）。所以在这里
+    // 按模拟出的表面现算，而不是照搬载体上的值。
+    if (event.type === 'compaction/summary' || event.type === 'compaction/prune') {
+      const carrier = event.type === 'compaction/summary'
+        ? carriers.get(event.data?.compactionId)
+        : null
+      const range = event.type === 'compaction/summary'
+        ? (carrier !== undefined && carrier.surfaceOp !== null && typeof carrier.surfaceOp === 'object' ? carrier.surfaceOp : null)
+        : (event.data?.shadowedRange ?? null)
+      const startIdx = range === null ? -1 : nodes.indexOf(Number(range.start))
+      const endIdx = range === null ? -1 : nodes.indexOf(Number(range.end))
+      if (range === null || startIdx < 0 || endIdx < startIdx) {
+        compactionDropped2 += 1
+        if (typeof event.data?.compactionId === 'string') brokenCompactions.add(event.data.compactionId)
+        continue
+      }
+      const span = nodes.slice(startIdx, endIdx + 1)
+      event.data = { ...event.data, shadowedRange: { start: span[0], end: span[span.length - 1] }, shadowedSeqs: [...span] }
+      finalKept.push(event)
+      continue
+    }
     const op = event.surfaceOp
     if (op === undefined || op === null) {
       if (event.sourceEventSeqs !== undefined) {
@@ -1528,6 +1635,7 @@ export function renumber(events) {
         else event.sourceEventSeqs = moved
         if (flat === null || flat.length !== moved.length) refsFixed += 1
       }
+      finalKept.push(event)
       continue
     }
     if (op === 'append') {
@@ -1539,6 +1647,7 @@ export function renumber(events) {
         if (flat === null || flat.length !== moved.length) refsFixed += 1
       }
       nodes.push(event.seq)
+      finalKept.push(event)
       continue
     }
     const startIdx = nodes.indexOf(op.startSeq)
@@ -1547,6 +1656,7 @@ export function renumber(events) {
       event.surfaceOp = 'append'
       delete event.sourceEventSeqs
       nodes.push(event.seq)
+      finalKept.push(event)
       refsFixed += 1
       continue
     }
@@ -1555,16 +1665,56 @@ export function renumber(events) {
     if (before.length !== shadowed.length || before.some((value, i) => value !== shadowed[i])) refsFixed += 1
     event.sourceEventSeqs = [...shadowed]
     nodes.splice(startIdx, endIdx - startIdx + 1, event.seq)
+    finalKept.push(event)
+  }
+
+  // 收敛式收尾：丢掉事件会让后面的 seq 整体前移，而重编之后又可能有事件的
+  // throughSeq 不再"更早"（它指向别的会话，不能重编），于是再丢一次。循环到不再
+  // 丢弃为止（实测最多两轮）。
+  let current = finalKept
+  let deliveryDropped2 = 0
+  for (let pass = 0; pass < 4; pass += 1) {
+    const map = new Map()
+    current.forEach((event, index) => map.set(event.seq, index))
+    const remap = (seq) => (map.has(seq) ? map.get(seq) : null)
+    const out = []
+    let dropped = 0
+    for (const event of current) {
+      const next = { ...event, seq: map.get(event.seq) }
+      if (next.data !== undefined && next.data !== null) {
+        const remapped = remapSeqFields(next.data, remap)
+        if (remapped.drop) { dropped += 1; continue }
+        next.data = remapped.value
+      }
+      if (Array.isArray(next.sourceEventSeqs)) {
+        next.sourceEventSeqs = next.sourceEventSeqs.map(remap).filter((seq) => seq !== null)
+        if (next.sourceEventSeqs.length === 0) delete next.sourceEventSeqs
+      }
+      if (next.surfaceOp !== undefined && next.surfaceOp !== null && typeof next.surfaceOp === 'object') {
+        const startSeq = remap(next.surfaceOp.startSeq)
+        const endSeq = remap(next.surfaceOp.endSeq)
+        if (startSeq !== null && endSeq !== null) next.surfaceOp = { ...next.surfaceOp, startSeq, endSeq }
+        else next.surfaceOp = 'append'
+      }
+      if (Number.isSafeInteger(next.data?.throughSeq) && next.data.throughSeq >= next.seq) {
+        dropped += 1
+        deliveryDropped2 += 1
+        continue
+      }
+      out.push(next)
+    }
+    current = out
+    if (dropped === 0) break
   }
 
   return {
-    events: rebuilt,
+    events: current,
     mapping: finalMapping,
     refsFixed,
     titlesDropped,
-    compactionDropped,
+    compactionDropped: compactionDropped + compactionDropped2,
     seqDropped,
-    deliveryDropped,
+    deliveryDropped: deliveryDropped + deliveryDropped2,
   }
 }
 
