@@ -1500,6 +1500,103 @@ export function renumber(events) {
   return { events: rebuilt, mapping: finalMapping, refsFixed, titlesDropped, compactionDropped }
 }
 
+/**
+ * 会话是否正被某个进程持有（`session.lock` 被打开）。
+ *
+ * 宿主在内存里打开会话时会持有这把锁；这时候改文件会被它后续的写入覆盖，所以必须拒绝。
+ *
+ * @param {string} logFile - 日志文件路径。
+ * @returns {boolean} 被持有时为 true。
+ */
+function isSessionLocked(logFile) {
+  const lock = path.join(path.dirname(logFile), 'session.lock')
+  if (!fs.existsSync(lock)) return false
+  try {
+    const out = execFileSync('lsof', ['--', lock], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    const lines = out.trim().split('\n').filter((line) => line.trim() !== '' && !line.startsWith('COMMAND'))
+    return lines.length > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 真正落盘：备份原文件（改名保留）、写新文件（临时名 → rename）。
+ *
+ * @param {string} logFile - 原日志。
+ * @param {number} keep - 保留最后几窗。
+ * @returns {object} 结果摘要。
+ */
+export function applyTrim(logFile, keep) {
+  if (isSessionLocked(logFile)) {
+    throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
+  }
+  const original = readLog(logFile)
+  const trimmed = keepLastWindows(original.events, keep)
+  if (trimmed.cutSeq === null) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
+  const renamed = renumber(trimmed.events)
+
+  const seqs = new Set(renamed.events.map((e) => e.seq))
+  for (let i = 0; i < renamed.events.length; i += 1) {
+    if (!seqs.has(i)) throw new Error(`内部错误：seq ${i} 缺失`)
+  }
+  for (const event of renamed.events) {
+    const refs = [...(Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : [])]
+    if (event.surfaceOp !== null && typeof event.surfaceOp === 'object') refs.push(event.surfaceOp.startSeq, event.surfaceOp.endSeq)
+    for (const ref of refs) {
+      if (ref !== undefined && !seqs.has(Number(ref))) throw new Error(`内部错误：seq ${event.seq} 引用不存在的 ${ref}`)
+    }
+    if (Number.isSafeInteger(event.data?.headerSeq) && !seqs.has(event.data.headerSeq)) {
+      throw new Error(`内部错误：seq ${event.seq} 的 headerSeq 指向不存在的 ${event.data.headerSeq}`)
+    }
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const backup = `${logFile}.precompact-${stamp}`
+  const staging = `${logFile}.staging-${stamp}`
+  fs.writeFileSync(staging, encodeLog(original.header, renamed.events))
+  fs.renameSync(logFile, backup)
+  fs.renameSync(staging, logFile)
+  return {
+    backup,
+    before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
+    after: { events: renamed.events.length, bytes: fs.statSync(logFile).size },
+    dropped: trimmed.dropped,
+    refsFixed: renamed.refsFixed,
+    titlesDropped: renamed.titlesDropped,
+    compactionDropped: renamed.compactionDropped,
+    transcript: { before: transcriptRows(original.events), after: transcriptRows(renamed.events) },
+    model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamed.events).visible.length },
+  }
+}
+
+/**
+ * 只保留最后 keep 个窗口，试写到临时文件，并报告删了什么。
+ *
+ * @param {string} file - 原日志。
+ * @param {number} keep - 保留最后几窗。
+ * @param {string} target - 写到哪里（只写临时文件）。
+ */
+function trimReport(file, keep, target) {
+  const original = readLog(file)
+  const trimmed = keepLastWindows(original.events, keep)
+  if (trimmed.cutSeq === null) {
+    console.log(`只有 ${trimmed.windows} 个窗口，不需要裁。`)
+    return
+  }
+  const renamed = renumber(trimmed.events)
+  const bytes = encodeLog(original.header, renamed.events)
+  fs.writeFileSync(target, bytes)
+  console.log(`原日志    ${file}`)
+  console.log(`窗口      ${trimmed.windows} 个 → 保留最后 ${keep} 个（切点 seq ${trimmed.cutSeq}）`)
+  console.log(`事件      ${original.events.length} → ${renamed.events.length}（删除 ${trimmed.dropped} 条）`)
+  console.log(`大小      ${human(original.compressedBytes)} → ${human(bytes.length)}`)
+  console.log(`对话区    可见行 ${transcriptRows(original.events)} → ${transcriptRows(renamed.events)}`)
+  console.log(`模型视图  可见节点 ${foldSurface(original.events).visible.length} → ${foldSurface(renamed.events).visible.length}`)
+  console.log(`重算引用  ${renamed.refsFixed} 条；标题丢 ${renamed.titlesDropped} 条；compaction 丢 ${renamed.compactionDropped} 条`)
+  console.log(`试写文件  ${target}`)
+}
+
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
 if (isMain) {
   const args = process.argv.slice(2)
