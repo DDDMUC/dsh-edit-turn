@@ -1276,6 +1276,70 @@ export function planUnloadableDrops(events) {
 }
 
 /** 会进入表面的消息类型（宿主 SURFACE_EVENT_TYPES）。 */
+/**
+ * 递归重编事件里的"指向别的 seq"的字段。
+ *
+ * 宿主的格式层会逐条校验这些交叉引用（实测报错：`delivery throughSeq must
+ * precede its marker`），而它们不止一种名字：`throughSeq`、`headerSeq`、
+ * `source.originalSeq`、`source.promptSeq`、`messageSeqs`、`shadowedSeqs`、
+ * `shadowedRange`…… 逐个硬编码迟早漏，所以按后缀统一处理。
+ *
+ * 策略：
+ * - `*Seqs` 数组：逐项重编，目标没了的项丢掉；
+ * - `*Seq` 数字：重编；目标没了就删掉该字段；
+ * - `*Range` 对象：`start`/`end` 一起重编，任一端没了就删掉该字段；
+ * - `throughSeq` 特殊：它是投递标记的"投到哪一条"，目标没了这条事件就没意义，
+ *   由调用方整条丢弃（返回 `{ drop: true }`）。
+ *
+ * @param {unknown} value - 待处理的子树。
+ * @param {(seq: number) => number|null} remap - 旧 seq → 新 seq。
+ * @returns {{ value: unknown, drop: boolean }} 处理后的子树与是否需要丢弃该事件。
+ */
+function remapSeqFields(value, remap) {
+  if (Array.isArray(value)) {
+    const out = []
+    for (const item of value) {
+      const result = remapSeqFields(item, remap)
+      if (result.drop) return { value, drop: true }
+      out.push(result.value)
+    }
+    return { value: out, drop: false }
+  }
+  if (value === null || typeof value !== 'object') return { value, drop: false }
+  const out = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (key === 'throughSeq' && Number.isSafeInteger(item)) {
+      // 不重编：`throughSeq` 指的是**另一个会话**（`data.sessionId`）的日志位置，
+      // 不在本会话的 seq 空间里。它只需要"比本条事件的 seq 更早"，这一点由
+      // 调用方在重编之后检查（撑不住就丢这条投递记录）。
+      out[key] = item
+      continue
+    }
+    if (/Seqs$/.test(key) && Array.isArray(item)) {
+      const moved = item
+        .map((seq) => (Number.isSafeInteger(seq) ? remap(seq) : null))
+        .filter((seq) => seq !== null)
+      if (moved.length > 0) out[key] = moved
+      continue
+    }
+    if (/Seq$/.test(key) && Number.isSafeInteger(item)) {
+      const moved = remap(item)
+      if (moved !== null) out[key] = moved
+      continue
+    }
+    if (/Range$/.test(key) && item !== null && typeof item === 'object' && !Array.isArray(item)) {
+      const start = Number.isSafeInteger(item.start) ? remap(item.start) : null
+      const end = Number.isSafeInteger(item.end) ? remap(item.end) : null
+      if (start !== null && end !== null) out[key] = { ...item, start, end }
+      continue
+    }
+    const nested = remapSeqFields(item, remap)
+    if (nested.drop) return { value, drop: true }
+    out[key] = nested.value
+  }
+  return { value: out, drop: false }
+}
+
 export function renumber(events) {
   // ── 0) 系统提示词搬到最前，并改成 append ─────────────────────────────────
   //
@@ -1319,7 +1383,9 @@ export function renumber(events) {
     }
   }
 
-  const out = ordered.map((event) => {
+  const out = []
+  let seqDropped = 0
+  for (const event of ordered) {
     const next = { ...event, seq: mapping.get(event.seq) }
     if (event.data !== undefined && event.data !== null) {
       const data = { ...event.data }
@@ -1335,22 +1401,17 @@ export function renumber(events) {
           touched = true
         }
       }
-      if (Number.isSafeInteger(data.headerSeq)) {
-        const moved = remap(data.headerSeq)
-        if (moved === null) delete data.headerSeq
-        else data.headerSeq = moved
-        touched = true
+      // 所有"指向别的 seq"的字段统一重编（throughSeq / headerSeq / originalSeq /
+      // promptSeq / messageSeqs / shadowedSeqs / shadowedRange …）。
+      const remapped = remapSeqFields(data, remap)
+      if (remapped.drop) {
+        // 这条事件引用了一条已经被裁掉的事件（例如投递标记的 throughSeq），
+        // 它自己也就没有意义了 —— 整条丢掉，而不是留下一条悬空引用。
+        seqDropped += 1
+        continue
       }
-      // 标题的 messageSeqs 指向它据以命名的消息：必须重编，撑不住就丢这条标题
-      // （宿主报的正是 "title messageSeqs must name an earlier event"）。
-      if (event.type === 'session/title' && Array.isArray(data.messageSeqs)) {
-        const moved = data.messageSeqs
-          .map((seq) => remap(seq))
-          .filter((seq) => seq !== null && seq < next.seq)
-        data.messageSeqs = moved
-        touched = true
-      }
-      if (touched) next.data = data
+      void touched
+      next.data = remapped.value
     }
     if (event.surfaceOp !== undefined && event.surfaceOp !== null && typeof event.surfaceOp === 'object') {
       const startSeq = remap(Number(event.surfaceOp.startSeq))
@@ -1358,13 +1419,20 @@ export function renumber(events) {
       if (startSeq !== null && endSeq !== null) next.surfaceOp = { ...event.surfaceOp, startSeq, endSeq }
       else next.surfaceOp = 'append'
     }
-    return next
-  })
+    out.push(next)
+  }
 
   // 标题：fallback 来源必须至少指向一条消息；指向不到就整条丢掉。
   let titlesDropped = 0
+  let deliveryDropped = 0
   const kept = []
   for (const event of out) {
+    // 投递记录的 throughSeq 指向别的会话，裁掉前面的内容后它可能不再"更早"，
+    // 这时整条丢掉（格式层逐条校验 `throughSeq must precede its marker`）。
+    if (Number.isSafeInteger(event.data?.throughSeq) && event.data.throughSeq >= event.seq) {
+      deliveryDropped += 1
+      continue
+    }
     if (event.type === 'session/title') {
       const kind = event.data?.source?.kind
       const refs = event.data?.messageSeqs
@@ -1421,23 +1489,15 @@ export function renumber(events) {
   const finalMapping = new Map()
   finalEvents.forEach((event, index) => finalMapping.set(event.seq, index))
   const finalRemap = (seq) => (finalMapping.has(seq) ? finalMapping.get(seq) : null)
-  const rebuilt = finalEvents.map((event) => {
+  const rebuilt = []
+  for (const event of finalEvents) {
     const next = { ...event, seq: finalMapping.get(event.seq) }
-    if (Number.isSafeInteger(next.data?.headerSeq)) {
-      const moved = finalRemap(next.data.headerSeq)
-      next.data = { ...next.data }
-      if (moved === null) delete next.data.headerSeq
-      else next.data.headerSeq = moved
-    }
-    if (Array.isArray(next.data?.messageSeqs)) {
-      next.data = { ...next.data }
-      next.data.messageSeqs = next.data.messageSeqs.map(finalRemap).filter((seq) => seq !== null && seq < next.seq)
-    }
-    if (Array.isArray(next.data?.shadowedSeqs) && next.type === 'compaction/prune') {
-      next.data = { ...next.data }
-      const moved = next.data.shadowedSeqs.map(finalRemap).filter((seq) => seq !== null)
-      next.data.shadowedSeqs = moved
-      if (moved.length > 0) next.data.shadowedRange = { start: Math.min(...moved), end: Math.max(...moved) }
+    // 第二趟必须**同样走通用重编**：中间丢掉了事件（标题 / 摘要 / 投递记录），
+    // 后面的 seq 整体前移，只补几个硬编码字段会让 promptSeq、originalSeq 这类
+    // 字段停在旧编号上（实测偏差 73 —— 正好是丢掉的投递记录数）。
+    if (next.data !== undefined && next.data !== null) {
+      const remapped = remapSeqFields(next.data, finalRemap)
+      if (!remapped.drop) next.data = remapped.value
     }
     if (next.data?.shadowedRange !== undefined && next.type === 'compaction/summary') {
       next.data = { ...next.data }
@@ -1452,8 +1512,8 @@ export function renumber(events) {
       if (startSeq !== null && endSeq !== null) next.surfaceOp = { ...next.surfaceOp, startSeq, endSeq }
       else next.surfaceOp = 'append'
     }
-    return next
-  })
+    rebuilt.push(next)
+  }
 
   // ── 5) 按宿主算法重算 sourceEventSeqs ───────────────────────────────────
   const nodes = []
@@ -1497,7 +1557,15 @@ export function renumber(events) {
     nodes.splice(startIdx, endIdx - startIdx + 1, event.seq)
   }
 
-  return { events: rebuilt, mapping: finalMapping, refsFixed, titlesDropped, compactionDropped }
+  return {
+    events: rebuilt,
+    mapping: finalMapping,
+    refsFixed,
+    titlesDropped,
+    compactionDropped,
+    seqDropped,
+    deliveryDropped,
+  }
 }
 
 /**
