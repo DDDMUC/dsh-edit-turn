@@ -975,6 +975,46 @@ export function keepLastWindows(events, keep) {
   const lastHeaderBefore = events.filter((e) => e.type === 'request/header' && e.seq < cutSeq).pop()
   if (lastHeaderBefore !== undefined) keepSeq.add(lastHeaderBefore.seq)
 
+  // `agent/inbox/spliced` 是逐次拼接的记账，投影层会**按顺序重放**它（`start` 必须
+  // 落在当前 inbox 长度内）。裁掉前面的拼接后，后面的 start 就越界了 —— 实测报
+  // `invalid persisted inbox splice at session seq N`。先把全部拼接重放一遍拿到最终
+  // 状态：为空就全丢（结果完全一致）；非空就压成一条，免得丢掉待处理消息。
+  const splices = events.filter((e) => e.type === 'agent/inbox/spliced')
+  if (splices.length > 0) {
+    const inbox = { 'next-turn': [], 'next-step': [] }
+    let replayOk = true
+    for (const event of splices) {
+      const splice = event.data ?? {}
+      const target = splice.target
+      const list = inbox[target]
+      const removed = splice.removedCount ?? 0
+      if (
+        list === undefined ||
+        !Number.isSafeInteger(splice.start) ||
+        splice.start < 0 ||
+        splice.start > list.length ||
+        !Number.isSafeInteger(removed) ||
+        removed < 0 ||
+        splice.start + removed > list.length ||
+        !Array.isArray(splice.inserted)
+      ) {
+        replayOk = false
+        break
+      }
+      inbox[target] = list.toSpliced(splice.start, removed, ...splice.inserted)
+    }
+    for (const event of splices) keepSeq.delete(event.seq)
+    if (replayOk) {
+      for (const target of ['next-turn', 'next-step']) {
+        if (inbox[target].length === 0) continue
+        const first = splices.find((e) => e.data?.target === target && keepSeq.has(e.seq)) ?? splices.find((e) => e.data?.target === target)
+        if (first === undefined) continue
+        keepSeq.add(first.seq)
+        first.data = { target, start: 0, removedCount: 0, inserted: inbox[target] }
+      }
+    }
+  }
+
   // compaction/prune 指向它剪短的那条工具输出；目标被裁掉就整条丢掉（它只是记账，
   // 真正生效的是那条 tool/result 自己的 surfaceOp）。
   for (const event of events) {
