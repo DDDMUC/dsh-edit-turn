@@ -265,6 +265,11 @@ class StubElement {
   }
 
   /** Nearest ancestor (or self) matching the selector. */
+  /** Node.childNodes: the plugin walks a row's own nodes to read the host's text. */
+  get childNodes() {
+    return this.children
+  }
+
   closest(selector) {
     let node = this
     while (node !== null && node !== undefined) {
@@ -402,6 +407,21 @@ async function loadBundle(shared = null) {
   // reuses the page, and both instances write into the same record.
   if (document.clipboard === undefined) document.clipboard = []
   const clipboard = document.clipboard
+  // The platform's clipboard object. Its writer is what every copy goes through -
+  // the host's own button included - so the plugin wraps THIS, and a test can call
+  // it directly to model a host that copies without the plugin's button handover.
+  // Node has a `navigator` global of its own (userAgent and friends), so the
+  // clipboard is added to whatever is there rather than to a fresh object.
+  // `navigator` is Node's own global and outlives a harness, so the writer is
+  // re-pointed at THIS page's record every time: a write must land in the array the
+  // test that caused it reads back.
+  if (globalThis.navigator === undefined) globalThis.navigator = {}
+  globalThis.navigator.clipboard = {
+    writeText: (value) => {
+      clipboard.push(String(value))
+      return Promise.resolve(true)
+    },
+  }
   const windowListeners = new Map()
   globalThis.window = {
     __ModuleLoader__: { load: ({ factory }) => { bundleFactory = factory } },
@@ -2102,6 +2122,29 @@ test('a copy button the host re-rendered is still answered, by row', async () =>
 
   assert.deepEqual(hostWrites, [], 'the host handler never saw the press')
   assert.deepEqual(harness.clipboard, ['revised prompt'], 'the rewritten text is what landed')
+})
+
+test('a copy the platform writes itself still lands the rewritten text', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-clipboard')
+  // The row's own bubble still holds the wording the host would copy: this plugin
+  // hides it and stands its revision in front, it does not remove it.
+  host.bubble.textContent = 'the old prompt'
+  const snapshot = { nodes: new Map([['row-copy-clipboard', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(revisionBubble(host.row).textContent, 'revised prompt', 'the row shows the rewritten text')
+
+  // The host copies on its own - no press this half answered, no button of ours in
+  // the path - and the wording it writes is the pre-edit one.
+  await globalThis.navigator.clipboard.writeText('the old prompt')
+  assert.deepEqual(harness.clipboard.slice(-1), ['revised prompt'], 'the write itself is corrected')
+
+  // A copy that has nothing to do with a rewritten row is left exactly as it is.
+  await globalThis.navigator.clipboard.writeText('something else entirely')
+  assert.deepEqual(harness.clipboard.slice(-1), ['something else entirely'], 'and every other copy is untouched')
 })
 
 test('a row that was never rewritten is left to the host', async () => {
