@@ -1,6 +1,6 @@
 {
   "name": "dsh-edit-turn",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Edit any message in DeepSeek Harness in place: a prompt is replaced where it stands; a model reply block (answer text or reasoning) is patched through a plugin record and a message projection, so the turn stays where it is, later turns are untouched and the log grows by one small record. Falls back to the replay splice on hosts without the projection API. The append-only session log is never rewritten.",
   "type": "module",
   "main": "lib/index.js",
