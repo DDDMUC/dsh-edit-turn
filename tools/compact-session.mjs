@@ -1766,7 +1766,7 @@ export function renumber(events) {
  * @param {string} logFile - 日志文件路径。
  * @returns {boolean} 被持有时为 true。
  */
-function isSessionLocked(logFile) {
+export function isSessionLocked(logFile) {
   const lock = path.join(path.dirname(logFile), 'session.lock')
   if (!fs.existsSync(lock)) return false
   try {
