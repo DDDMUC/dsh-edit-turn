@@ -2069,6 +2069,41 @@ test('copying from a rewritten row hands over the rewritten text, not the old on
   assert.equal(host.copy.dataset.dshetCopyOwn, '1', 'the one write on it is this half’s own marker')
 })
 
+test('a copy button the host re-rendered is still answered, by row', async () => {
+  const harness = await loadBundle()
+  const controller = harness.controller
+  const host = mountHostUserRow(harness.document, 'row-copy-rerender')
+  const snapshot = { nodes: new Map([['row-copy-rerender', { kind: 'user', data: { seq: 2 }, anchorSeq: 2 }]]) }
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => revisedState() })
+  await controller.load(true)
+  render(harness, controller, snapshot)
+  assert.equal(revisionBubble(host.row).textContent, 'revised prompt', 'the row shows the rewritten text')
+
+  // The host re-renders its action bar and draws a NEW button: whatever a
+  // listener planted on the old node would have answered is gone with it. This
+  // is why the press is answered from the document, by row.
+  const fresh = harness.document.createElement('button')
+  fresh.className = 'xzv4MW_action'
+  fresh.setAttribute('aria-label', '复制')
+  // (The old node is left where it is: this stands for "the bar now holds a
+  // button this half never marked", which is what a host re-render leaves.)
+  host.bar.appendChild(fresh)
+  const hostWrites = []
+  fresh.addEventListener('click', () => hostWrites.push('original'))
+  fresh.onclick = () => hostWrites.push('original')
+
+  harness.document.fireDocument('click', {
+    target: fresh,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  })
+  await Promise.resolve()
+
+  assert.deepEqual(hostWrites, [], 'the host handler never saw the press')
+  assert.deepEqual(harness.clipboard, ['revised prompt'], 'the rewritten text is what landed')
+})
+
 test('a row that was never rewritten is left to the host', async () => {
   const harness = await loadBundle()
   const controller = harness.controller

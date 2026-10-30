@@ -277,6 +277,16 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
+**0.5.7** —— 改写过的行，复制按钮被宿主重画之后仍然交出改写后的文本。
+
+- **问题**：编辑过一条消息（提示词走官方 surface 替换），界面上显示的是改写后的文本，但点那一排的**复制**按钮，粘出来的是**改写前**的原文。
+
+- **原因**：宿主自己的复制按钮复制的是"这一行被画出来时的那条消息"，所以改写过的行需要由本插件来回答这次按下。原来的做法是**在那个按钮节点上**装一个捕获期监听——只要节点还在就有效。但动作条是宿主的 React 画的，任何一次重渲染都可能换掉那个按钮节点（时钟、悬停、流式更新都会触发），监听就跟着旧节点一起没了；于是这次按下落到宿主自己的处理上，复制出原文。同一排的删除 / 重跑 / 编辑不受影响，因为它们本来就是本插件自己注入的节点。
+
+- **修法**：改由**文档级捕获期监听**按"行"来回答——命中的是 `button.closest('[data-chat-flow-key]')` 那一行，取的是本插件维护的"这一行该交出的文本"，与按钮是不是同一个节点无关。捕获期在 React 根节点之前，所以宿主自己的处理根本看不到这次按下；本插件自己注入的按钮按标记排除，不会被误当成复制。
+
+- 新增测试：**宿主重渲染后换上全新的复制按钮**（旧节点上没有任何本插件的标记），按下它仍然交出改写后的文本，且宿主自己的处理拿不到这次按下。
+
 **0.5.6** —— 裁剪工具改为"先验后写"：用宿主自己的校验器验，验不过就不落盘。
 
 - **校验不能自己写一份**：日志格式的规则全在宿主里，而且分三层——格式层（`dsh-session-format-v3-to-v4`）、会话层（`dsh-session` 的逐条准入与表面折叠）、投影层（`dsh-agent-loop` 的 inbox 拼接）。这次做裁剪时自己按理解写校验，结果是**连续八次被宿主拒收**：`title messageSeqs must name an earlier event`、`delivery throughSeq must precede its marker`、`system/message does not match an open turn and step`、`request/header is outside an open turn`、`turn/start does not open the expected turn`、`compaction shadowedSeqs do not name an exact current surface span`、`format v4 event N is not dense`、`successful compaction/end requires one summary`。
