@@ -277,6 +277,18 @@ ln -s /path/to/dsh-install/node_modules ./node_modules
 
 ### 更新日志
 
+**0.5.6** —— 裁剪工具改为"先验后写"：用宿主自己的校验器验，验不过就不落盘。
+
+- **校验不能自己写一份**：日志格式的规则全在宿主里，而且分三层——格式层（`dsh-session-format-v3-to-v4`）、会话层（`dsh-session` 的逐条准入与表面折叠）、投影层（`dsh-agent-loop` 的 inbox 拼接）。这次做裁剪时自己按理解写校验，结果是**连续八次被宿主拒收**：`title messageSeqs must name an earlier event`、`delivery throughSeq must precede its marker`、`system/message does not match an open turn and step`、`request/header is outside an open turn`、`turn/start does not open the expected turn`、`compaction shadowedSeqs do not name an exact current surface span`、`format v4 event N is not dense`、`successful compaction/end requires one summary`。
+
+- **`tools/verify-session-log.mjs`（新）**：把宿主的包**从 app.asar 里取出来直接跑**。六项检查：格式层、会话层（`adoptSessionEvent` + `foldSurface`）、交叉引用（所有 `*Seq` / `*Seqs` / `*Range` 字段必须存在且更早）、inbox 投影（按投影层的规则重放拼接）、结构（seq 从 0 连续、表面区间合法）、标题（`fallback` 来源必须指向更早的消息）。命令：`node tools/verify-session-log.mjs <日志文件> [--json]`，不通过时退出码为 1。
+
+  取包这一步有个坑：asar 的数据段起点是 **`8 + headerSize`**，不是 `16 + headerSize`。写成后者会让每个文件错位 8 字节、解出来的 JS 全部不可解析——这就是最初"没法用宿主自己的校验器"的原因。取出的包缓存在 `~/.cache/dsh-edit-turn/host-libs/`，只在首次或 asar 变化时重解。
+
+- **落盘改为先验后写**：`--apply` 现在先把裁剪结果写到暂存文件、**用它跑完六项校验**，通过才把原文件改名成备份、暂存文件上位；任何一项不过就删掉暂存文件、原文件一个字节都不动（报出是哪一项、哪个细节）。校验器本身跑不起来（比如找不到 app.asar）同样拒绝写入——要强行跳过用 `--no-verify`。
+
+- 新增 `tools/lib/host-libs.mjs`（asar 读取与宿主库解包）与 `test/apply.test.js`（暂存/提交/跳过校验/拒绝写入/编码往返）。这些都在 `tools/` 下，**不随 npm 包发布**（`files` 只含 `lib/`），仓库里可用。
+
 **0.5.5** —— 不再向模型暴露任何工具；新增会话日志裁剪工具。
 
 - **模型工具移除**：本插件原先注册了一个模型可见的工具（`edit_turn_targets`，给模型列可编辑的轮次/步骤）。它其实用不上——编辑是靠 UI 面板做的，模型不需要知道这件事——而且它把 `dsh-tools` 平台拖成了硬依赖。现在整个工具拿掉，插件不再注册任何模型可见的工具，也不再依赖 `dsh-tools`。

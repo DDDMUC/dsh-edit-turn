@@ -1779,13 +1779,13 @@ function isSessionLocked(logFile) {
 }
 
 /**
- * 真正落盘：备份原文件（改名保留）、写新文件（临时名 → rename）。
+ * 生成裁剪结果并写到暂存文件（**不动原文件**）。
  *
  * @param {string} logFile - 原日志。
  * @param {number} keep - 保留最后几窗。
- * @returns {object} 结果摘要。
+ * @returns {{ staging: string, backup: string, summary: object }} 暂存信息。
  */
-export function applyTrim(logFile, keep) {
+export function stageTrim(logFile, keep) {
   if (isSessionLocked(logFile)) {
     throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
   }
@@ -1813,19 +1813,66 @@ export function applyTrim(logFile, keep) {
   const backup = `${logFile}.precompact-${stamp}`
   const staging = `${logFile}.staging-${stamp}`
   fs.writeFileSync(staging, encodeLog(original.header, renamed.events))
-  fs.renameSync(logFile, backup)
-  fs.renameSync(staging, logFile)
   return {
+    staging,
     backup,
-    before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
-    after: { events: renamed.events.length, bytes: fs.statSync(logFile).size },
-    dropped: trimmed.dropped,
-    refsFixed: renamed.refsFixed,
-    titlesDropped: renamed.titlesDropped,
-    compactionDropped: renamed.compactionDropped,
-    transcript: { before: transcriptRows(original.events), after: transcriptRows(renamed.events) },
-    model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamed.events).visible.length },
+    summary: {
+      backup,
+      before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
+      after: { events: renamed.events.length, bytes: fs.statSync(staging).size },
+      dropped: trimmed.dropped,
+      refsFixed: renamed.refsFixed,
+      titlesDropped: renamed.titlesDropped,
+      compactionDropped: renamed.compactionDropped,
+      transcript: { before: transcriptRows(original.events), after: transcriptRows(renamed.events) },
+      model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamed.events).visible.length },
+    },
   }
+}
+
+/**
+ * 暂存文件换到正式位置：原文件改名成备份，暂存改名成正式文件。
+ *
+ * @param {{ staging: string, backup: string, summary: object }} staged - 暂存信息。
+ * @param {string} logFile - 原日志路径。
+ * @returns {object} 结果摘要。
+ */
+export function commitTrim(staged, logFile) {
+  fs.renameSync(logFile, staged.backup)
+  fs.renameSync(staged.staging, logFile)
+  return staged.summary
+}
+
+/**
+ * 落盘：**先验后写**。
+ *
+ * 校验用的是宿主自己的校验器（格式层 / 会话层 / 投影层，见 verify-session-log.mjs）——
+ * 日志格式的规则全在宿主里，自己写一份"我以为对"的校验已经付过八次代价。验不过就
+ * 删掉暂存文件、原文件一个字节都不动。
+ *
+ * @param {string} logFile - 原日志。
+ * @param {number} keep - 保留最后几窗。
+ * @param {{ verify?: boolean }} [options] - `verify: false` 跳过校验（等于 `--no-verify`）。
+ * @returns {Promise<object>} 结果摘要。
+ */
+export async function applyTrim(logFile, keep, options = {}) {
+  const staged = stageTrim(logFile, keep)
+  if (options.verify !== false) {
+    let result
+    try {
+      const { verifyLog } = await import('./verify-session-log.mjs')
+      result = await verifyLog(staged.staging)
+    } catch (error) {
+      fs.rmSync(staged.staging, { force: true })
+      throw new Error(`校验器跑不起来，未写入（确实要跳过就用 --no-verify）：${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (!result.ok) {
+      fs.rmSync(staged.staging, { force: true })
+      const bad = result.checks.filter((check) => !check.ok).map((check) => `${check.name} ${check.detail}`).join('；')
+      throw new Error(`裁剪结果没通过宿主校验，未写入：${bad}`)
+    }
+  }
+  return commitTrim(staged, logFile)
 }
 
 /**
@@ -1871,7 +1918,7 @@ if (isMain) {
       for (const file of allLogs()) {
         try {
           const before = fs.statSync(file).size
-          const result = applyTrim(file, keep)
+          const result = await applyTrim(file, keep, { verify: !args.includes('--no-verify') })
           saved += Math.max(0, before - result.after.bytes)
           trimmed += 1
           console.log(`✔ ${path.basename(path.dirname(file)).slice(8, 20)}  ${result.before.events} → ${result.after.events} 事件  ${human(result.before.bytes)} → ${human(result.after.bytes)}  模型视图 ${result.model.before} → ${result.model.after}`)
@@ -1925,7 +1972,7 @@ if (isMain) {
       } else if (args.includes('--apply')) {
         const at = args.indexOf('--keep-windows')
         const keep = at >= 0 ? Number(args[at + 1] ?? '3') : 3
-        const result = applyTrim(resolveLog(positional[0]), keep)
+        const result = await applyTrim(resolveLog(positional[0]), keep, { verify: !args.includes('--no-verify') })
         console.log(`已裁剪    ${resolveLog(positional[0])}`)
         console.log(`窗口      ${result.before.windows} 个 → 保留最后 ${keep} 个`)
         console.log(`事件      ${result.before.events} → ${result.after.events}（删除 ${result.dropped} 条）`)
