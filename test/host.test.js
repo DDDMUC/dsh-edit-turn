@@ -334,9 +334,16 @@ test('GET /state reports the editable turns of a live session', async () => {
     assert.equal(res.json.surface.length, 6)
     assert.deepEqual(res.json.turns.map((turn) => turn.seq), [2, 6])
     assert.deepEqual(res.json.turns.map((turn) => turn.text), ['original prompt', 'second prompt'])
-    // The model's answers are editable too, as a separate list.
+    // The model's answers are editable too, as a separate list - but as identities
+    // only: one reply carries its whole turn's reasoning and answer text, and a
+    // long session's list ran to 27.9 MB (13 s for a single refresh). The wording
+    // is fetched per reply from `/reply` when it is actually wanted.
     assert.deepEqual(res.json.replies.map((reply) => reply.seq), [3, 8])
-    assert.deepEqual(res.json.replies.map((reply) => reply.text), ['first answer', 'second answer'])
+    assert.equal(res.json.replies[0].text, undefined, 'no wording in the list')
+    assert.equal(res.json.replies[0].textLength, 'first answer'.length, 'its length is published')
+    // `blocks` only exists on the in-place (patch) path, so the count is the
+    // contract: on the replay path it is 0 and the whole reply is replaced.
+    assert.equal(typeof res.json.replies[0].blockCount, 'number', 'and so is its block count')
     // Compared against the module, not a literal: a version bump must not require
     // editing a test.
     assert.equal(res.json.version, PLUGIN_VERSION)
@@ -355,6 +362,7 @@ test('every route is mounted, so a missing one never silently passes', async () 
       '/dsh-edit-turn/apply',
       '/dsh-edit-turn/attachment',
       '/dsh-edit-turn/debug',
+      '/dsh-edit-turn/reply',
       '/dsh-edit-turn/state',
     ])
   } finally {
@@ -977,10 +985,14 @@ test('editing a reply block appends one patch record and no turn', async () => {
     assert.equal(state.json.patches.length, 1)
     assert.deepEqual(state.json.patches[0], { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer' })
     const reply = state.json.replies.find((entry) => entry.seq === assistant.seq)
-    assert.equal(reply.blocks.length, 2)
-    assert.equal(reply.blocks[1].text, 'patched answer')
-    assert.equal(reply.blocks[1].original, 'OLD ANSWER')
-    assert.equal(reply.patched, true)
+    assert.equal(reply.blocks, undefined, '/state publishes identities only')
+    assert.equal(reply.blockCount, 2, 'the block count is published')
+    // The wording and the blocks come from `/reply`, on demand.
+    const body = await raw(h.port, { path: `/dsh-edit-turn/reply?sessionId=${SESSION_ID}&messageId=${encodeURIComponent(reply.messageId)}` })
+    assert.equal(body.json.ok, true)
+    assert.equal(body.json.blocks.length, 2)
+    assert.equal(body.json.blocks[1].text, 'patched answer')
+    assert.equal(body.json.blocks[1].original, 'OLD ANSWER')
   } finally {
     await h.close()
   }
@@ -1119,8 +1131,10 @@ test('the answer picker lists every step reasoning of the same turn', async () =
   try {
     const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
     const replies = state.json.replies
-    const answer = replies.find((reply) => Array.isArray(reply.blocks) && reply.blocks.some((block) => block.kind === 'text'))
-    assert.ok(answer, 'the answer row is offered')
+    const answerRow = replies.find((reply) => (reply.blockCount ?? 0) > 1)
+    assert.ok(answerRow, 'the answer row is offered')
+    const body = await raw(h.port, { path: `/dsh-edit-turn/reply?sessionId=${SESSION_ID}&messageId=${encodeURIComponent(answerRow.messageId)}` })
+    const answer = body.json
     assert.deepEqual(
       answer.blocks.map((block) => [block.kind, block.text]),
       [['reasoning', 'STEP ONE THOUGHT'], ['reasoning', 'STEP TWO THOUGHT'], ['text', 'FINAL ANSWER']],
