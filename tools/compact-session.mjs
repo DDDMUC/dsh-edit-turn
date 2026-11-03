@@ -1832,14 +1832,77 @@ export function isSessionLocked(logFile) {
  * @param {number} keep - 保留最后几窗。
  * @returns {{ staging: string, backup: string, summary: object }} 暂存信息。
  */
-export function stageTrim(logFile, keep) {
+
+/**
+ * 每个事件属于第几轮（`turn/start` 打开、`turn/end` 关闭；没有轮次的记 0）。
+ *
+ * @param {object[]} events - 事件数组。
+ * @returns {Map<number, number>} seq → turn。
+ */
+function turnIndexOf(events) {
+  const out = new Map()
+  let current = 0
+  for (const event of events) {
+    if (event.type === 'turn/start') {
+      const turn = event.data && typeof event.data.turn === 'number' ? event.data.turn : current + 1
+      current = turn
+      out.set(event.seq, turn)
+      continue
+    }
+    if (current > 0) out.set(event.seq, current)
+    if (event.type === 'turn/end') current = 0
+  }
+  return out
+}
+
+/**
+ * 删掉「旧回合」里 `assistant/message.data.stream` 的流式回放记录。
+ *
+ * `stream` 是模型输出的原始增量（block-start / reasoning-chunks / tool-call-chunks /
+ * block-end / usage / finish，带 `dt` 与 `time0`）。它与 `data.message.content`
+ * **逐块重复**（实测 reasoning 与 tool-call 完全相同），删掉不丢正文、不丢思考文本，
+ * 只丢“逐字回放的动画与时序”。近期回合保留，因为那是回头看时唯一会用到的。
+ *
+ * 不改行数、不改 seq、不动表面，所以不触发重编号与内容闸门。
+ *
+ * @param {object[]} events - 裁剪后的事件。
+ * @param {number} keepTurns - 保留最近几轮的 stream；`Infinity` 表示全留。
+ * @returns {{ events: object[], stripped: number, bytesSaved: number }} 新事件与统计。
+ */
+export function stripOldStreams(events, keepTurns) {
+  if (!Number.isFinite(keepTurns) && keepTurns !== Infinity) return { events, stripped: 0, bytesSaved: 0 }
+  if (keepTurns === Infinity) return { events, stripped: 0, bytesSaved: 0 }
+  const turnOf = turnIndexOf(events)
+  let maxTurn = 0
+  for (const turn of turnOf.values()) if (turn > maxTurn) maxTurn = turn
+  const floor = maxTurn - Math.max(1, keepTurns) + 1
+  let stripped = 0
+  let bytesSaved = 0
+  const out = events.map((event) => {
+    if (event.type !== 'assistant/message') return event
+    if (event.data === null || typeof event.data !== 'object' || event.data.stream === undefined) return event
+    const turn = turnOf.get(event.seq) ?? 0
+    if (turn >= floor) return event
+    bytesSaved += Buffer.byteLength(JSON.stringify(event.data.stream))
+    const data = { ...event.data }
+    delete data.stream
+    stripped += 1
+    return { ...event, data }
+  })
+  return { events: out, stripped, bytesSaved }
+}
+
+export function stageTrim(logFile, keep, options = {}) {
   if (isSessionLocked(logFile)) {
     throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
   }
   const original = readLog(logFile)
   const trimmed = keepLastWindows(original.events, keep)
   if (trimmed.cutSeq === null) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
-  const renamed = renumber(trimmed.events)
+  // 旧回合的流式回放记录：与 data.message.content 逐块重复，留最近几轮就够。
+  const streamKeepTurns = options.streamKeepTurns === undefined ? Infinity : options.streamKeepTurns
+  const stripped = stripOldStreams(trimmed.events, streamKeepTurns)
+  const renamed = renumber(stripped.events)
 
   const seqs = new Set(renamed.events.map((e) => e.seq))
   for (let i = 0; i < renamed.events.length; i += 1) {
@@ -1871,6 +1934,7 @@ export function stageTrim(logFile, keep) {
       refsFixed: renamed.refsFixed,
       titlesDropped: renamed.titlesDropped,
       compactionDropped: renamed.compactionDropped,
+      stream: { stripped: stripped.stripped, bytesSaved: stripped.bytesSaved, keepTurns: streamKeepTurns === Infinity ? null : streamKeepTurns },
       transcript: { before: transcriptRows(original.events), after: transcriptRows(renamed.events) },
       model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamed.events).visible.length },
     },
@@ -1904,7 +1968,7 @@ export function commitTrim(staged, logFile) {
  * @returns {Promise<object>} 结果摘要。
  */
 export async function applyTrim(logFile, keep, options = {}) {
-  const staged = stageTrim(logFile, keep)
+  const staged = stageTrim(logFile, keep, options)
   if (options.verify !== false) {
     let result
     try {
