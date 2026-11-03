@@ -891,6 +891,28 @@ export function assertHostLoadable(header, events) {
 }
 
 /**
+ * 一个检查点保留的尾巴从哪开始。
+ *
+ * 检查点用 `surfaceOp: { startSeq, endSeq }` 替换掉旧区间，**替换之后的那些单元
+ * 才是这一窗留给模型的尾巴**——它们的 seq 比检查点自己的 seq 小。所以一窗的边界
+ * 是 `endSeq + 1`，不是检查点的 seq；从检查点切会把这截尾巴一起切掉。
+ *
+ * 不是检查点（没有区间），或者这个 seq 根本不在日志里，就返回它自己：调用方
+ * 只关心"往后找第一条 turn/start"。
+ *
+ * @param {object[]} events - 原事件（不含头部）。
+ * @param {number} checkpointSeq - 检查点事件的 seq。
+ * @returns {number} 这一窗尾巴的起始 seq。
+ */
+export function checkpointTailStart(events, checkpointSeq) {
+  const checkpoint = events.find((event) => event.seq === checkpointSeq)
+  const op = checkpoint?.surfaceOp
+  if (op === null || op === undefined || typeof op !== 'object') return checkpointSeq
+  if (!Number.isSafeInteger(op.endSeq)) return checkpointSeq
+  return op.endSeq + 1
+}
+
+/**
  * 只保留最后 keep 个窗口，其余整段裁掉。
  *
  * 这是**销毁性**操作：被裁窗口的原文是对话区的源材料，删掉之后人也看不到了。
@@ -914,7 +936,12 @@ export function keepLastWindows(events, keep) {
   // 切点退到**轮次边界**：checkpoint 不是 turn 边界，从它切会留下一条没有 turn/start
   // 的 request/header，宿主直接拒绝（实测报 "title messageSeqs must name an earlier
   // event" 之前，先撞上这个）。所以从 checkpoint 往后找第一条 turn/start。
-  const boundary = real[firstKept - 1].startSeq
+  //
+  // 边界是**检查点保留的尾巴起点**，不是检查点自己：一条 checkpoint 用
+  // `surfaceOp: { startSeq, endSeq }` 替换掉旧区间，紧接着那些"没被替换"的单元
+  // 就是这一窗真正留给模型的尾巴——它们的 seq 比 checkpoint 自己的 seq 还小。
+  // 从 checkpoint 切会把这些尾巴一起切掉，模型立刻少读一窗内容。
+  const boundary = checkpointTailStart(events, real[firstKept - 1].checkpointSeq)
   const turnStart = events.find((e) => e.type === 'turn/start' && e.seq >= boundary)
   const cutSeq = turnStart !== undefined ? turnStart.seq : boundary
 

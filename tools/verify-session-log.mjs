@@ -37,6 +37,20 @@ const EXTRA_SEQ_FIELDS = new Set(['logFrom', 'logTo', 'rerunTurnEnd'])
  */
 function checkStructure(events) {
   const seqs = new Set(events.map((event) => event.seq))
+  // 宿主的行格式把 type/seq/time/data 列为必填（EVENT_REQUIRED）。缺了 time 的行
+  // 会让整份日志在加载时被拒——`released v2 row 0 lacks required field time`——
+  // 而 ①② 拿到的是已解析的事件、不走宿主的 decodeRow，所以这一条必须在这里查，
+  // 否则"校验通过"的文件宿主照样打不开。
+  const REQUIRED = ['type', 'seq', 'time', 'data']
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]
+    for (const key of REQUIRED) {
+      if (!Object.hasOwn(event, key)) {
+        return `第 ${index} 条事件缺 ${key}（宿主会拒收：released v2 row ${index} lacks required field ${key}）`
+      }
+    }
+    if (!Number.isSafeInteger(event.time)) return `第 ${index} 条事件的 time 不是安全整数：${event.time}`
+  }
   for (let index = 0; index < events.length; index += 1) {
     if (events[index].seq !== index) return `第 ${index} 条事件的 seq 是 ${events[index].seq}，不连续`
   }
