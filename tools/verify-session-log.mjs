@@ -206,6 +206,63 @@ function checkTitles(events) {
  * @param {{ libs?: object }} [options] - 可传入已加载的宿主库以复用。
  * @returns {Promise<{ ok: boolean, checks: Array<{ name: string, ok: boolean, detail: string }>, events: number, visible: number }>} 结果。
  */
+/**
+ * 检查项 ⑥：用宿主的 `Session` 构造器把整份日志装一遍。
+ *
+ * 这一层才是加载路径本身。`assertSessionEventEnvelope` 逐条校验行信封（`time`
+ * 必填）、消息形状、`assistant/message` 的 settlement 字段（`turn`/`step`/`stream`
+ * 必须是数组）、表面元数据——而 ①② 拿到的是已解析的事件，全都绕过了它。实测代价：
+ * 缺 `time` 的日志六项全绿、宿主报 `released v2 row 0 lacks required field time`；
+ * 补上 `time` 又报 `seed assistant/message at index 9 has invalid settlement fields`。
+ * 直接构造一次最省事，也不会随宿主升级而过时。
+ *
+ * @param {object[]} events - 事件数组（`readLog` 的原始形态，区间未展开）。
+ * @param {object|null} header - 日志头部。
+ * @param {object} libs - 宿主的包。
+ * @returns {string|null} 违规说明，通过返回 null。
+ */
+function checkSeedLoad(events, header, libs) {
+  const Session = libs?.session?.Session
+  if (typeof Session !== 'function') return '宿主没有导出 Session，跳过这一项'
+  const id = header?.id
+  if (typeof id !== 'string' || id === '') return null
+  try {
+    new Session(id, expandSeqRanges(events), { ...header, version: 4 }, 'restore', 0)
+    return null
+  } catch (error) {
+    return String((error && error.message) || error)
+  }
+}
+
+/**
+ * 把 `sourceEventSeqs` 的 `[start, end]` 区间展开成逐个 seq。
+ *
+ * 日志里是紧凑写法（`[[1481,1483],1487,…]`），宿主在 `decodeSeqRanges` 里展开
+ * 之后才校验。不展开就喂给 `Session`，合法日志会被判成
+ * `sourceEventSeqs must densely contain non-negative safe integers`。
+ *
+ * @param {object[]} events - 事件数组。
+ * @returns {object[]} 展开后的副本（不改原对象）。
+ */
+function expandSeqRanges(events) {
+  return events.map((event) => {
+    if (!Array.isArray(event.sourceEventSeqs)) return event
+    const expanded = []
+    for (const entry of event.sourceEventSeqs) {
+      if (typeof entry === 'number') {
+        expanded.push(entry)
+        continue
+      }
+      if (!Array.isArray(entry) || entry.length !== 2) {
+        expanded.push(entry)
+        continue
+      }
+      for (let seq = entry[0]; seq <= entry[1]; seq += 1) expanded.push(seq)
+    }
+    return { ...event, sourceEventSeqs: expanded }
+  })
+}
+
 export async function verifyLog(logFile, options = {}) {
   const libs = options.libs ?? (await loadHostLibs())
   const log = readLog(logFile)
@@ -229,6 +286,9 @@ export async function verifyLog(logFile, options = {}) {
 
   const titleError = checkTitles(log.events)
   checks.push({ name: '标题', ok: titleError === null, detail: titleError ?? '合法' })
+
+  const loadError = checkSeedLoad(log.events, header, libs)
+  checks.push({ name: '装载', ok: loadError === null, detail: loadError ?? '宿主 Session 构造通过' })
 
   return {
     ok: checks.every((check) => check.ok),
