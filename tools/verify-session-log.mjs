@@ -263,39 +263,94 @@ function expandSeqRanges(events) {
   })
 }
 
+/** 表面事件类型，与宿主 `SURFACE_TYPES` 一致。 */
+const SURFACE_TYPES = new Set(['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result'])
+
+/**
+ * 检查项 ⑦：表面头。
+ *
+ * 宿主规定表面的第一个节点必须是**受保护的 system/message**——之后再追加一条
+ * system/message，就报 `system/message requires a protected first surface head`，
+ * 整份日志拒收。重写（rebuild）最容易踩：把旧的 system 消息当成"被替换掉的历史"
+ * 丢掉，表面就从 user/assistant 开头，文件看着没问题、宿主读不了。
+ *
+ * @param {object[]} events - 事件数组。
+ * @returns {string|null} 违规说明，通过返回 null。
+ */
+function checkSurfaceHead(events) {
+  const surface = []
+  let protectedHead
+  for (const event of events) {
+    if (!SURFACE_TYPES.has(event.type)) continue
+    if (event.type === 'system/message' && surface.length > 0 && protectedHead === undefined) {
+      return `seq ${event.seq}: system/message 出现时表面已非空且没有受保护的头（宿主原话：system/message requires a protected first surface head）`
+    }
+    if (event.surfaceOp === 'append') {
+      if (event.type === 'system/message' && surface.length === 0) protectedHead = event.seq
+      surface.push(event.seq)
+      continue
+    }
+    const op = event.surfaceOp
+    if (op === null || typeof op !== 'object') continue
+    const first = surface.indexOf(op.startSeq)
+    const last = surface.indexOf(op.endSeq)
+    if (first < 0 || last < first) continue
+    const removed = surface.slice(first, last + 1)
+    if (protectedHead !== undefined && removed.includes(protectedHead)) {
+      if (event.type !== 'system/message' || removed.length !== 1) {
+        return `seq ${event.seq}: 表面替换遮住了受保护的 system 头`
+      }
+      protectedHead = event.seq
+    }
+    surface.splice(first, removed.length, event.seq)
+  }
+  if (surface.length > 0 && protectedHead === undefined) {
+    return '表面的第一个节点不是 system/message（宿主会拒收：requires a protected first surface head）'
+  }
+  return null
+}
+
 export async function verifyLog(logFile, options = {}) {
   const libs = options.libs ?? (await loadHostLibs())
   const log = readLog(logFile)
   const { type: _type, ...header } = log.header ?? {}
+  // `sourceEventSeqs` 在日志里是紧凑的 `[start, end]` 区间，宿主在
+  // `decodeSeqRanges` 里展开之后才校验。整份校验都用展开后的副本，否则合法日志
+  // 会被判成 `must densely contain non-negative safe integers`（实测有 3 个会话
+  // 就是这么被误报的）。
+  const events = expandSeqRanges(log.events)
   const checks = []
 
-  const formatError = checkFormat(log.events, header, libs)
+  const formatError = checkFormat(events, header, libs)
   checks.push({ name: '格式层', ok: formatError === null, detail: formatError ?? '通过' })
 
-  const sessionResult = checkSession(log.events, libs)
+  const sessionResult = checkSession(events, libs)
   checks.push({ name: '会话层', ok: sessionResult.error === null, detail: sessionResult.error ?? `可见节点 ${sessionResult.visible}` })
 
-  const refError = checkReferences(log.events)
+  const refError = checkReferences(events)
   checks.push({ name: '交叉引用', ok: refError === null, detail: refError ?? '所有引用都存在且更早' })
 
-  const inboxError = checkInbox(log.events)
+  const inboxError = checkInbox(events)
   checks.push({ name: 'inbox 投影', ok: inboxError === null, detail: inboxError ?? '拼接重放通过' })
 
-  const structureError = checkStructure(log.events)
-  checks.push({ name: '结构', ok: structureError === null, detail: structureError ?? `seq 0..${log.events.length - 1} 连续` })
+  const structureError = checkStructure(events)
+  checks.push({ name: '结构', ok: structureError === null, detail: structureError ?? `seq 0..${events.length - 1} 连续` })
 
-  const titleError = checkTitles(log.events)
+  const titleError = checkTitles(events)
   checks.push({ name: '标题', ok: titleError === null, detail: titleError ?? '合法' })
 
-  const loadError = checkSeedLoad(log.events, header, libs)
+  const loadError = checkSeedLoad(events, header, libs)
   checks.push({ name: '装载', ok: loadError === null, detail: loadError ?? '宿主 Session 构造通过' })
+
+  const headError = checkSurfaceHead(events)
+  checks.push({ name: '表面头', ok: headError === null, detail: headError ?? '第一个表面节点是受保护的 system/message' })
 
   return {
     ok: checks.every((check) => check.ok),
     checks,
-    events: log.events.length,
+    events: events.length,
     visible: sessionResult.visible,
-    checkpoints: log.events.filter((event) => isCheckpoint(event)).length,
+    checkpoints: events.filter((event) => isCheckpoint(event)).length,
   }
 }
 
