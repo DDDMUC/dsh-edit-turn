@@ -310,10 +310,46 @@ function checkSurfaceHead(events) {
   return null
 }
 
+/**
+ * 检查项 ⑧：用宿主的格式层解码器把整份日志逐行走一遍。
+ *
+ * 前面几项拿的都是"已经解析好的事件数组"，而**行级准入**（行信封的 `time`）和
+ * **格式层关系**（turn/step 密度、tool 配对、compaction 区间、表面折叠）发生在
+ * 逐行解码里。这一项就是加载器那一步：`createDecoder` → 每行 `decodeRow` →
+ * `finish`。
+ *
+ * 实测覆盖面：缺 `time` 会在这里报出宿主原话
+ * （`released v2 row 12 lacks required field time`）；但 assistant 的 settlement
+ * 字段（`stream`）它不查——那一条由「装载」那一项兜住。两者互补，都要留。
+ *
+ * @param {object[]} events - 事件数组（区间已展开）。
+ * @param {object|null} header - 日志头部。
+ * @param {object} libs - 宿主的包。
+ * @returns {string|null} 违规说明，通过返回 null。
+ */
+function checkDecoder(events, header, libs) {
+  const codec = libs?.formatV3ToV4?.releasedV4SessionFormatCodec
+  if (codec === undefined || codec === null || typeof codec.createDecoder !== 'function') {
+    return '宿主没有导出格式层解码器，跳过这一项'
+  }
+  try {
+    const decoder = codec.createDecoder({ ...header, version: 4 }, 'strict')
+    const sink = { emitRun: () => {}, emitEvent: () => {} }
+    for (const event of events) decoder.decodeRow(event, sink)
+    decoder.finish()
+    return null
+  } catch (error) {
+    return String((error && error.message) || error)
+  }
+}
+
 export async function verifyLog(logFile, options = {}) {
   const libs = options.libs ?? (await loadHostLibs())
   const log = readLog(logFile)
-  const { type: _type, ...header } = log.header ?? {}
+  // 头部原样留一份：解码器要求物理头部带 `type: "session"`，而下面几项检查用的是
+  // 去掉 type 的副本。
+  const rawHeader = log.header ?? null
+  const { type: _type, ...header } = rawHeader ?? {}
   // `sourceEventSeqs` 在日志里是紧凑的 `[start, end]` 区间，宿主在
   // `decodeSeqRanges` 里展开之后才校验。整份校验都用展开后的副本，否则合法日志
   // 会被判成 `must densely contain non-negative safe integers`（实测有 3 个会话
@@ -344,6 +380,9 @@ export async function verifyLog(logFile, options = {}) {
 
   const headError = checkSurfaceHead(events)
   checks.push({ name: '表面头', ok: headError === null, detail: headError ?? '第一个表面节点是受保护的 system/message' })
+
+  const decoderError = checkDecoder(events, rawHeader, libs)
+  checks.push({ name: '解码器', ok: decoderError === null, detail: decoderError ?? '逐行解码通过' })
 
   return {
     ok: checks.every((check) => check.ok),
