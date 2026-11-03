@@ -923,6 +923,21 @@ export function checkpointTailStart(events, checkpointSeq) {
  * @param {number} keep - 保留最后几窗。
  * @returns {{ events: object[], cutSeq: number|null, windows: number, kept: number, dropped: number, frame: object[] }}
  */
+function viewSignature(events) {
+  const bySeq = new Map(events.map((event) => [event.seq, event]))
+  return foldSurface(events).visible.map((seq) => {
+    const event = bySeq.get(seq)
+    if (event === undefined) return 'missing:' + seq
+    return event.type + '\u0000' + JSON.stringify(event.data === undefined || event.data === null ? null : event.data.message ?? null)
+  })
+}
+
+function sameVisible(left, right) {
+  if (left.length !== right.length) return false
+  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false
+  return true
+}
+
 export function keepLastWindows(events, keep) {
   const windows = windowsOf(events)
   // 只数**有 checkpoint 的窗口**：第 1 窗是"会话开头到第一个 checkpoint 前"的设置窗
@@ -942,8 +957,8 @@ export function keepLastWindows(events, keep) {
   // 就是这一窗真正留给模型的尾巴——它们的 seq 比 checkpoint 自己的 seq 还小。
   // 从 checkpoint 切会把这些尾巴一起切掉，模型立刻少读一窗内容。
   const boundary = checkpointTailStart(events, real[firstKept - 1].checkpointSeq)
-  const turnStart = events.find((e) => e.type === 'turn/start' && e.seq >= boundary)
-  const cutSeq = turnStart !== undefined ? turnStart.seq : boundary
+  // 往回退到整轮起点，不往前找：往前会把这一轮的前半截连同尾巴一起切走。
+  const cutSeq = snapToTurnStart(events, boundary)
 
   const bySeq = new Map(events.map((e) => [e.seq, e]))
 
@@ -1069,6 +1084,11 @@ export function keepLastWindows(events, keep) {
     .filter((seq) => !frame.some((e) => e.seq === seq))
     .map((seq) => bySeq.get(seq))
     .filter((e) => e !== undefined)
+  // 硬闸门：裁完的日志模型看到的内容必须逐条不变。量重编号后真正会写盘的那份
+  // （重编号会丢掉悬空 replace，被它压住的内容会重新露出来），按内容比不比 seq。
+  if (!sameVisible(viewSignature(events), viewSignature(renumber(events.map((event) => structuredClone(event)).filter((event) => keepSeq.has(event.seq))).events))) {
+    return { events, cutSeq: null, windows: windows.length, kept: events.length, dropped: 0, frame: [] }
+  }
   return {
     events: finalOut,
     cutSeq,
@@ -1865,7 +1885,8 @@ export function stageTrim(logFile, keep) {
  * @returns {object} 结果摘要。
  */
 export function commitTrim(staged, logFile) {
-  fs.renameSync(logFile, staged.backup)
+  // 先复制出备份再替换：两次 rename 之间崩溃会让日志短暂不存在，会话直接消失。
+  fs.copyFileSync(logFile, staged.backup)
   fs.renameSync(staged.staging, logFile)
   return staged.summary
 }

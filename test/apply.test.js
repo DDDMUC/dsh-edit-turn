@@ -30,10 +30,12 @@ function windowedLog() {
   push('system/message', { turn: 1, step: 1, message: { id: 'sys', role: 'system', content: [{ type: 'text', text: 'system prompt' }] } }, { surfaceOp: 'append' })
 
   for (let turn = 1; turn <= 6; turn += 1) {
-    if (turn > 1) {
-      // 检查点：覆盖上一窗的两条消息。
-      const from = events.find((e) => e.data?.message?.id === `u${turn - 1}`).seq
-      const to = events.find((e) => e.data?.message?.id === `a${turn - 1}`).seq
+    if (turn > 2) {
+      // 检查点：覆盖**上一窗**的两条消息（turn-2），于是 turn-1 的两条还留在
+      // 检查点之前——那正是真实日志里"检查点保留的尾巴"，切点要落在这条尾巴起点，
+      // 检查点本身必须跟着留（否则模型少读一段摘要）。
+      const from = events.find((e) => e.data?.message?.id === `u${turn - 2}`).seq
+      const to = events.find((e) => e.data?.message?.id === `a${turn - 2}`).seq
       push(
         'user/message',
         {

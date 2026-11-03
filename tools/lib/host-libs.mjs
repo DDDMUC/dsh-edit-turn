@@ -14,6 +14,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 
 /** 需要取出的包（含它们的依赖，缺一个都会加载失败）。 */
@@ -139,7 +140,38 @@ export async function ensureHostLibs(options = {}) {
  * @returns {Promise<{ session: object, formatV3ToV4: object, formatCatalog: object, cache: string, asar: string }>} 宿主库。
  */
 export async function loadHostLibs(options = {}) {
+  // Inside the host the platform packages are simply there: the app's own
+  // node_modules is resolvable, so importing them is both faster and the only
+  // thing that works - a running app takes `app.asar` over with its asar shim,
+  // and reading the archive as a FILE from inside it fails with ENOENT (that is
+  // exactly how the compaction plugin's verifier first failed).
+  // Anchors to resolve the platform packages from. The plain specifier only works
+  // when this file sits inside a tree that has them; a plugin installed as a LINK
+  // to its source tree is resolved by Node through its REAL path, where the
+  // platform packages do not exist at all. So the anchors cover the places that do
+  // have them: the host's cwd, the app's own tree, and the desktop profile.
+  const anchors = [
+    null,
+    process.cwd(),
+    path.join(os.homedir(), '.dsh', 'profiles', 'desktop'),
+    path.dirname(process.execPath),
+  ]
+  for (const anchor of anchors) {
+    try {
+      const resolveFrom = anchor === null ? import.meta.url : pathToFileURL(path.join(anchor, 'package.json')).href
+      const requireFrom = createRequire(resolveFrom)
+      const sessionPath = requireFrom.resolve('@deepseek-ai/dsh-session')
+      const formatPath = requireFrom.resolve('@deepseek-ai/dsh-session-format-v3-to-v4')
+      const session = await import(pathToFileURL(sessionPath).href)
+      const formatV3ToV4 = await import(pathToFileURL(formatPath).href)
+      if (typeof session.foldSurface === 'function' && typeof formatV3ToV4.restoreReleasedV4Artifact === 'function') {
+        return { session, formatV3ToV4, formatCatalog: {}, cache: null, asar: null, source: `import:${anchor ?? 'self'}` }
+      }
+    } catch {
+      // Try the next anchor.
+    }
+  }
   const { url, cache, asar } = await ensureHostLibs(options)
   const libs = await import(url)
-  return { ...libs, cache, asar }
+  return { ...libs, cache, asar, source: 'asar' }
 }
