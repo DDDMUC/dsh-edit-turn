@@ -1875,17 +1875,23 @@ export function stripOldStreams(events, keepTurns) {
   const turnOf = turnIndexOf(events)
   let maxTurn = 0
   for (const turn of turnOf.values()) if (turn > maxTurn) maxTurn = turn
-  const floor = maxTurn - Math.max(1, keepTurns) + 1
+  const floor = keepTurns > 0 ? maxTurn - Math.max(1, keepTurns) + 1 : Infinity
   let stripped = 0
   let bytesSaved = 0
   const out = events.map((event) => {
     if (event.type !== 'assistant/message') return event
     if (event.data === null || typeof event.data !== 'object' || event.data.stream === undefined) return event
     const turn = turnOf.get(event.seq) ?? 0
-    if (turn >= floor) return event
+    if (keepTurns > 0 && turn >= floor) return event
+    // 宿主在两条回退路径上会读 stream：图片查找（正文里没找到就翻块）与用量
+    // （`data.usage ?? streamUsage(stream)`）。缺这两样东西的行不动，避免清出信息空窗。
+    if (event.data.usage === undefined) return event
+    const blocks = event.data?.message?.content
+    if (Array.isArray(blocks) && blocks.some((block) => block && (block.type === 'image' || block.type === 'file'))) return event
     bytesSaved += Buffer.byteLength(JSON.stringify(event.data.stream))
-    const data = { ...event.data }
-    delete data.stream
+    // 不能整条删：宿主对 assistant 行的结算字段有校验，缺 stream 会报
+    // `invalid settlement fields`。空数组是被接受的“没有回放记录”。
+    const data = { ...event.data, stream: [] }
     stripped += 1
     return { ...event, data }
   })
