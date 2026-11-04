@@ -108,25 +108,20 @@ check('the dictionary carries zh and en', Boolean(dictionaries[0] && dictionarie
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
 check('injects the per-session overlay slot', injections.includes('conversation.input.overlay'), injections.join(','))
 check('injects the official assistant-actions slot', injections.includes('conversation.chat.assistant-actions'), injections.join(','))
-check('injects the plugin manager row-config slot', injections.includes('plugins.row.config'), injections.join(','))
+check('injects the plugin manager bundle-config slot', injections.includes('plugins.bundle.config'), injections.join(','))
 check('injects the turn-tail slot (the fallback strip)', injections.includes('conversation.chat.turnTail'), injections.join(','))
 
 // One entry per injection point. Picked by name so adding another entry does not
 // silently re-point these checks at the wrong one.
 //   assistant-actions  the pencil, in the host's own reply strip
 //   input.overlay      the editor
-//   row.config         the plugin manager row
 //   bundle.config      the package's own page (the same card, one level up)
 //   chat.turnTail      the fallback strip for a turn the host draws no strip for
 const byName = (name) => registrations.find((item) => item.definition.name === name) || { definition: {} }
-check('registers one entry per injection point', registrations.length === 5, `got ${registrations.length}`)
-const rowConfigRegistration = byName('plugins.row.config')
-check('the row-config entry uses the manager key', rowConfigRegistration.definition.key === 'dsh-edit-turn#dsh-edit-turn', rowConfigRegistration.definition.key)
-check('the row-config entry renders a component', typeof rowConfigRegistration.component === 'function')
-
+check('registers one entry per injection point', registrations.length === 4, `got ${registrations.length}`)
 const bundleConfigRegistration = byName('plugins.bundle.config')
 check('the bundle-config entry uses the bare package key', bundleConfigRegistration.definition.key === 'dsh-edit-turn', bundleConfigRegistration.definition.key)
-check('the bundle-config entry renders the same card', bundleConfigRegistration.component === rowConfigRegistration.component)
+check('the bundle-config entry renders a component', typeof bundleConfigRegistration.component === 'function')
 
 const registration = byName('conversation.input.overlay')
 check('the overlay slot name matches its injection point', registration.definition.name === 'conversation.input.overlay')

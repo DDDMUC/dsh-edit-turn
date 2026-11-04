@@ -2,6 +2,11 @@
 
 ## 中文
 
+**0.5.16** —— 设置卡片只挂在包自己的页面上。
+
+- 去掉 `plugins.row.config` 注册：不再给行加「配置」按钮，编辑设置只出现在 `#/panel/plugins/dsh-edit-turn`。
+- 同一张卡、同一个组件，只有一个入口。
+
 **0.5.15** —— 设置卡片同时出现在包自己的页面上。
 
 - 新增 `plugins.bundle.config` 注册（key 是裸包名）：`#/panel/plugins/dsh-edit-turn` 直接能看到编辑设置，不再只能从 `…/dsh-edit-turn/dsh-edit-turn` 那一层进去。
