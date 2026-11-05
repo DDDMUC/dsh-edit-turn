@@ -46,10 +46,7 @@ export const RULES = {
  */
 export function readLog(file) {
   const buf = fs.readFileSync(file)
-  const starts = []
-  for (let i = 0; i + 4 <= buf.length; i += 1) {
-    if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i)
-  }
+  const starts = frameOffsets(buf)
   let text = ''
   for (let k = 0; k < starts.length; k += 1) {
     const end = k + 1 < starts.length ? starts[k + 1] : buf.length
@@ -59,6 +56,52 @@ export function readLog(file) {
       // 一帧坏了不该毁掉整个文件：跳过它，后面的帧照读。
     }
   }
+  return parseLog(text, buf.length)
+}
+
+/**
+ * 异步版 readLog：解压照旧同步（每帧几毫秒），但每 64 帧、每 2000 行让出一次
+ * 事件循环。
+ *
+ * 这里刻意没用 zstd 的异步 API：日志是千帧级的多帧文件，一帧一次线程池往返
+ * 反而更慢（18 MB 的日志 4.7 秒变 11.7 秒）。真正要的是"别一口气按住宿主"，
+ * 分片让出就够了。
+ *
+ * @param {string} file - 日志文件路径。
+ * @returns {Promise<{ events: object[], rawBytes: number, compressedBytes: number, header: object|null }>}
+ */
+export async function readLogAsync(file) {
+  const buf = await fs.promises.readFile(file)
+  const starts = frameOffsets(buf)
+  const parts = []
+  for (let k = 0; k < starts.length; k += 1) {
+    const end = k + 1 < starts.length ? starts[k + 1] : buf.length
+    try {
+      parts.push(zlib.zstdDecompressSync(buf.subarray(starts[k], end)))
+    } catch {
+      // 同上：坏帧跳过。
+    }
+    if (k % 64 === 63) await yieldLoop()
+  }
+  return parseLogAsync(Buffer.concat(parts).toString('utf8'), buf.length)
+}
+
+/** 让出一次事件循环尾巴上的活。 */
+function yieldLoop() {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+/** 按魔数切出每一帧的起点。 */
+function frameOffsets(buf) {
+  const starts = []
+  for (let i = 0; i + 4 <= buf.length; i += 1) {
+    if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i)
+  }
+  return starts
+}
+
+/** 把拼好的 JSONL 文本拆成头部与事件。 */
+function parseLog(text, compressedBytes) {
   const events = []
   let rawBytes = 0
   let header = null
@@ -74,7 +117,38 @@ export function readLog(file) {
     if (header === null && event.type === 'session') header = event
     else events.push(event)
   }
-  return { events, rawBytes, compressedBytes: buf.length, header }
+  return { events, rawBytes, compressedBytes, header }
+}
+
+/** parseLog 的异步版：每 2000 行让出一次，避免一次 JSON.parse 把界面卡住。 */
+async function parseLogAsync(text, compressedBytes) {
+  const events = []
+  let rawBytes = 0
+  let header = null
+  let cursor = 0
+  let seen = 0
+  while (cursor < text.length) {
+    const breakAt = text.indexOf('\n', cursor)
+    const end = breakAt === -1 ? text.length : breakAt
+    const line = text.slice(cursor, end)
+    cursor = end + 1
+    if (line.trim() !== '') {
+      rawBytes += Buffer.byteLength(line, 'utf8') + 1
+      let event
+      try {
+        event = JSON.parse(line)
+      } catch {
+        event = undefined
+      }
+      if (event !== undefined) {
+        if (header === null && event.type === 'session') header = event
+        else events.push(event)
+      }
+    }
+    seen += 1
+    if (seen % 2000 === 0) await yieldLoop()
+  }
+  return { events, rawBytes, compressedBytes, header }
 }
 
 /**
@@ -437,14 +511,8 @@ export function derivedHistory(events) {
  * @returns {Buffer} 文件内容。
  */
 export function encodeLog(header, events) {
-  const lines = []
-  if (header !== null) lines.push(JSON.stringify(header))
-  for (const event of events) lines.push(JSON.stringify(event))
   const frames = []
-  // 头部单独一帧，其余每 256 条一帧：和官方一样是多帧结构。
-  const chunks = [lines.slice(0, 1), ...chunk(lines.slice(1), 256)]
-  for (const chunkLines of chunks) {
-    if (chunkLines.length === 0) continue
+  for (const chunkLines of frameLines(header, events)) {
     // 和宿主一致：每帧独立可解、带校验和（宿主的 scanZstdFrames 按帧头判断）。
     frames.push(
       zlib.zstdCompressSync(Buffer.from(chunkLines.join('\n') + '\n', 'utf8'), {
@@ -453,6 +521,40 @@ export function encodeLog(header, events) {
     )
   }
   return Buffer.concat(frames)
+}
+
+/**
+ * 异步版 encodeLog：帧结构与上面逐字节相同（头部一帧，其余每 256 条一帧），
+ * 只是每帧之间让出一次事件循环。
+ *
+ * @param {object|null} header - 头部记录。
+ * @param {object[]} events - 事件。
+ * @returns {Promise<Buffer>} 文件内容。
+ */
+export async function encodeLogAsync(header, events) {
+  const frames = []
+  const push = async (lines) => {
+    if (lines.length === 0) return
+    frames.push(
+      zlib.zstdCompressSync(Buffer.from(lines.join('\n') + '\n', 'utf8'), {
+        params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 },
+      }),
+    )
+    await yieldLoop()
+  }
+  if (header !== null) await push([JSON.stringify(header)])
+  for (let index = 0; index < events.length; index += 256) {
+    await push(events.slice(index, index + 256).map((event) => JSON.stringify(event)))
+  }
+  return Buffer.concat(frames)
+}
+
+/** 头部单独一帧，其余每 256 条一帧：和官方一样是多帧结构。 */
+function frameLines(header, events) {
+  const lines = []
+  if (header !== null) lines.push(JSON.stringify(header))
+  for (const event of events) lines.push(JSON.stringify(event))
+  return [lines.slice(0, 1), ...chunk(lines.slice(1), 256)].filter((chunkLines) => chunkLines.length > 0)
 }
 
 /** 把数组切成固定大小的块。 */
@@ -963,9 +1065,11 @@ export function keepLastWindows(events, keep) {
   const bySeq = new Map(events.map((e) => [e.seq, e]))
 
   // 会话级设置：无论落在哪一窗都留（裁掉模型就没有系统提示词和工具声明了）。
+  // 走 bySeq 查表：这里原来是 events.find() 套在 visible 的 map 里，等于每个可见
+  // 事件都线性扫一遍全表，18 MB 的日志光这一句就要 6 秒。
   const originalVisible = foldSurface(events).visible
   const effectiveSystem = originalVisible
-    .map((seq) => events.find((e) => e.seq === seq))
+    .map((seq) => bySeq.get(seq))
     .find(
       (e) =>
         e !== undefined &&
@@ -1086,7 +1190,10 @@ export function keepLastWindows(events, keep) {
     .filter((e) => e !== undefined)
   // 硬闸门：裁完的日志模型看到的内容必须逐条不变。量重编号后真正会写盘的那份
   // （重编号会丢掉悬空 replace，被它压住的内容会重新露出来），按内容比不比 seq。
-  if (!sameVisible(viewSignature(events), viewSignature(renumber(events.map((event) => structuredClone(event)).filter((event) => keepSeq.has(event.seq))).events))) {
+  // 先按 keepSeq 过滤再深拷贝：反过来的话，被丢掉的那一大半也要克隆一遍，
+  // 18 MB 的日志光这一步就是好几秒。
+  const survivor = events.filter((event) => keepSeq.has(event.seq)).map((event) => structuredClone(event))
+  if (!sameVisible(viewSignature(events), viewSignature(renumber(survivor).events))) {
     return { events, cutSeq: null, windows: windows.length, kept: events.length, dropped: 0, frame: [] }
   }
   return {
@@ -1898,11 +2005,11 @@ export function stripOldStreams(events, keepTurns) {
   return { events: out, stripped, bytesSaved }
 }
 
-export function stageTrim(logFile, keep, options = {}) {
+export async function stageTrim(logFile, keep, options = {}) {
   if (isSessionLocked(logFile)) {
     throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
   }
-  const original = readLog(logFile)
+  const original = await readLogAsync(logFile)
   const trimmed = keepLastWindows(original.events, keep)
   if (trimmed.cutSeq === null) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
   // 旧回合的流式回放记录：与 data.message.content 逐块重复，留最近几轮就够。
@@ -1928,14 +2035,14 @@ export function stageTrim(logFile, keep, options = {}) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
   const backup = `${logFile}.precompact-${stamp}`
   const staging = `${logFile}.staging-${stamp}`
-  fs.writeFileSync(staging, encodeLog(original.header, renamed.events))
+  await fs.promises.writeFile(staging, await encodeLogAsync(original.header, renamed.events))
   return {
     staging,
     backup,
     summary: {
       backup,
       before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
-      after: { events: renamed.events.length, bytes: fs.statSync(staging).size },
+      after: { events: renamed.events.length, bytes: (await fs.promises.stat(staging)).size },
       dropped: trimmed.dropped,
       refsFixed: renamed.refsFixed,
       titlesDropped: renamed.titlesDropped,
@@ -1954,10 +2061,10 @@ export function stageTrim(logFile, keep, options = {}) {
  * @param {string} logFile - 原日志路径。
  * @returns {object} 结果摘要。
  */
-export function commitTrim(staged, logFile) {
+export async function commitTrim(staged, logFile) {
   // 先复制出备份再替换：两次 rename 之间崩溃会让日志短暂不存在，会话直接消失。
-  fs.copyFileSync(logFile, staged.backup)
-  fs.renameSync(staged.staging, logFile)
+  await fs.promises.copyFile(logFile, staged.backup)
+  await fs.promises.rename(staged.staging, logFile)
   return staged.summary
 }
 
@@ -1974,7 +2081,7 @@ export function commitTrim(staged, logFile) {
  * @returns {Promise<object>} 结果摘要。
  */
 export async function applyTrim(logFile, keep, options = {}) {
-  const staged = stageTrim(logFile, keep, options)
+  const staged = await stageTrim(logFile, keep, options)
   if (options.verify !== false) {
     let result
     try {
