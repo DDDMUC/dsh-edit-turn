@@ -2,6 +2,8 @@
 
 ## 中文
 
+**0.5.18** —— 补测：`stageTrim` / `commitTrim` 改异步后，两条用例补上 `await`（0.5.17 里它们会因为异步落盘未完成而误报）。
+
 **0.5.17** —— 裁剪内核改异步（供 dsh-log-trim 0.7.0 的 worker 扫描复用）。
 
 - `tools/compact-session.mjs`：新增 `readLogAsync` / `encodeLogAsync`（分片让出事件循环），

@@ -73,20 +73,20 @@ function writeLog(events) {
   return { dir, file }
 }
 
-test('暂存：只写暂存文件，原文件一个字节都不动', () => {
+test('暂存：只写暂存文件，原文件一个字节都不动', async () => {
   const { file } = writeLog(windowedLog())
   const before = fs.readFileSync(file)
-  const staged = stageTrim(file, 3)
+  const staged = await stageTrim(file, 3)
   assert.equal(fs.readFileSync(file).equals(before), true, '原文件未被改动')
   assert.equal(fs.existsSync(staged.staging), true, '暂存文件已写出')
   assert.equal(fs.existsSync(staged.backup), false, '还没有备份（备份是提交那一步才产生）')
   assert.ok(staged.summary.before.events > staged.summary.after.events, '事件数确实减少了')
 })
 
-test('提交：原文件改名成备份，暂存文件上位', () => {
+test('提交：原文件改名成备份，暂存文件上位', async () => {
   const { file } = writeLog(windowedLog())
-  const staged = stageTrim(file, 3)
-  const summary = commitTrim(staged, file)
+  const staged = await stageTrim(file, 3)
+  const summary = await commitTrim(staged, file)
   assert.equal(summary.backup, staged.backup)
   assert.equal(fs.existsSync(staged.staging), false, '暂存文件已经改名')
   assert.equal(fs.existsSync(staged.backup), true, '备份在')
