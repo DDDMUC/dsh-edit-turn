@@ -2,6 +2,12 @@
 
 ## 中文
 
+**0.5.17** —— 裁剪内核改异步（供 dsh-log-trim 0.7.0 的 worker 扫描复用）。
+
+- `tools/compact-session.mjs`：新增 `readLogAsync` / `encodeLogAsync`（分片让出事件循环），
+  `stageTrim` / `commitTrim` 改异步；`keepLastWindows` 去掉 O(n²) 与多余的 `structuredClone`。
+- 与 log-trim 的 vendor 副本逐字一致（`npm run sync:vendor` 可复现）。
+
 **0.5.16** —— 设置卡片只挂在包自己的页面上。
 
 - 去掉 `plugins.row.config` 注册：不再给行加「配置」按钮，编辑设置只出现在 `#/panel/plugins/dsh-edit-turn`。
