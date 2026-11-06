@@ -2,6 +2,10 @@
 
 ## 中文
 
+**0.5.20** —— 裁剪内核处理迟到的 tool/result（供 dsh-log-trim 0.7.3 同步）。
+
+- 新增 `repairLateToolResults()`：把落在 step 之外的工具结果挪回原位，丢弃调用已被裁掉的孤儿结果；`stageTrim` 在重编号后调用并在有改动时再编号一次。
+
 **0.5.19** —— 裁剪内核保留目标事件（供 dsh-log-trim 0.7.1 同步）。
 
 - `KEEP_ALWAYS` 增加 `goal/`：窗口裁剪不再丢掉被覆盖的 `goal/change`。

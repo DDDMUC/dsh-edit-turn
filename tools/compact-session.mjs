@@ -2046,6 +2046,95 @@ export function stripOldStreams(events, keepTurns) {
   return { events: out, stripped, bytesSaved }
 }
 
+/**
+ * 把落在「没有任何开放 step」位置的 tool/result 归位。
+ *
+ * 为什么会有这种行：工具调用的结果可能晚到——它挂在很早的 turn/step 上，
+ * 却在很后面的位置才写进日志。原日志能装得上，但当裁剪从中间切掉一段再重编号后，
+ * 这些行就会落在 step/end 之后、下一段 step 之前，宿主的格式层要求
+ * 「tool/result 的 turn/step 必须等于当前打开的 turn/step」，于是整份日志被拒。
+ *
+ * 处理：找到它自己那一步的 step/start，把它挪进那一 step 的最后；找不到就往后
+ * 找第一个 step/start 并改挂到那一步；连一个 step 都没有就删掉（此时它已经无处
+ * 可挂，留着只会让整份日志装不上）。
+ *
+ * @param {object[]} events - 已重编号的事件。
+ * @returns {{ events: object[], moved: number, dropped: number }} 处理结果。
+ */
+export function repairLateToolResults(events) {
+  const list = [...events]
+  let moved = 0
+  let dropped = 0
+  // 被裁剪丢掉的调用不会再有 tool/call；它的结果留着就是「没有 advertised lifecycle」，
+  // 格式层直接拒收，所以先把这种孤儿结果清掉。
+  const advertised = new Set()
+  for (const event of list) {
+    if (event.type === 'tool/call' && typeof event.data?.callId === 'string') advertised.add(event.data.callId)
+    if (event.type === 'assistant/message' && Array.isArray(event.data?.message?.content)) {
+      for (const block of event.data.message.content) {
+        if (block?.type === 'tool-call' && typeof block.id === 'string') advertised.add(block.id)
+      }
+    }
+  }
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const event = list[index]
+    if (event.type !== 'tool/result') continue
+    const callId = event.data?.message?.toolCallId ?? event.data?.message?.source?.callId ?? event.data?.toolCallId
+    if (typeof callId !== 'string') continue
+    if (advertised.has(callId)) continue
+    list.splice(index, 1)
+    dropped += 1
+  }
+  for (let round = 0; round < 5; round += 1) {
+    // 1) 模拟当前开放的 turn/step，找出位置不对的 tool/result
+    let turn = null
+    let step = null
+    const offenders = []
+    for (let index = 0; index < list.length; index += 1) {
+      const event = list[index]
+      if (event.type === 'turn/start') { turn = event.data?.turn; step = null; continue }
+      if (event.type === 'step/start') { step = event.data?.step; continue }
+      if (event.type === 'step/end') { step = null; continue }
+      if (event.type === 'turn/end') { turn = null; step = null; continue }
+      if (event.type !== 'tool/result') continue
+      const t = event.data?.turn
+      const s = event.data?.step
+      if (!Number.isSafeInteger(t) || !Number.isSafeInteger(s)) continue
+      if (step !== null && t === turn && s === step) continue
+      offenders.push({ index, turn: t, step: s })
+    }
+    if (offenders.length === 0) break
+    // 2) 逐个找落点：优先自己那一步，其次往后第一个 step
+    for (const offender of offenders.sort((a, b) => b.index - a.index)) {
+      const row = list[offender.index]
+      let target = -1
+      for (let index = 0; index < list.length; index += 1) {
+        const event = list[index]
+        if (event.type === 'step/start' && event.data?.turn === offender.turn && event.data?.step === offender.step) { target = index; break }
+      }
+      if (target === -1) {
+        for (let index = offender.index + 1; index < list.length; index += 1) {
+          if (list[index].type === 'step/start') { target = index; break }
+        }
+      }
+      list.splice(offender.index, 1)
+      if (target === -1) { dropped += 1; continue }
+      if (target > offender.index) target -= 1
+      const anchor = list[target]
+      let insertAfter = target
+      for (let index = target + 1; index < list.length; index += 1) {
+        const event = list[index]
+        if (['step/end', 'turn/end', 'step/start', 'turn/start'].includes(event.type)) break
+        if (event.data?.turn === anchor.data?.turn && event.data?.step === anchor.data?.step) insertAfter = index
+      }
+      row.data = { ...row.data, turn: anchor.data?.turn, step: anchor.data?.step }
+      list.splice(insertAfter + 1, 0, row)
+      moved += 1
+    }
+  }
+  return { events: list, moved, dropped }
+}
+
 export async function stageTrim(logFile, keep, options = {}) {
   if (isSessionLocked(logFile)) {
     throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
@@ -2057,7 +2146,12 @@ export async function stageTrim(logFile, keep, options = {}) {
   const streamKeepTurns = options.streamKeepTurns === undefined ? Infinity : options.streamKeepTurns
   const stripped = stripOldStreams(trimmed.events, streamKeepTurns)
   assertNoGoalEventsDropped(original.events, stripped.events)
-  const renamed = renumber(stripped.events)
+  let renamed = renumber(stripped.events)
+  const repaired = repairLateToolResults(renamed.events)
+  if (repaired.moved > 0 || repaired.dropped > 0) {
+    // 挪动会改变 seq，重新编号一次让所有引用跟上。
+    renamed = renumber(repaired.events)
+  }
 
   const seqs = new Set(renamed.events.map((e) => e.seq))
   for (let i = 0; i < renamed.events.length; i += 1) {
