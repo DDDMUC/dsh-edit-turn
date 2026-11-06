@@ -2,6 +2,8 @@
 
 ## 中文
 
+**0.5.22** —— 导出 `dropShadowedPrefix`（供 dsh-log-trim 0.7.6 的扫描试算使用）。
+
 **0.5.21** —— 裁剪内核丢被 checkpoint 遮蔽的前缀（供 dsh-log-trim 0.7.5 同步）。
 
 - 保留区改成「连续尾巴 + 系统提示词/设置」；compaction 组、`session/*`、`agent/inbox/spliced` 结构事件保留。

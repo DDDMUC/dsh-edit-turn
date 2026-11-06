@@ -2147,7 +2147,7 @@ export function repairLateToolResults(events) {
  * @param {object[]} events - 候选保留事件（keepLastWindows 的结果）。
  * @returns {{ events: object[], dropped: number }} 结果。
  */
-function dropShadowedPrefix(events) {
+export function dropShadowedPrefix(events) {
   const checkpoints = events.filter((event) => event.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint')
   const last = checkpoints[checkpoints.length - 1]
   const shadowEnd = last !== undefined && typeof last.surfaceOp?.endSeq === 'number' ? last.surfaceOp.endSeq : null
