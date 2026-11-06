@@ -445,7 +445,44 @@ function resolveLog(arg) {
  * 无论被谁覆盖都保留的事件：这些是界面渲染「压缩标记」和会话元信息要用的，
  * 体量可以忽略（这个会话里 64 条），丢了会让界面少一行标记或丢标题。
  */
-const KEEP_ALWAYS = ['compaction/', 'session/']
+const KEEP_ALWAYS = ['compaction/', 'session/', 'goal/']
+
+/**
+ * 目标事件：`goal/change` 与带 goal source 的轮次。
+ *
+ * 目标投影折叠的是**整份日志**（包括已被 replace 遮蔽的历史），所以"模型看不见的
+ * 事件就能删"这条规则对它不成立：少一条 goal/change 或少一轮，后面的轮次就全成了
+ * 孤儿，该会话的 /goal 从此永久报 "goal replay failed"。
+ *
+ * @param {object} event - 一条日志事件。
+ * @returns {boolean} 是否属于目标。
+ */
+function isGoalEvent(event) {
+  if (event === null || typeof event !== 'object') return false
+  if (event.type === 'goal/change') return true
+  return event.type === 'user/message' && event.data?.source?.kind === 'goal'
+}
+
+/**
+ * 任何会让目标事件变少的裁剪都必须放弃：目标语义不在宿主的格式校验里，
+ * 写下去就是一整份"能装得上、但 /goal 永久失败"的日志。
+ *
+ * @param {object[]} original - 裁剪前的日志事件。
+ * @param {object[]} kept - 准备写入的事件。
+ * @throws {Error} 会删掉目标事件时抛出。
+ */
+export function assertNoGoalEventsDropped(original, kept) {
+  let before = 0
+  for (const event of original) if (isGoalEvent(event)) before += 1
+  if (before === 0) return
+  let after = 0
+  for (const event of kept) if (isGoalEvent(event)) after += 1
+  if (after >= before) return
+  throw new Error(
+    `压缩会删掉 ${before - after} 条目标事件（goal/change 或目标轮次）；` +
+      '目标投影从整份日志折叠，删掉任何一条都会让该会话的 /goal 永久失败，已放弃这次写入',
+  )
+}
 
 /**
  * 生成压缩后的日志事件流。
@@ -1565,6 +1602,10 @@ export function renumber(events) {
     'llm/retry', 'llm/retry-started', 'session/title', 'session/title-llm-request',
     'command/run', 'command/done', 'compaction/start', 'compaction/summary', 'compaction/end',
     'compaction/prune', 'session/end-seed',
+    // `goal/change` 没有 turn/step 字段，格式层不管它；但它的顺序对目标投影有意义
+    // （create/edit 必须排在被它放行的那一轮之前）。归到 head 会被搬到整份日志最前，
+    // 那一轮就成了孤儿，所以必须留在 body 原位。
+    'goal/change',
   ])
   const head = events.filter((e) => !RELATIONSHIP_TYPES.has(e.type))
   const body = events.filter((e) => RELATIONSHIP_TYPES.has(e.type))
@@ -2015,6 +2056,7 @@ export async function stageTrim(logFile, keep, options = {}) {
   // 旧回合的流式回放记录：与 data.message.content 逐块重复，留最近几轮就够。
   const streamKeepTurns = options.streamKeepTurns === undefined ? Infinity : options.streamKeepTurns
   const stripped = stripOldStreams(trimmed.events, streamKeepTurns)
+  assertNoGoalEventsDropped(original.events, stripped.events)
   const renamed = renumber(stripped.events)
 
   const seqs = new Set(renamed.events.map((e) => e.seq))

@@ -2,6 +2,12 @@
 
 ## 中文
 
+**0.5.19** —— 裁剪内核保留目标事件（供 dsh-log-trim 0.7.1 同步）。
+
+- `KEEP_ALWAYS` 增加 `goal/`：窗口裁剪不再丢掉被覆盖的 `goal/change`。
+- `renumber()` 把 `goal/change` 留在原位（不再搬到日志最前面，否则目标轮次成孤儿）。
+- 新增 `assertNoGoalEventsDropped()`，`stageTrim()` 在写盘前守卫：会删目标事件就放弃这次写入。
+
 **0.5.18** —— 补测：`stageTrim` / `commitTrim` 改异步后，两条用例补上 `await`（0.5.17 里它们会因为异步落盘未完成而误报）。
 
 **0.5.17** —— 裁剪内核改异步（供 dsh-log-trim 0.7.0 的 worker 扫描复用）。
