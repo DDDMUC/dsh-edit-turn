@@ -2,6 +2,11 @@
 
 ## 中文
 
+**0.5.21** —— 裁剪内核丢被 checkpoint 遮蔽的前缀（供 dsh-log-trim 0.7.5 同步）。
+
+- 保留区改成「连续尾巴 + 系统提示词/设置」；compaction 组、`session/*`、`agent/inbox/spliced` 结构事件保留。
+- 过不了宿主校验时自动退回旧做法。
+
 **0.5.20** —— 裁剪内核处理迟到的 tool/result（供 dsh-log-trim 0.7.3 同步）。
 
 - 新增 `repairLateToolResults()`：把落在 step 之外的工具结果挪回原位，丢弃调用已被裁掉的孤儿结果；`stageTrim` 在重编号后调用并在有改动时再编号一次。

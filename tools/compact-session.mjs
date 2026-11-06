@@ -2135,17 +2135,70 @@ export function repairLateToolResults(events) {
   return { events: list, moved, dropped }
 }
 
+
+/**
+ * 被 checkpoint 的 `replace` 区间盖住的前缀：模型与界面都看不到，留着只是占空间，
+ * 窗口页还会把它算成一窗。
+ *
+ * 不逐行删（会切坏 step/turn 括号），而是把保留区改成「连续尾巴 + frame」：
+ * 从最后一个存活 checkpoint 的 replace 末尾之后、对齐到轮次起点开始保留，
+ * 再加系统提示词与设置事件。这样结构始终是自洽的。
+ *
+ * @param {object[]} events - 候选保留事件（keepLastWindows 的结果）。
+ * @returns {{ events: object[], dropped: number }} 结果。
+ */
+function dropShadowedPrefix(events) {
+  const checkpoints = events.filter((event) => event.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint')
+  const last = checkpoints[checkpoints.length - 1]
+  const shadowEnd = last !== undefined && typeof last.surfaceOp?.endSeq === 'number' ? last.surfaceOp.endSeq : null
+  if (shadowEnd === null) return { events, dropped: 0 }
+  const aligned = events.find((event) => event.seq > shadowEnd && event.type === 'turn/start')
+  if (aligned === undefined) return { events, dropped: 0 }
+  const liveStart = aligned.seq
+  const frame = new Set()
+  const visible = foldSurface(events).visible
+  const system = visible.map((seq) => events.find((event) => event.seq === seq)).find((event) => event !== undefined && (event.type === 'system/message' || event.type === 'developer/message'))
+  if (system !== undefined) frame.add(system.seq)
+  for (const type of ['agent-preset/selected', 'permission/preset', 'sandbox/mode', 'approval/policy', 'session/title', 'session/end-seed']) {
+    const hit = events.filter((event) => event.type === type && event.seq < liveStart).pop()
+    if (hit !== undefined) frame.add(hit.seq)
+  }
+  // 结构性事件不受“前缀”限制：compaction 组、seeded 标记、inbox 拼接都是按顺序
+  // 重放的记账，丢掉半组会让整份日志装不上；它们不占模型视图，留着也便宜。
+  const structural = (event) =>
+    String(event.type).startsWith('compaction/') ||
+    String(event.type).startsWith('session/') ||
+    event.type === 'agent/inbox/spliced'
+  const out = events.filter((event) => event.seq >= liveStart || frame.has(event.seq) || structural(event))
+  // compaction 是一组（start / summary / end 同一个 compactionId）：end 落在尾巴里而
+  // start/summary 落在被丢的前缀里时，宿主要求「成功的 compaction/end 必须有一条 summary」。
+  // 只要有同组的行留下，就把整组补回来（都是记账行，不影响模型视图）。
+  const compactionIds = new Set()
+  for (const event of out) {
+    if (typeof event.data?.compactionId === 'string') compactionIds.add(event.data.compactionId)
+  }
+  if (compactionIds.size > 0) {
+    for (const event of events) {
+      if (typeof event.data?.compactionId === 'string' && compactionIds.has(event.data.compactionId) && !out.includes(event)) out.push(event)
+    }
+    out.sort((left, right) => left.seq - right.seq)
+  }
+  return { events: out, dropped: events.length - out.length }
+}
+
 export async function stageTrim(logFile, keep, options = {}) {
   if (isSessionLocked(logFile)) {
     throw new Error('会话正被宿主持有（session.lock 被打开），拒绝改动；请先关掉该会话或重启宿主')
   }
   const original = await readLogAsync(logFile)
   const trimmed = keepLastWindows(original.events, keep)
-  if (trimmed.cutSeq === null) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
   // 旧回合的流式回放记录：与 data.message.content 逐块重复，留最近几轮就够。
   const streamKeepTurns = options.streamKeepTurns === undefined ? Infinity : options.streamKeepTurns
-  const stripped = stripOldStreams(trimmed.events, streamKeepTurns)
+  // 先丢掉被 checkpoint 遮蔽的前缀（连续尾巴 + frame），再清流式回放。
+  const shadowed = options.shadowPrefix === false ? { events: trimmed.events, dropped: 0 } : dropShadowedPrefix(trimmed.events)
+  const stripped = stripOldStreams(shadowed.events, streamKeepTurns)
   assertNoGoalEventsDropped(original.events, stripped.events)
+  if (trimmed.cutSeq === null && shadowed.dropped === 0) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
   let renamed = renumber(stripped.events)
   const repaired = repairLateToolResults(renamed.events)
   if (repaired.moved > 0 || repaired.dropped > 0) {
@@ -2179,7 +2232,7 @@ export async function stageTrim(logFile, keep, options = {}) {
       backup,
       before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
       after: { events: renamed.events.length, bytes: (await fs.promises.stat(staging)).size },
-      dropped: trimmed.dropped,
+      dropped: trimmed.dropped + shadowed.dropped,
       refsFixed: renamed.refsFixed,
       titlesDropped: renamed.titlesDropped,
       compactionDropped: renamed.compactionDropped,
@@ -2217,7 +2270,7 @@ export async function commitTrim(staged, logFile) {
  * @returns {Promise<object>} 结果摘要。
  */
 export async function applyTrim(logFile, keep, options = {}) {
-  const staged = await stageTrim(logFile, keep, options)
+  let staged = await stageTrim(logFile, keep, options)
   if (options.verify !== false) {
     let result
     try {
@@ -2229,6 +2282,20 @@ export async function applyTrim(logFile, keep, options = {}) {
     }
     if (!result.ok) {
       fs.rmSync(staged.staging, { force: true })
+      // 丢掉「被 checkpoint 遮蔽的前缀」是收益、不是前提：这份日志上它可能撞到
+      // compaction / 标题 / inbox 的结构约束。退回不丢前缀的老做法再验一次，
+      // 两次都不过才真的失败。
+      if (options.shadowPrefix !== false) {
+        staged = await stageTrim(logFile, keep, { ...options, shadowPrefix: false })
+        const retried = await (async () => {
+          const { verifyLog } = await import('./verify-session-log.mjs')
+          return verifyLog(staged.staging)
+        })()
+        if (retried.ok) return commitTrim(staged, logFile)
+        fs.rmSync(staged.staging, { force: true })
+        const bad = retried.checks.filter((check) => !check.ok).map((check) => `${check.name} ${check.detail}`).join('；')
+        throw new Error(`裁剪结果没通过宿主校验，未写入：${bad}`)
+      }
       const bad = result.checks.filter((check) => !check.ok).map((check) => `${check.name} ${check.detail}`).join('；')
       throw new Error(`裁剪结果没通过宿主校验，未写入：${bad}`)
     }
