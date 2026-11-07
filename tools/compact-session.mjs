@@ -2294,6 +2294,9 @@ export async function applyTrim(logFile, keep, options = {}) {
         if (retried.ok) return commitTrim(staged, logFile)
         fs.rmSync(staged.staging, { force: true })
         const bad = retried.checks.filter((check) => !check.ok).map((check) => `${check.name} ${check.detail}`).join('；')
+        // 两次都不过：如果退回后本来就“不需要裁”，那是这份日志结构不适合丢前缀，
+        // 当成跳过而不是失败（扫描不该因为收益型优化失败而报错）。
+        if (String(bad).includes('不需要裁')) throw new Error('不需要裁（前缀清理在这份日志上过不了宿主校验）')
         throw new Error(`裁剪结果没通过宿主校验，未写入：${bad}`)
       }
       const bad = result.checks.filter((check) => !check.ok).map((check) => `${check.name} ${check.detail}`).join('；')

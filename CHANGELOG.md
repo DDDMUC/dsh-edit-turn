@@ -2,6 +2,8 @@
 
 ## 中文
 
+**0.5.23** —— 前缀清理失败降级为跳过（供 dsh-log-trim 0.7.7 同步）。
+
 **0.5.22** —— 导出 `dropShadowedPrefix`（供 dsh-log-trim 0.7.6 的扫描试算使用）。
 
 **0.5.21** —— 裁剪内核丢被 checkpoint 遮蔽的前缀（供 dsh-log-trim 0.7.5 同步）。
