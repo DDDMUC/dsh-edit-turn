@@ -1635,7 +1635,8 @@ test('the reply entry draws a pencil only for an editable reply', async () => {
     'the class whose flex order pulls the pencil ahead of the copy button')
   assert.equal(button.props['aria-label'], '编辑这条回答')
 
-  button.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  // 打开前会按需取正文（/state 只发身份），所以 onClick 是异步的。
+  await button.props.onClick({ preventDefault() {}, stopPropagation() {} })
   const editing = controller.getSnapshot().editing
   assert.equal(editing.seq, 5, 'it opens the reply the host named')
   assert.equal(editing.mode, 'reply')
