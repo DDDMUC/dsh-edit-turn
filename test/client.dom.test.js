@@ -2433,7 +2433,12 @@ test('the reply entry cannot take the assistant-actions strip down with it', asy
     { messageId: 'm-a1', controller: { getSnapshot: () => { throw new Error('boom') } }, t },
   ]
   for (const props of cases) {
-    assert.equal(entry.component(props), null, `renders nothing instead of throwing: ${JSON.stringify(props)}`)
+    // 新语义：有 messageId 但状态未到时，先画一个置灰的按钮；没有任何
+    // messageId 时才什么都不画。两种情况都绝不能抛。
+    const out = entry.component(props)
+    const messageId = props !== null && typeof props === 'object' ? props.messageId : undefined
+    if (messageId === undefined) assert.equal(out, null, `renders nothing: ${JSON.stringify(props)}`)
+    else assert.ok(out !== null && out.props && out.props.disabled === true, `renders a disabled button: ${JSON.stringify(props)}`)
   }
 
   // And the happy path still draws the pencil - with a config object, because
