@@ -983,7 +983,9 @@ test('editing a reply block appends one patch record and no turn', async () => {
     const state = await raw(h.port, { path: `/dsh-edit-turn/state?sessionId=${SESSION_ID}` })
     assert.equal(state.json.mode, 'patch')
     assert.equal(state.json.patches.length, 1)
-    assert.deepEqual(state.json.patches[0], { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer' })
+    // `original` rides along so the browser can find the recorded block in the
+    // DOM: `/state` no longer ships the replies' blocks themselves.
+    assert.deepEqual(state.json.patches[0], { seq: assistant.seq, blockIndex: 1, kind: 'text', text: 'patched answer', original: 'OLD ANSWER' })
     const reply = state.json.replies.find((entry) => entry.seq === assistant.seq)
     assert.equal(reply.blocks, undefined, '/state publishes identities only')
     assert.equal(reply.blockCount, 2, 'the block count is published')
