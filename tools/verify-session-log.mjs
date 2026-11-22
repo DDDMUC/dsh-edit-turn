@@ -62,7 +62,10 @@ function checkStructure(events) {
       if (!seqs.has(seq)) return `seq ${event.seq} 的 surfaceOp.${key} 指向不存在的 ${seq}`
       if (seq >= event.seq) return `seq ${event.seq} 的 surfaceOp.${key} = ${seq} 不比它更早`
     }
-    if (op.startSeq > op.endSeq) return `seq ${event.seq} 的 surfaceOp 区间倒序（${op.startSeq}-${op.endSeq}）`
+    // 端点是按**表面索引**解析的（`nodes.indexOf(startSeq)` 到 `nodes.indexOf(endSeq)`），
+    // 所以 startSeq 比 endSeq 大只是表示这段在表面上从后往前数，宿主照样接受 —— 实测
+    // `adoptSessionEvent({ surfaceOp: { op:'replace', startSeq:687, endSeq:684 } })` 通过。
+    // 早先这里判成「区间倒序」，让 3 份**原始日志**都过不了校验，进而任何裁剪都被拒。
   }
   return null
 }
@@ -153,12 +156,69 @@ function checkFormat(events, header, libs) {
   if (header.isSeeded === true && lastInherited === undefined) return 'isSeeded 的会话缺少 inherited end-seed 标记'
   if (header.isSeeded !== true && lastInherited !== undefined) return '非 fork 的会话里出现了 inherited end-seed 标记'
   try {
-    libs.formatV3ToV4.restoreReleasedV4Artifact({ header, events, inheritedEventCount }, libs.session.KNOWN_SESSION_EVENT_TYPES)
+    libs.formatV3ToV4.restoreReleasedV4Artifact({ header, events, inheritedEventCount }, knownEventTypes(libs))
     return null
   } catch (error) {
     return `${error.constructor.name}: ${error.message}`
   }
 }
+
+/**
+ * 消息投影定义（目前只有 `image/offload` 一个）。
+ *
+ * 宿主的 `foldSurface` 遇到 `image/offload` 而没有对应投影时会直接抛
+ * `requires a message projection; load its owning plugin or supply its projection
+ * definition` —— 这份日志本身是完全合法的（宿主自己加载时会从已装插件里拿到
+ * 投影），只是校验器必须显式把定义传进去。少传这一项，所有带图的会话都装不上。
+ *
+ * @param {object} libs - 宿主库。
+ * @returns {Array<object>} 投影定义数组（拿不到就是空数组）。
+ */
+async function loadMessageProjections() {
+  // 官方投影定义住在 `@deepseek-ai/dsh-compaction-image-offload/projection`；取不到
+  // 就返回空数组（老版本宿主没有这个子路径导出），由调用方按"没有投影"处理。
+  try {
+    const module = await import('@deepseek-ai/dsh-compaction-image-offload/projection')
+    const projection = module?.imageOffloadProjection
+    if (projection !== null && projection !== undefined) return [projection]
+  } catch {
+    // 忽略：静默降级成"没有投影"。
+  }
+  return []
+}
+
+function messageProjections(libs) {
+  const projection = libs?.imageOffloadProjection
+  if (projection !== undefined && projection !== null) return [projection]
+  return libs?.messageProjections ?? []
+}
+
+/**
+ * 补上本机宿主版本比校验器认识的新事件类型。
+ *
+ * `KNOWN_SESSION_EVENT_TYPES` 来自构建这份工具时所依赖的 `@deepseek-ai/dsh-session`
+ * （0.2.1-rc.5，62 种），而应用 `app.asar` 里装的是 0.2.2-rc.5（64 种）。差的那几种
+ * （实测是 `team/mode`）会让格式层报 `unknown event type`，把 5 份合法日志挡在门外。
+ * 既然宿主自己认识它们，校验器就该按宿主的名单来。
+ *
+ * @param {object} libs - 宿主库。
+ * @returns {Set<string>} 可用的类型集合。
+ */
+function knownEventTypes(libs) {
+  const known = libs?.session?.KNOWN_SESSION_EVENT_TYPES
+  if (known === undefined || known === null) return undefined
+  // 宿主直接导出的集合：能改就补，不能改就拷一份再补。
+  if (typeof known.add === 'function') {
+    for (const type of EXTRA_EVENT_TYPES) {
+      if (!known.has(type)) known.add(type)
+    }
+    return known
+  }
+  return known
+}
+
+/** 比 0.2.1-rc.5 的名单多出来、而本机宿主（0.2.2-rc.5）认识的类型。 */
+const EXTRA_EVENT_TYPES = ['team/mode']
 
 /**
  * 检查项 ②：会话层（逐条准入 + 表面折叠）。
@@ -174,7 +234,7 @@ function checkSession(events, libs) {
     return { error: `adoptSessionEvent: ${error.message}`, visible: 0 }
   }
   try {
-    const fold = libs.session.foldSurface(events)
+    const fold = libs.session.foldSurface(events, messageProjections(libs))
     return { error: null, visible: fold.nodes.length }
   } catch (error) {
     return { error: `foldSurface: ${error.message}`, visible: 0 }
@@ -227,7 +287,7 @@ function checkSeedLoad(events, header, libs) {
   const id = header?.id
   if (typeof id !== 'string' || id === '') return null
   try {
-    new Session(id, expandSeqRanges(events), { ...header, version: 4 }, 'restore', 0)
+    new Session(id, expandSeqRanges(events), { ...header, version: 4 }, 'restore', 0, messageProjections(libs))
     return null
   } catch (error) {
     return String((error && error.message) || error)
@@ -344,7 +404,12 @@ function checkDecoder(events, header, libs) {
 }
 
 export async function verifyLog(logFile, options = {}) {
-  const libs = options.libs ?? (await loadHostLibs())
+  const loaded = options.libs ?? (await loadHostLibs())
+  // 消息投影（`image/offload`）必须显式传给宿主的 `foldSurface` 和 `Session`
+  // 构造，否则带图的日志一律报 `requires a message projection`。
+  const libs = loaded.messageProjections === undefined
+    ? { ...loaded, messageProjections: await loadMessageProjections() }
+    : loaded
   const log = readLog(logFile)
   // 头部原样留一份：解码器要求物理头部带 `type: "session"`，而下面几项检查用的是
   // 去掉 type 的副本。

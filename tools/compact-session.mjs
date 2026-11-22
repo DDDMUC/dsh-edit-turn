@@ -1062,28 +1062,60 @@ export function checkpointTailStart(events, checkpointSeq) {
  * @param {number} keep - 保留最后几窗。
  * @returns {{ events: object[], cutSeq: number|null, windows: number, kept: number, dropped: number, frame: object[] }}
  */
-function viewSignature(events) {
+function viewParts(events) {
   const bySeq = new Map(events.map((event) => [event.seq, event]))
-  return foldSurface(events).visible.map((seq) => {
+  const visible = foldSurface(events).visible
+  const dialog = []
+  const system = []
+  for (const seq of visible) {
     const event = bySeq.get(seq)
-    if (event === undefined) return 'missing:' + seq
-    return event.type + '\u0000' + JSON.stringify(event.data === undefined || event.data === null ? null : event.data.message ?? null)
-  })
+    const signature = event === undefined
+      ? 'missing:' + seq
+      : event.type + '\u0000' + JSON.stringify(event.data === undefined || event.data === null ? null : event.data.message ?? null)
+    // 会话级设置（system/developer）在 `renumber` 里会被物理搬到日志最前
+    // （宿主要求表面 node 0 是系统提示词），所以它们的位置在裁剪前后必然不同。
+    if (event !== undefined && (event.type === 'system/message' || event.type === 'developer/message')) system.push(signature)
+    else dialog.push(signature)
+  }
+  return { visible, dialog, system }
 }
 
 function sameVisible(left, right) {
-  if (left.length !== right.length) return false
-  for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false
+  // 对话必须**逐条同位置**：模型读的是对话顺序，顺序变了就是内容变了。
+  if (left.dialog.length !== right.dialog.length) return false
+  for (let index = 0; index < left.dialog.length; index += 1) {
+    if (left.dialog[index] !== right.dialog[index]) return false
+  }
+  // 系统提示词只比内容多重集，而且**允许产物比原视图多**：`renumber` 第 0 步会把
+  // 一条 `system/message` 搬到日志最前并改成 `append`（宿主规定表面第 0 位必须是
+  // 受保护的系统提示词），而那条在原日志里往往是被 checkpoint 遮蔽的 —— 于是原视图
+  // 里 0 条、产物里 1 条。这不是"内容变了"，是把合法副本摆到了宿主要求的位置上。
+  // 要求两边条数相等，等于让所有「原视图没有 system」的会话永远裁不动
+  // （实测 session-9c6d39ac：9 个窗口、45419 条，每次都被这条闸门撤销）。
+  // 所以判据是「原视图的每一条 system 都在产物里」，多出来的那条放行。
+  if (right.system.length < left.system.length) return false
+  const remaining = [...right.system].sort()
+  for (const signature of [...left.system].sort()) {
+    const at = remaining.indexOf(signature)
+    if (at < 0) return false
+    remaining.splice(at, 1)
+  }
   return true
 }
 
 export function keepLastWindows(events, keep) {
+  // 闸门要比的是「**原始**日志的模型视图」。`alignReplaceRanges` 会就地改写
+  // `events` 里的 surfaceOp，改完之后再 fold 出来的视图已经不是原日志的视图了 ——
+  // 拿它当基准等于让受检者给自己打分：实测 25515ab4 因此被误判（重锚后 594 条 vs
+  // 真实的 593 条），整次裁剪被撤销，cutSeq 返回 null，界面却还在说"该裁、能丢 54%"。
+  // 快照只用于闸门，后面的计算仍然在 `events` 上做（那份会被就地改）。
+  const gateEvents = structuredClone(events)
   const windows = windowsOf(events)
   // 只数**有 checkpoint 的窗口**：第 1 窗是"会话开头到第一个 checkpoint 前"的设置窗
   // （系统提示词、权限、预设），它不含对话内容。
   const real = windows.filter((w) => w.checkpointSeq !== null)
   if (real.length <= keep) {
-    return { events, cutSeq: null, windows: windows.length, kept: events.length, dropped: 0, frame: [] }
+    return { events, cutSeq: null, windows: windows.length, realWindows: real.length, kept: events.length, dropped: 0, frame: [] }
   }
   const firstKept = real.length - keep + 1
 
@@ -1125,6 +1157,24 @@ export function keepLastWindows(events, keep) {
 
   const keepSeq = new Set(frame.map((e) => e.seq))
   for (const event of events) if (event.seq >= cutSeq) keepSeq.add(event.seq)
+
+  // 表面头：宿主要求「第一个表面节点是受保护的 system/message」。原日志里这条
+  // 往往是一条 `append` 的 `system/message`（后续 checkpoint 用 replace 把它换成了
+  // 有正文的新版本，于是原表面上它不在——宿主接受，因为没有 system 出现也算合法）。
+  // 但裁剪之后，后面那些 system/replace 可能一起被切走，产物表面就由一条
+  // `assistant/message` 打头，宿主的加载器直接拒收
+  // （`requires a protected first surface head`，实测 25515ab4 / 50d48342）。
+  // 它不占模型视图（原日志里本来就被遮蔽），留着只是让产物的首个表面节点合法。
+  const firstSystemAppend = events.find((e) => e.type === 'system/message' && e.surfaceOp === 'append')
+  if (firstSystemAppend !== undefined) keepSeq.add(firstSystemAppend.seq)
+
+  // fork 的继承标记必须保住。`header.isSeeded === true` 的日志靠最后一条
+  // `session/end-seed {inherited:true}` 声明"我继承了前 N 条"，它通常落在最早的
+  // 那一窗里；窗口裁剪只留 `seq >= cutSeq`，会把这个标记本身删掉，宿主立刻报
+  // `isSeeded 的会话缺少 inherited end-seed 标记`（实测 72e19985 的标记在 seq 4428，
+  // 切点 9554，整次裁剪被拒）。它不占模型视图，留着只多一行。
+  const inheritedSeed = events.filter((e) => e.type === 'session/end-seed' && e.data?.inherited === true).pop()
+  if (inheritedSeed !== undefined) keepSeq.add(inheritedSeed.seq)
 
   // compaction 是**一组**（start/summary/end 同一个 compactionId）：只留一半，
   // 宿主会说 end 丢了 summary。任一条被保留，整组都留下。
@@ -1213,6 +1263,74 @@ export function keepLastWindows(events, keep) {
     else dropped += 1
   }
 
+  // 活下来的 replace 的区间端点必须落在保留集里。端点被切走的话，`renumber` 会把它
+  // 降级成 `append`，被它遮蔽的那段历史就重新露到模型眼前 —— 表面直接膨胀（实测
+  // 5a2d5cc6 的 ck 4165 因此让 1257 条涨到 1747 条）。所以在重锚之前先把缺失的端点
+  // 补进保留集：保住整条 replace，`alignReplaceRanges` 就没有机会再去重锚它。
+  for (let round = 0; round < 8; round += 1) {
+    let added = false
+    for (const event of events) {
+      if (!keepSeq.has(event.seq)) continue
+      const op = event.surfaceOp
+      if (op === null || op === undefined || typeof op !== 'object') continue
+      for (const endpoint of [op.startSeq, op.endSeq]) {
+        const seq = Number(endpoint)
+        if (!Number.isSafeInteger(seq) || seq >= event.seq || keepSeq.has(seq)) continue
+        if (!bySeq.has(seq)) continue
+        keepSeq.add(seq)
+        added = true
+      }
+    }
+    if (!added) break
+  }
+
+  // 目标事件（`goal/change` 与 `source.kind === 'goal'` 的轮次消息）**必须整份留下**。
+  //
+  // `/goal` 的投影是从**整份日志**折叠出来的，被 checkpoint 遮蔽的事件同样参与；
+  // 砍掉任何一条都会让该会话的 /goal 永久失败（插件早先就为此加过
+  // `assertNoGoalEventsDropped` 硬拦截）。它们不占模型视图，留着只是几十到几百行
+  // 记账。实测 session-9c6d39ac 523 条 goal 事件里 414 条本来就被遮蔽，全部保留
+  // 之后仍能从 45523 条裁到 ~6500 条。
+  //
+  // 但**只保留 goal 是不够的**：它们原本可能正是被 checkpoint 的 replace 遮蔽着，
+  // 而那条 replace 的端点落在被裁掉的窗口里。只留 goal、不留遮蔽者，它们就会
+  // **露到表面上** —— 模型看到原本看不到的内容，硬闸门必然拒绝（实测 25515ab4：
+  // 原表面 655、产物 1138，首个差异就是一条 goal user/message）。
+  //
+  // 所以做**向上闭包**：把每条 goal 事件在原日志里的遮蔽者（那条 replace 事件）
+  // 也加进保留集；遮蔽者自己若同样被更上层遮蔽，继续往上补，直到没有为止。
+  {
+    const coveredBy = new Map()
+    for (const event of events) {
+      const op = event.surfaceOp
+      if (op === null || op === undefined || typeof op !== 'object') continue
+      const start = Math.min(Number(op.startSeq), Number(op.endSeq))
+      const end = Math.max(Number(op.startSeq), Number(op.endSeq))
+      for (const target of events) {
+        if (target.seq < start || target.seq > end || target.seq >= event.seq) continue
+        const list = coveredBy.get(target.seq) ?? []
+        list.push(event.seq)
+        coveredBy.set(target.seq, list)
+      }
+    }
+    const bySeqOf = new Map(events.map((event) => [event.seq, event]))
+    const goals = events.filter(
+      (event) => event.type === 'goal/change' || (event.type === 'user/message' && event.data?.source?.kind === 'goal'),
+    )
+    const pending = goals.map((event) => event.seq)
+    while (pending.length > 0) {
+      const seq = pending.pop()
+      keepSeq.add(seq)
+      for (const shadowerSeq of coveredBy.get(seq) ?? []) {
+        if (keepSeq.has(shadowerSeq)) continue
+        const shadower = bySeqOf.get(shadowerSeq)
+        if (shadower === undefined) continue
+        keepSeq.add(shadowerSeq)
+        pending.push(shadowerSeq)
+      }
+    }
+  }
+
   // 活下来的 replace 的区间端点必须落在保留集里的表面节点上。
   const { anchors } = alignReplaceRanges(events, keepSeq)
   const finalOut = []
@@ -1225,18 +1343,337 @@ export function keepLastWindows(events, keep) {
     .filter((seq) => !frame.some((e) => e.seq === seq))
     .map((seq) => bySeq.get(seq))
     .filter((e) => e !== undefined)
+  // ── 窗口裁剪失败时的兜底：按「模型当前真正看得见的第一个节点」重切 ──────────
+  //
+  // 有些会话（典型的"深压缩后继续使用"）结构是这样的：4~9 个 checkpoint，
+  // 每个都遮蔽着它之前一大段历史，而**模型现在看得见的内容全在最后一个
+  // checkpoint 附近**（实测 25515ab4：655 个可见节点全在 seq 15103..17293，
+  // 前面 4 个 checkpoint 遮蔽的东西一条都不可见）。
+  //
+  // 这种会话按窗口数切（`checkpointTailStart`）永远过不了硬闸门：只要删掉任何
+  // 一个前面的 checkpoint，它遮蔽的那一大片就会露出表面，视图直接变。
+  // 但换个切法就成立：**从"第一个可见节点所在的 turn"整段切下去**，
+  // 再把最后一个 checkpoint 的替身区间重锚到新起点（让它继续压住新起点后面
+  // 那一段本不该可见的内容），最后清掉几条端点彻底失效的小 replace。
+  // 实测这样切出来模型视图逐条不变、窗数 1。
+  // ── 兜底：按「模型当前真正看得见的区域」重切 ──────────────────────────────
+  //
+  // 有一类会话（典型的"深压缩后继续使用"）结构是：4~9 个 checkpoint，每个都遮蔽
+  // 着它之前一大段历史，而**模型现在看得见的内容全在最后一个 checkpoint 附近**
+  // （实测 25515ab4：655 个可见节点全在 seq 15103..17293，前 4 个 checkpoint 遮蔽
+  // 的东西一条都不可见）。这种会话按窗口数切永远过不了硬闸门 —— 删任何一条前面的
+  // checkpoint，它遮蔽的那一大片就会露出表面。
+  //
+  // 换一种切法就成立，实测 25515ab4 从 17296 条切到 2262 条、窗 1，模型视图逐条
+  // 相同、42 条 goal 完整、宿主校验六项全过：
+  //
+  //   1. 切点 = 第一个可见节点所在 turn 的 turn/start
+  //   2. 保留 [切点, ∞) 的全部事件
+  //   3. 目标事件（goal/change 与 goal 轮次消息）全部保留 —— 它们是 `/goal` 投影的
+  //      唯一来源，少一条就永久失效；它们原本全被 checkpoint 压着、模型看不见，
+  //      保留它们不会改变视图
+  //   4. 系统提示词只留**链尾**（模型实际读到的那条），并固定成 `append`
+  //   5. 继承标记 `inherited === true` 的 `session/end-seed` 必须留（宿主要求）
+  //   6. 保留集里第一个 retry 之前必须有 provider 相同的 `request/header`
+  //   7. 最后一个 checkpoint 的区间重锚成 [最早那条**带 surfaceOp 的 goal**, 原 end]
+  //      —— 起点不能取表面节点（goal 会露），也不能取最早一条 goal（goal/change
+  //      没有 surfaceOp、不在栈上，端点会指空）
+  //   8. 端点彻底不在保留集的 replace 删掉（它们的替换目标本来就不可见）
+  //   9. inbox 拼接重放后压成每个 target 一条（这是按长度重放的状态机）
+  {
+    const folded = foldSurface(gateEvents)
+    const firstVisible = folded.visible[0]
+    const hasVisible = folded.visible.length > 0 && firstVisible !== undefined
+    if (hasVisible) {
+      let anchorSeq = firstVisible
+      for (const event of gateEvents) {
+        if (event.seq > firstVisible) break
+        if (event.type === 'turn/start') anchorSeq = event.seq
+      }
+      // 切点之前还有可见节点，说明前史对模型有用，不能整段切掉。
+      const visibleBefore = folded.visible.filter((seq) => seq < anchorSeq)
+      const checkpoints = gateEvents.filter(isCheckpoint)
+      const lastCheckpoint = checkpoints[checkpoints.length - 1]
+      if (
+        visibleBefore.length === 0 &&
+        anchorSeq > 0 &&
+        lastCheckpoint !== undefined &&
+        lastCheckpoint.surfaceOp !== null &&
+        typeof lastCheckpoint.surfaceOp === 'object'
+      ) {
+        const isGoalEvent = (event) =>
+          event.type === 'goal/change' || (event.type === 'user/message' && event.data?.source?.kind === 'goal')
+        const keep2 = new Set()
+        for (const event of gateEvents) if (event.seq >= anchorSeq) keep2.add(event.seq)
+        // 最后一个 checkpoint 的**整组**记账行必须一起留（`compaction/start` +
+        // `summary` + `end`，同一 compactionId）。checkpoint 载体落在保留集里而
+        // 它的 start/summary/end 落在切点之前时，宿主报
+        // `compaction checkpoint has no matching compaction/summary`
+        // （实测 25515ab4：载体 seq 16328 保留、组在 16326..16329、切点是 15019，
+        //  但 r 的 16326/16327 因为在 anchor 之后本该也在 —— 问题在于 keep2 过滤
+        //  之后又用 fallbackFinal 删 replace，把 summary 的载体关系弄丢了）。
+        // 这里显式把最后一个 checkpoint 的那个 compactionId 整组加进来。
+        {
+          const ckPoint = gateEvents.filter(isCheckpoint).pop()
+          const groupId = ckPoint?.data?.source?.compactionId
+          if (typeof groupId === 'string') {
+            for (const event of gateEvents) {
+              if (event.data?.compactionId === groupId) keep2.add(event.seq)
+            }
+          }
+        }
+        for (const event of gateEvents) if (isGoalEvent(event)) keep2.add(event.seq)
+        for (const event of gateEvents) {
+          if (event.type === 'session/end-seed' && event.data?.inherited === true) keep2.add(event.seq)
+        }
+        const systemChain = gateEvents.filter((event) => event.type === 'system/message')
+        const systemTail = systemChain[systemChain.length - 1]
+        if (systemTail !== undefined) keep2.add(systemTail.seq)
+        for (const event of systemChain) {
+          if (systemTail !== undefined && event.seq === systemTail.seq) continue
+          keep2.delete(event.seq)
+        }
+        for (const type of ['agent-preset/selected', 'permission/preset', 'sandbox/mode', 'approval/policy', 'session/title']) {
+          const head = gateEvents.filter((event) => event.type === type && event.seq < anchorSeq).pop()
+          if (head !== undefined) keep2.add(head.seq)
+        }
+        const retryFirst = gateEvents
+          .filter((event) => keep2.has(event.seq) && (event.type === 'llm/retry' || event.type === 'llm/retry-started'))
+          .sort((a, b) => a.seq - b.seq)[0]
+        if (retryFirst !== undefined) {
+          const header = gateEvents.filter((event) => event.type === 'request/header' && event.seq < retryFirst.seq).pop()
+          if (header !== undefined) keep2.add(header.seq)
+        }
+        const goalOnSurface = gateEvents
+          .filter((event) => isGoalEvent(event) && event.surfaceOp !== undefined && event.surfaceOp !== null)
+          .sort((a, b) => a.seq - b.seq)[0]
+        const oldEnd = Number(lastCheckpoint.surfaceOp.endSeq)
+        if (process.env.DSH_TRIM_DEBUG) {
+          console.log('[dbg fb goalOnSurface]', goalOnSurface?.seq, goalOnSurface?.surfaceOp, '| oldEnd', oldEnd, '| anchor', anchorSeq)
+        }
+        if (goalOnSurface !== undefined && goalOnSurface.seq < oldEnd) {
+          let fallbackEvents = gateEvents
+            .filter((event) => keep2.has(event.seq))
+            .map((event) => structuredClone(event))
+          for (const event of fallbackEvents) {
+            if (event.seq === lastCheckpoint.seq) {
+              event.surfaceOp = { op: 'replace', startSeq: goalOnSurface.seq, endSeq: oldEnd }
+            }
+            if (systemTail !== undefined && event.seq === systemTail.seq) {
+              event.surfaceOp = 'append'
+              delete event.sourceEventSeqs
+            }
+          }
+          fallbackEvents = fallbackEvents.filter((event) => {
+            const op = event.surfaceOp
+            if (op === null || op === undefined || typeof op !== 'object') return true
+            if (event.seq === lastCheckpoint.seq) return true
+            return keep2.has(Number(op.startSeq)) && keep2.has(Number(op.endSeq))
+          })
+          if (process.env.DSH_TRIM_DEBUG) {
+            const ck = fallbackEvents.find((e) => e.type === 'user/message' && e.data?.source?.kind === 'compact-checkpoint')
+            console.log('[dbg fb filtered] ckseq', ck?.seq, 'op', JSON.stringify(ck?.surfaceOp), '| 694 in', fallbackEvents.some((e) => e.seq === 694), '| len', fallbackEvents.length)
+          }
+          // inbox 拼接按长度重放：前面几十条一起裁掉之后，第一条留下的拼接就是
+          // `start 0, removedCount 1` —— 空列表上减 1，投影层直接报越界。
+          // 重放保留的那些拿到最终 inbox，再压成每个 target 一条。
+          {
+            const inboxState = { 'next-turn': [], 'next-step': [] }
+            const keptSplices = fallbackEvents.filter((event) => event.type === 'agent/inbox/spliced')
+            for (const event of keptSplices) {
+              const splice = event.data ?? {}
+              const list = inboxState[splice.target]
+              if (list === undefined) continue
+              const at = Math.min(Number.isSafeInteger(splice.start) ? splice.start : 0, list.length)
+              const removed = Math.min(
+                Number.isSafeInteger(splice.removedCount) ? splice.removedCount : 0,
+                list.length - at,
+              )
+              const inserted = Array.isArray(splice.inserted) ? splice.inserted : []
+              inboxState[splice.target] = list.toSpliced(at, Math.max(0, removed), ...inserted)
+            }
+            const keptSpliceSeq = new Set(keptSplices.map((event) => event.seq))
+            const rest = fallbackEvents.filter((event) => !keptSpliceSeq.has(event.seq))
+            const added = []
+            for (const target of ['next-turn', 'next-step']) {
+              if (inboxState[target].length === 0) continue
+              const anchor = gateEvents.find(
+                (event) => event.type === 'agent/inbox/spliced' && event.data?.target === target,
+              )
+              if (anchor === undefined) continue
+              added.push({
+                ...structuredClone(anchor),
+                data: { target, start: 0, removedCount: 0, inserted: inboxState[target] },
+              })
+            }
+            for (const splice of added) {
+              const clashAt = rest.findIndex((event) => event.seq === splice.seq)
+              if (clashAt >= 0) rest.splice(clashAt, 1)
+            }
+            fallbackEvents = [...rest, ...added]
+          }
+          // ⚠️ 这里**只能重编号一次**。
+          //
+          // 之前是 renumber → prune → 孤儿组修复 → renumber，两次重编。第二次的
+          // `finalMapping` 键已经是"第一次重编后的新 seq"，而 checkpoint 的
+          // `surfaceOp` 在第一次重编里已经变成 622..1152 这种**新编号**；拿它去
+          // 旧映射里查，取到的是另一段区间 —— 遮蔽区间被搬到错误位置，它压着的
+          // 那 500 条历史全部露出表面（实测 9c6d39ac 对话 678 → 1178）。
+          //
+          // 正确做法：所有改造（inbox 压缩、孤儿组修复、offload 剪枝）都在**原始
+          // seq 空间**里做完，最后只 `renumber` 一次。
+          // ⚠️ 判据必须是「`start` 与 `end` 都在保留集里**成对**出现」，只数
+          // `compaction/end` 的类型是不够的 —— 裁剪会把一组的 `summary` 与 `end`
+          // 切到保留区外面，只剩 `start`（实测 2ac54d53：原日志 8411..8414 四项齐全，
+          // 保留集里只剩 8411 与 8413，`end` 落在被裁段里）。这时宿走到 `turn/end`
+          // 就报 `turn/end crosses an open compaction`。
+          //
+          // 所以这里改成：把「有 start 但保留集里没有同 id 的 end」的组一律认定为
+          // 残缺组 —— 连它留下的 start/summary 一起删，并把引用该 id 的 checkpoint
+          // 载体降级成 `append`（否则会变成
+          // `compaction checkpoint has no matching compaction/start`）。
+          // 判据改成「**三项齐全才算完整组**」：`start` + `summary` + `end` 三项
+          // 必须**都在保留集里**。
+          //
+          // 只比 `start` 与 `end` 是不够的：`renumber` 有一条规则 —— `summary` 找不到
+          // 载体（或载体区间失效）就把它丢掉，顺带把同组的 `end` 也判成非法。
+          // 实测 2ac54d53：保留集里有 8411:start 与 8413:user/message，但
+          // 8412:summary 与 8414:end 都落在被裁段里 —— `openIds` 与 `closedIds`
+          // 都只看到部分信息，于是孤儿组识别不出来，产物里留下一个光杆 `start`，
+          // 宿主走到 `turn/end` 就报 `turn/end crosses an open compaction`。
+          //
+          // 三项齐全的组原样保留（25515ab4 / 9c6d39ac / 50d48342 都不受影响）。
+          // 孤儿组修复是**条件触发**的，不能无条件执行。
+          //
+          // 之前无条件先跑一次"探针重编"来认孤儿组，等于所有会话都多跑一次
+          // `renumber`；探针虽然用了深拷贝，但 `pruneOffloadTargets` 那条链路
+          // 仍会让产物里出现大量重复内容（实测 9c6d39ac 表面 678 → 1178、
+          // 去重后只剩 517）。本来就完好的会话因此被弄坏。
+          //
+          // 现在改成两条候选：
+          //   候选 A：原样（不删任何 compaction 组）—— 绝大多数会话走这条
+          //   候选 B：把「三项不齐」的组整组删掉、引用它的 checkpoint 降级 append
+          //
+          // 先验 A，通过就用 A；不通过才构造 B 再验。这样 9c6d39ac / 50d48342
+          // 回到原来那条通过的路径，2ac54d53 / 8f22b386 走 B。
+          const tryFinish = (events) => {
+            const pruned = pruneOffloadTargets(events)
+            const clean = renumber(pruned.events)
+            if (!sameVisible(viewParts(gateEvents), viewParts(clean.events))) return null
+            // ⚠️ 光验视图是不够的。有一类结构错误**不影响模型视图**，却会让宿主
+            // 拒收整份日志：一个没有配对的 `compaction/start` 会让后续 `turn/end`
+            // 报 `turn/end crosses an open compaction`（实测 2ac54d53 / 8f22b386）。
+            // 视图比对看不见它（compaction 记账行不是表面节点），所以必须在这里
+            // 单独扫一遍；不通过就回落去走"删孤儿组"那条候选路径。
+            // 宿主规则：`compaction/start` 打开后必须由同 id 的 `compaction/end`
+            // 关掉；中途遇到 `turn/end` 就报 `turn/end crosses an open compaction`。
+            // 重编会重排事件顺序，偶尔把一个**原本合法**的组的 `end` 排到
+            // `turn/end` 之后（实测 9c6d39ac 的 95ca3732、50d48342 的 ad50f32f、
+            // 8f22b386 的 ecf2f721）。
+            //
+            // 修法：把这些组的 `compaction/*` 记账行删掉，并把引用该 id 的
+            // checkpoint 载体**改标成普通 user 消息**（删 `source.compactionId`、
+            // `source.kind` 改 `user`）。载体本身是表面节点，**不能删** —— 删了
+            // 视图就变；改标之后它不再被当 checkpoint 校验，表面语义完全不变。
+            const badCompactionIds = new Set()
+            {
+              let openId = null
+              for (const event of clean.events) {
+                if (event.type === 'session/end-seed') { openId = null; continue }
+                if (event.type === 'compaction/start') { openId = event.data?.compactionId ?? null; continue }
+                if (event.type === 'compaction/end') { openId = null; continue }
+                if (event.type === 'turn/end' && openId !== null) { badCompactionIds.add(openId); openId = null }
+              }
+            }
+            if (badCompactionIds.size > 0) {
+              const repaired = clean.events
+                .filter((event) => !(String(event.type).startsWith('compaction/') && badCompactionIds.has(event.data?.compactionId)))
+                .map((event) => {
+                  if (event.type !== 'user/message') return event
+                  if (event.data?.source?.kind !== 'compact-checkpoint') return event
+                  const id = event.data.source.compactionId
+                  if (!badCompactionIds.has(id)) return event
+                  const source = { ...event.data.source }
+                  delete source.compactionId
+                  return { ...event, data: { ...event.data, source: { ...source, kind: 'user' } } }
+                })
+              const repairedClean = renumber(repaired)
+              if (!sameVisible(viewParts(gateEvents), viewParts(repairedClean.events))) return null
+              return repairedClean
+            }
+            return clean
+          }
+          let fallbackClean = tryFinish(fallbackEvents)
+          if (fallbackClean === null) {
+            // 认孤儿组：以 `compaction/start` 为主体，同 id 的 `summary` 与 `end`
+            // 只要缺任一项就认定这组坏了。这些是纯记账行，删掉不影响模型视图；
+            // 但引用它的 checkpoint 载体必须降级成 `append`，否则会变成
+            // `compaction checkpoint has no matching compaction/start`。
+            const openIds = new Set()
+            const summaryIds = new Set()
+            const closedIds = new Set()
+            for (const event of fallbackEvents) {
+              const id = event.data?.compactionId
+              if (typeof id !== 'string') continue
+              if (event.type === 'compaction/start') openIds.add(id)
+              else if (event.type === 'compaction/summary') summaryIds.add(id)
+              else if (event.type === 'compaction/end') closedIds.add(id)
+            }
+            const orphanIds = new Set()
+            for (const id of openIds) {
+              if (!summaryIds.has(id) || !closedIds.has(id)) orphanIds.add(id)
+            }
+            const fixedEvents = orphanIds.size === 0
+              ? fallbackEvents
+              : fallbackEvents
+                  .filter((event) => !(String(event.type).startsWith('compaction/') && orphanIds.has(event.data?.compactionId)))
+                  .map((event) => {
+                    if (event.type !== 'user/message') return event
+                    if (event.data?.source?.kind !== 'compact-checkpoint') return event
+                    const id = event.data.source.compactionId
+                    if (!orphanIds.has(id)) return event
+                    const copy = { ...event, surfaceOp: 'append' }
+                    delete copy.sourceEventSeqs
+                    return copy
+                  })
+            fallbackClean = tryFinish(fixedEvents)
+          }
+
+          if (fallbackClean !== null && sameVisible(viewParts(gateEvents), viewParts(fallbackClean.events))) {
+            return {
+              // ⚠️ 必须返回**重编后**的那份：`fallbackEvents` 还是原始 seq（0..15019
+              // 之间有大段空洞），直接写盘宿主会报 `format v4 event 0 is not dense`
+              // —— 裁剪产物要求 seq 从 0 开始连续。
+              events: fallbackClean.events,
+              cutSeq: anchorSeq,
+              windows: windows.length,
+              realWindows: real.length,
+              kept: fallbackClean.events.length,
+              dropped: events.length - fallbackClean.events.length,
+              frame: [...frame],
+              anchors: anchors.size,
+              fallback: true,
+            }
+          }
+        }
+      }
+    }
+  }
+
   // 硬闸门：裁完的日志模型看到的内容必须逐条不变。量重编号后真正会写盘的那份
   // （重编号会丢掉悬空 replace，被它压住的内容会重新露出来），按内容比不比 seq。
+  // 基准用前面那份 `gateEvents` 快照：`alignReplaceRanges` 已经把 `events` 就地改过了。
   // 先按 keepSeq 过滤再深拷贝：反过来的话，被丢掉的那一大半也要克隆一遍，
   // 18 MB 的日志光这一步就是好几秒。
   const survivor = events.filter((event) => keepSeq.has(event.seq)).map((event) => structuredClone(event))
-  if (!sameVisible(viewSignature(events), viewSignature(renumber(survivor).events))) {
-    return { events, cutSeq: null, windows: windows.length, kept: events.length, dropped: 0, frame: [] }
+  if (!sameVisible(viewParts(gateEvents), viewParts(renumber(survivor).events))) {
+    return { events, cutSeq: null, windows: windows.length, realWindows: real.length, kept: events.length, dropped: 0, frame: [] }
   }
   return {
     events: finalOut,
     cutSeq,
     windows: windows.length,
+    realWindows: real.length,
     kept: finalOut.length,
     dropped: finalDropped,
     frame: [...frame, ...extra],
@@ -1630,12 +2067,39 @@ export function renumber(events) {
       },
     }
     const rest = body.filter((_, index) => index !== sysIndex)
-    const anchor = stepStart ?? turnStart
-    if (anchor === undefined) {
-      ordered = [...head, sys, ...rest]
+    const isSurfaceType = (e) =>
+      e.type === 'system/message' || e.type === 'developer/message' ||
+      e.type === 'user/message' || e.type === 'assistant/message' || e.type === 'tool/result'
+    // 插入点是**第一个表面事件之前**，不是"第一个 step/start 之后"。
+    //
+    // 原来锚到 `stepStart`，但 `[turn/start, step/start)` 之间允许存在不带 step 的
+    // 表面事件（实测 d3089018 的 `1712 user/message` 就在 turn/start 1710 之后、
+    // step/start 1713 之前）。系统提示词插到 stepStart 后面，就排到了它后面 ——
+    // 产物里第一个表面节点成了 user/message，宿主的加载器直接拒收
+    // （`system/message requires a protected first surface head`）。
+    const surfAt = rest.findIndex(isSurfaceType)
+    if (surfAt >= 0) {
+      // sys 必须落在已开启的 turn + step 里，所以把紧邻的 step/start 提到它前面。
+      const moved = []
+      const remaining = []
+      rest.forEach((event, index) => {
+        if (index >= surfAt && event.type === 'step/start' && moved.length === 0 && stepStart !== undefined && event.seq === stepStart.seq) {
+          moved.push(event)
+          return
+        }
+        remaining.push(event)
+      })
+      const at = remaining.findIndex(isSurfaceType)
+      const insertAt = at < 0 ? remaining.length : at
+      ordered = [...head, ...remaining.slice(0, insertAt), ...moved, sys, ...remaining.slice(insertAt)]
     } else {
-      const at = rest.findIndex((e) => e.seq === anchor.seq)
-      ordered = [...head, ...rest.slice(0, at + 1), sys, ...rest.slice(at + 1)]
+      const anchor = stepStart ?? turnStart
+      if (anchor === undefined) {
+        ordered = [...head, sys, ...rest]
+      } else {
+        const at = rest.findIndex((e) => e.seq === anchor.seq)
+        ordered = [...head, ...rest.slice(0, at + 1), sys, ...rest.slice(at + 1)]
+      }
     }
   } else {
     ordered = [...head, ...body]
@@ -1678,7 +2142,21 @@ export function renumber(events) {
     const old = event.data?.turn
     if (Number.isSafeInteger(old) && !turnMap.has(old)) turnMap.set(old, nextTurn++)
   }
-  const mapTurn = (turn) => (turnMap.has(turn) ? turnMap.get(turn) : 1)
+  // 兜底成 `1` 会让「没有 turn/start 的孤儿 turn 号」与新编号撞车：前缀被裁后，
+  // 残留的 tool/result 带着早已没有 turn/start 的旧 turn 号，映射到 1 就混进了
+  // 第 1 轮的 step 序列，格式层报 `tool/result does not match an open turn and step`
+  // （实测 184f1813 / 6df74bd5 / 7fdb94ec）。兜底成「不在任何被编号轮次里」的号，
+  // 让这些孤儿落在没人用的区间（它们本来也不该被当成正常轮次的一部分）。
+  // 孤儿轮次的编号必须**唯一且排在正常轮次之后**：全塞同一个号会破坏
+  // `turn/start` 必须按 1、2、3… 依次开启的连续性（实测报
+  // `turn/start does not open the expected turn`）。
+  const orphanMap = new Map()
+  let nextOrphan = nextTurn
+  const mapTurn = (turn) => {
+    if (turnMap.has(turn)) return turnMap.get(turn)
+    if (!orphanMap.has(turn)) orphanMap.set(turn, nextOrphan++)
+    return orphanMap.get(turn)
+  }
   const stepMap = new Map()
   for (const event of ordered) {
     const oldTurn = event.data?.turn
@@ -1750,6 +2228,37 @@ export function renumber(events) {
         titlesDropped += 1
         continue
       }
+      // 宿主的规则是「`messageSeqs` 为空 **当且仅当** source.kind 是 user」
+      // （format 层原话：`messageSeqs must be empty exactly for a user title`）。
+      // 裁剪会把 provider / fallback 标题引用的那条早期消息（例如 [11]）切掉，
+      // 重编之后映射成空数组 —— 于是一条 `provider` 标题拿着空的 messageSeqs，
+      // 整份日志被拒。这条标题的内容仍然在，但它的**来源引用**已经指不到任何
+      // 东西了；丢掉它比留一条非法记录强（同一批会话里通常还有用户自己设的标题）。
+      const isEmpty = !Array.isArray(refs) || refs.length === 0
+      if (isEmpty && kind !== 'user') {
+        titlesDropped += 1
+        continue
+      }
+      if (!isEmpty && kind === 'user') {
+        // 用户标题必须为空：把引用清掉，标题本体保留。
+        event.data = { ...event.data, messageSeqs: [] }
+      }
+    }
+    // `session/title-llm-request` 的 `messageSeqs` 必须与那条 `session/title` **完全
+    // 一致**（格式层逐条校验 `messages do not represent messageSeqs`）。用户自己设的
+    // 标题 `messageSeqs` 为空，而这次请求记的是当初那条消息的 seq（例如 [11]）；
+    // 前面的窗口被裁掉之后它映射成空数组，两边就对不上了。这种记录是「当初怎么
+    // 生成的标题」的历史注脚，标题已经定了，丢掉它不影响任何可读内容。
+    if (event.type === 'session/title-llm-request') {
+      const titleSeqs = [...out]
+        .reverse()
+        .find((candidate) => candidate.type === 'session/title' && candidate.seq <= event.seq)?.data?.messageSeqs
+      const ownSeqs = Array.isArray(event.data?.messageSeqs) ? event.data.messageSeqs : []
+      const expected = Array.isArray(titleSeqs) ? titleSeqs : []
+      if (ownSeqs.length === 0 && expected.length === 0) {
+        titlesDropped += 1
+        continue
+      }
     }
     kept.push(event)
   }
@@ -1817,16 +2326,46 @@ export function renumber(events) {
       else delete next.data.shadowedRange
     }
     if (next.surfaceOp !== undefined && next.surfaceOp !== null && typeof next.surfaceOp === 'object') {
-      const startSeq = finalRemap(next.surfaceOp.startSeq)
-      const endSeq = finalRemap(next.surfaceOp.endSeq)
-      if (startSeq !== null && endSeq !== null) next.surfaceOp = { ...next.surfaceOp, startSeq, endSeq }
-      else next.surfaceOp = 'append'
+      // ⚠️ 这里**不能**把 startSeq / endSeq 各自映射一次就完事。
+      //
+      // `finalRemap` 是「老 seq → 新下标」，而 `renumber` 重排过事件顺序（head 搬最前、
+      // 系统提示词插到第一个表面事件之前），所以它**不是单调的**：老 seq 小的，新下标
+      // 未必小。分别映射两端会让区间**反转**（实测 25515ab4 的 6745..9223 映射成
+      // 7905..1785），于是 fold 时 `startIdx > endIdx`，这条 replace 连带整片遮蔽一起
+      // 降级成 append，本该不可见的 447 条事件全部露到表面上（原表面 655 → 1123）。
+      //
+      // 正确做法是**按新顺序重新取端**：把原区间里仍然存活的事件映射一遍，取其中
+      // 最小的新 seq 与最大的新 seq 当新端点。这样区间在新序列里仍是一段连续的表
+      // 面范围，遮蔽语义不变。
+      const oldStart = Number(next.surfaceOp.startSeq)
+      const oldEnd = Number(next.surfaceOp.endSeq)
+      const low = Math.min(oldStart, oldEnd)
+      const high = Math.max(oldStart, oldEnd)
+      let newStart = null
+      let newEnd = null
+      if (Number.isSafeInteger(low) && Number.isSafeInteger(high)) {
+        for (const [oldSeq, newSeq] of finalMapping) {
+          if (oldSeq < low || oldSeq > high) continue
+          if (newStart === null || newSeq < newStart) newStart = newSeq
+          if (newEnd === null || newSeq > newEnd) newEnd = newSeq
+        }
+      }
+      if (newStart === null) {
+        newStart = finalRemap(oldStart)
+        newEnd = finalRemap(oldEnd)
+      }
+      if (newStart !== null && newEnd !== null && newStart <= newEnd) {
+        next.surfaceOp = { ...next.surfaceOp, startSeq: newStart, endSeq: newEnd }
+      } else {
+        next.surfaceOp = 'append'
+      }
     }
     rebuilt.push(next)
   }
 
   // ── 5) 按宿主算法重算 sourceEventSeqs ───────────────────────────────────
   const nodes = []
+  const keptBySeq = new Map(ordered.map((event) => [event.seq, event]))
   let refsFixed = 0
   let compactionDropped2 = 0
   const finalKept = []
@@ -1888,6 +2427,7 @@ export function renumber(events) {
     const startIdx = nodes.indexOf(op.startSeq)
     const endIdx = nodes.indexOf(op.endSeq)
     if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) {
+      if (process.env.DSH_TRIM_DEBUG) console.log('[dbg step5 degrade]', event.type, 'seq', event.seq, 'range', op.startSeq + '..' + op.endSeq, 'startIdx', startIdx, 'endIdx', endIdx, 'srcLen', Array.isArray(event.sourceEventSeqs)?event.sourceEventSeqs.length:0)
       event.surfaceOp = 'append'
       delete event.sourceEventSeqs
       nodes.push(event.seq)
@@ -1896,6 +2436,11 @@ export function renumber(events) {
       continue
     }
     const shadowed = nodes.slice(startIdx, endIdx + 1)
+    // `tool/result` 的 replace 被宿主**严格**限制：只能替换**一条**同为 `tool/result`
+    // 的节点，且替换者与被替换者的 `message` 除 `content` 外必须完全一致
+    // （`tool/result surface replacement may change only content`）。重编之后端点可能
+    // 指到了别的类型（实测 25515ab4 的 seq 1460 替换到一条 `step/start` 上），宿主
+    // 直接拒收整份日志。这种情况降级成 `append`：内容照样留着，只是不再"替换"别人。
     const before = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []
     if (before.length !== shadowed.length || before.some((value, i) => value !== shadowed[i])) refsFixed += 1
     event.sourceEventSeqs = [...shadowed]
@@ -2140,9 +2685,13 @@ export function repairLateToolResults(events) {
  * 被 checkpoint 的 `replace` 区间盖住的前缀：模型与界面都看不到，留着只是占空间，
  * 窗口页还会把它算成一窗。
  *
- * 不逐行删（会切坏 step/turn 括号），而是把保留区改成「连续尾巴 + frame」：
- * 从最后一个存活 checkpoint 的 replace 末尾之后、对齐到轮次起点开始保留，
- * 再加系统提示词与设置事件。这样结构始终是自洽的。
+ * 删除标准是 `foldSurface` 自己算出来的 `dropped`（真正被 replace 遮蔽的那些），
+ * 而不是「seq 小于某个边界」——后者会把 [shadowEnd, 第一条 turn/start) 这个空档里
+ * *仍然可见* 的节点一并删掉（实测 5a2d5cc6 空档 [5467,5571) 里有 29 个可见节点，
+ * 全局 11 个会话共 244 个）。那等于悄悄改掉模型读到的内容。
+ *
+ * 结构性事件（compaction 组、seeded 标记、inbox 拼接）不受遮蔽限制：它们是按顺序
+ * 重放的记账，丢掉半组会让整份日志装不上，而且不占模型视图。
  *
  * @param {object[]} events - 候选保留事件（keepLastWindows 的结果）。
  * @returns {{ events: object[], dropped: number }} 结果。
@@ -2154,13 +2703,20 @@ export function dropShadowedPrefix(events) {
   if (shadowEnd === null) return { events, dropped: 0 }
   const aligned = events.find((event) => event.seq > shadowEnd && event.type === 'turn/start')
   if (aligned === undefined) return { events, dropped: 0 }
+  // 保留区从这条 turn/start 开始：从轮次边界切，turn/step 括号与工具生命周期才是
+  // 自洽的（逐条删被遮蔽事件会让格式层报 `does not match an open turn and step`
+  // 与 `tool/call has no advertised tool lifecycle`）。
   const liveStart = aligned.seq
   const frame = new Set()
-  const visible = foldSurface(events).visible
-  const system = visible.map((seq) => events.find((event) => event.seq === seq)).find((event) => event !== undefined && (event.type === 'system/message' || event.type === 'developer/message'))
+  const fold = foldSurface(events)
+  const visible = fold.visible
+  const covered = fold.dropped
+  const system = visible
+    .map((seq) => events.find((event) => event.seq === seq))
+    .find((event) => event !== undefined && (event.type === 'system/message' || event.type === 'developer/message'))
   if (system !== undefined) frame.add(system.seq)
   for (const type of ['agent-preset/selected', 'permission/preset', 'sandbox/mode', 'approval/policy', 'session/title', 'session/end-seed']) {
-    const hit = events.filter((event) => event.type === type && event.seq < liveStart).pop()
+    const hit = events.filter((event) => event.type === type).pop()
     if (hit !== undefined) frame.add(hit.seq)
   }
   // 结构性事件不受“前缀”限制：compaction 组、seeded 标记、inbox 拼接都是按顺序
@@ -2168,8 +2724,114 @@ export function dropShadowedPrefix(events) {
   const structural = (event) =>
     String(event.type).startsWith('compaction/') ||
     String(event.type).startsWith('session/') ||
-    event.type === 'agent/inbox/spliced'
-  const out = events.filter((event) => event.seq >= liveStart || frame.has(event.seq) || structural(event))
+    event.type === 'agent/inbox/spliced' ||
+    // 目标事件：`/goal` 从整份日志折叠，被遮蔽的也要留（见 keepLastWindows 里的说明）。
+    event.type === 'goal/change' ||
+    (event.type === 'user/message' && event.data?.source?.kind === 'goal')
+  // **空档里仍然可见的节点必须留**。原来的判据只有 `seq >= liveStart`，把
+  // `[shadowEnd, liveStart)` 之间那批"没被遮蔽、模型还能看见"的节点一起删掉了
+  // （实测 5a2d5cc6 空档 [5467,5571) 里 29 个可见节点，全局 11 个会话共 244 个）。
+  //
+  // 不能改成"逐条删被遮蔽的"：那样会把 turn/step 括号与 tool 生命周期的半边删掉，
+  // 格式层立刻报 `does not match an open turn and step` / `tool/call has no advertised
+  // tool lifecycle`（实测）。所以仍然按"连续尾巴"切，只把**切点前移**到包住那些
+  // 可见节点的轮次起点：留的是完整的一轮，结构自洽，内容也不再丢。
+  let keptFrom = liveStart
+  const gapVisible = visible.filter((seq) => seq > shadowEnd && seq < liveStart)
+  if (gapVisible.length > 0) {
+    const earliest = gapVisible[0]
+    let candidate = keptFrom
+    for (const event of events) {
+      if (event.seq > earliest) break
+      if (event.type === 'turn/start') candidate = event.seq
+    }
+    if (candidate < keptFrom) keptFrom = candidate
+  }
+  // `llm/retry` / `llm/retry-started` 必须能找到一个**在它之前**的
+  // `request/header`，宿主逐条校验 `llm/retry provider does not match the open
+  // request/header`。前缀裁剪把那条 header 切掉之后，剩下的 retry 就全部悬空
+  // （实测 25515ab4 有 26 条 retry 跑在第一个 header 之前，整份被拒）。
+  // 所以：候选里第一条 retry 之前若没有 header，就把被丢掉的那条 header 补回来。
+  //
+  // 判据是**候选保留集里**第一条「retry 出现在它之前」的位置：只要有一条 retry
+  // 的 seq 小于候选里第一 header 的 seq，就说明那批 retry 没有开着的 header。
+  // 把它们前面最近的那条 header 补回来（一条就够，retry 只需要"有一个开着的"）。
+  const retryTypes = new Set(['llm/retry', 'llm/retry-started'])
+  const candidateFirstRetry = events.find(
+    (event) => event.seq >= keptFrom && retryTypes.has(String(event.type)),
+  )
+  const candidateFirstHeader = events.find(
+    (event) => event.seq >= keptFrom && event.type === 'request/header',
+  )
+  const retryBeforeHeader =
+    candidateFirstRetry !== undefined &&
+    (candidateFirstHeader === undefined || candidateFirstRetry.seq < candidateFirstHeader.seq)
+  if (retryBeforeHeader) {
+    const header = events
+      .filter((event) => event.type === 'request/header' && event.seq < candidateFirstRetry.seq)
+      .pop()
+    if (header !== undefined) frame.add(header.seq)
+  }
+  const out = events.filter(
+    (event) => event.seq >= keptFrom || frame.has(event.seq) || structural(event),
+  )
+  // **遮蔽闭包**：保留下来的事件里，有些原本依赖一条已被删掉的 `replace` 才不可见
+  // （例如 9c6d39ac 的 checkpoint 3469 遮蔽 694 等 399 条，3469 被前缀裁掉之后那批
+  // 又露出来，表面从 679 涨到 1078）。删一条 replace 就必须连带删掉它遮蔽的事件，
+  // 否则模型会看到原本看不到的内容 —— 这正是硬闸门要拦的。
+  //
+  // `coverOf` 用原日志试算出「每条事件是被哪些 replace 遮蔽的」。保留集里若某条
+  // 事件的所有遮蔽者都已不在，这条事件也得走。
+  {
+    const coveredBy = new Map()
+    for (const event of events) {
+      const op = event.surfaceOp
+      if (op === null || op === undefined || typeof op !== 'object') continue
+      const start = Math.min(Number(op.startSeq), Number(op.endSeq))
+      const end = Math.max(Number(op.startSeq), Number(op.endSeq))
+      for (const target of events) {
+        if (target.seq < start || target.seq > end || target.seq >= event.seq) continue
+        const list = coveredBy.get(target.seq) ?? []
+        list.push(event.seq)
+        coveredBy.set(target.seq, list)
+      }
+    }
+    // 目标事件（goal/change 与 goal 轮次消息）不能删：`/goal` 的投影从整份日志折叠。
+    // 但它们原本被 checkpoint 遮蔽、模型看不到；强行保留会让它们**露出表面**，
+    // 视图就变了（实测 9c6d39ac 的 goal 消息 694 因此从「被遮蔽」变成「可见」，
+    // 表面 679 → 1078）。所以对这些事件反过来做：**把遮蔽它的那条 replace 补回来**，
+    // 让它继续处于被遮蔽状态 —— 投影读得到，模型视图不变。
+    const isGoalEvent = (event) =>
+      event.type === 'goal/change' || (event.type === 'user/message' && event.data?.source?.kind === 'goal')
+    const kept = new Set(out.map((event) => event.seq))
+    for (let round = 0; round < 8; round += 1) {
+      let changed = false
+      for (const event of out) {
+        const shadowers = coveredBy.get(event.seq)
+        if (shadowers === undefined) continue
+        // 这里用**不含 goal** 的结构性判定：goal 事件要走下面的「补回遮蔽者」分支，
+        // 不能被 structural 提前豁免掉（否则它就留在表面上，视图直接膨胀）。
+        const structuralOnly = String(event.type).startsWith('compaction/') ||
+          String(event.type).startsWith('session/') ||
+          event.type === 'agent/inbox/spliced'
+        if (shadowers.some((seq) => kept.has(seq)) || frame.has(event.seq) || structuralOnly) continue
+        if (isGoalEvent(event)) {
+          for (const seq of shadowers) {
+            if (kept.has(seq)) continue
+            kept.add(seq)
+            changed = true
+          }
+          continue
+        }
+        kept.delete(event.seq)
+        changed = true
+      }
+      if (!changed) break
+    }
+    out.length = 0
+    for (const event of events) if (kept.has(event.seq)) out.push(event)
+  }
+
   // compaction 是一组（start / summary / end 同一个 compactionId）：end 落在尾巴里而
   // start/summary 落在被丢的前缀里时，宿主要求「成功的 compaction/end 必须有一条 summary」。
   // 只要有同组的行留下，就把整组补回来（都是记账行，不影响模型视图）。
@@ -2183,7 +2845,169 @@ export function dropShadowedPrefix(events) {
     }
     out.sort((left, right) => left.seq - right.seq)
   }
+  // compaction 组的记账字段（`shadowedRange` / `shadowedSeqs`）是**按 carrier** 现算的：
+  // `renumber` 先从 `source.kind === 'compact-checkpoint'` 的记录建 carrier 表，再拿
+  // carrier 的 `surfaceOp` 去重算 summary 的区间。前缀一削，carrier（例如 seq 11204，
+  // 一条被后一个 checkpoint 遮蔽的 `user/message`）常常跟着消失；summary 找不到 carrier
+  // 就被 `renumber` 丢掉，只剩 `compaction/start` + `compaction/end`，宿主立刻报
+  // `successful compaction/end requires one summary`（实测 72e19985 连撞两次）。
+  //
+  // 所以判据是「这一组的 carrier 还在不在」：carrier 没留下，整组连 summary 一起丢掉；
+  // carrier 留下了，整组都留（保证 start + summary + end 三项齐全）。
+  const carrierIds = new Set()
+  for (const event of out) {
+    const id = event.data?.compactionId ?? event.data?.source?.compactionId
+    if (typeof id === 'string') carrierIds.add(id)
+  }
+  const hasCarrier = new Set()
+  for (const event of out) {
+    if (event.data?.source?.kind !== 'compact-checkpoint') continue
+    const id = event.data?.source?.compactionId
+    if (typeof id === 'string') hasCarrier.add(id)
+  }
+  const carriersById = new Map()
+  for (const event of events) {
+    if (event.data?.source?.kind !== 'compact-checkpoint') continue
+    const id = event.data?.source?.compactionId
+    if (typeof id === 'string') carriersById.set(id, event)
+  }
+  const groups = new Map()
+  for (const event of out) {
+    const id = event.data?.compactionId
+    if (typeof id !== 'string') continue
+    const slot = groups.get(id) ?? { start: false, summary: false, end: false }
+    const type = String(event.type)
+    if (type === 'compaction/start') slot.start = true
+    else if (type === 'compaction/summary') slot.summary = true
+    else if (type === 'compaction/end') slot.end = true
+    groups.set(id, slot)
+  }
+  const complete = new Set()
+  for (const [id, slot] of groups) {
+    // 三项齐全**且** carrier 的 replace 两端都还在保留集里。carrier 的区间端点
+    // 指向被它遮蔽的旧消息（例如 11204..12381），前缀一削就没了；`renumber` 会把
+    // 端点失效的 carrier 降级成 `append`，summary 随即找不到区间而被丢掉。
+    // 端点不保，整组就留不住 —— 一起丢，比留个半套（start+end 无 summary）强。
+    const carrier = carriersById.get(id)
+    const endpointsKept =
+      carrier !== undefined &&
+      carrier.surfaceOp !== null &&
+      typeof carrier.surfaceOp === 'object' &&
+      out.includes(carrier) &&
+      out.some((event) => event.seq === Number(carrier.surfaceOp.startSeq)) &&
+      out.some((event) => event.seq === Number(carrier.surfaceOp.endSeq))
+    if (slot.start && slot.summary && slot.end && endpointsKept) complete.add(id)
+  }
+  void carrierIds
+  const pruned = out.filter((event) => {
+    if (String(event.type).startsWith('compaction/') === false) return true
+    const id = event.data?.compactionId
+    if (typeof id !== 'string') return true
+    return complete.has(id)
+  })
+  out.length = 0
+  for (const event of pruned) out.push(event)
+
+  // 保留集里带着 `turn`/`step` 却没有对应 `turn/start`、`step/start` 的事件是
+  // **孤儿**：前缀被裁时开括号落在被丢弃的那一段，闭括号（或 tool/result 这类
+  // 带 turn/step 的消息）却因为仍在表面上被留了下来。宿主的格式层拿孤儿事件
+  // 去比对「当前开着的 turn/step」，必报 `tool/result does not match an open turn
+  // and step`（实测 184f1813 / 6df74bd5 / 7fdb94ec / d3089018）。
+  //
+  // 修法是把**开括号**补回保留集，而不是丢正文：这些轮次本来就有一半在尾巴里，
+  // 补上 turn/start + step/start 之后整轮自洽。
+  // 保留集里带着 `turn`/`step` 却没有对应开括号的事件是**孤儿**（开括号落在被裁
+  // 的前缀里，闭括号却因为仍在表面上被留下），宿主必然报 `tool/result does not
+  // match an open turn and step`。这里**整轮**补回来：找到孤儿所属的 turn 号，
+  // 把该轮从 turn/start 到 turn/end 的全部事件一起留 —— 只补开括号不够，宿主还
+  // 会报 `turn/start does not open the expected turn`（轮次不连续）。
+  const kept = new Set(out.map((event) => event.seq))
+  const turnsToRestore = new Set()
+  for (const event of out) {
+    const turn = event.data?.turn
+    if (!Number.isSafeInteger(turn)) continue
+    if (event.type === 'turn/start' || event.type === 'turn/end') continue
+    turnsToRestore.add(turn)
+  }
+  // 已有 turn/start 的轮次算"正常轮次"，不用补；孤儿才是要补的。
+  for (const event of out) {
+    if (event.type === 'turn/start' && Number.isSafeInteger(event.data?.turn)) turnsToRestore.delete(event.data.turn)
+  }
+  if (turnsToRestore.size > 0) {
+    for (const event of events) {
+      if (!Number.isSafeInteger(event.data?.turn)) continue
+      if (!turnsToRestore.has(event.data.turn)) continue
+      kept.add(event.seq)
+    }
+  }
+  out.length = 0
+  for (const event of events) if (kept.has(event.seq)) out.push(event)
   return { events: out, dropped: events.length - out.length }
+}
+
+/**
+ * 把 `image/offload` 的 `targets` 裁到「这条事件那一刻的表面」上。
+ *
+ * 投影校验用的是**该事件被 fold 到那一刻**的节点集合，不是日志末尾的表面：
+ *
+ * ```js
+ * project(event, context) { const nodes = new Set(context.nodes); …
+ *   if (!nodes.has(seq)) throw new Error(`image/offload: target seq ${seq} is not a current surface node`) }
+ * ```
+ *
+ * 裁剪把 target 指向的消息移走之后，宿主会拿这条错误拒收整份日志。所以顺序推进
+ * 一个和 foldSurface 同构的节点栈，遇到 offload 就用此刻的栈来筛 target：全失效
+ * 就整条丢掉（它只是投影记账），部分失效就剪掉失效的那几项。
+ *
+ * @param {object[]} events - 待写盘的事件（seq 连续）。
+ * @returns {{ events: object[], removed: number, pruned: number }} 结果。
+ */
+export function pruneOffloadTargets(events) {
+  const bySeq = new Map(events.map((event) => [event.seq, event]))
+  const nodes = []
+  const out = []
+  let removed = 0
+  let pruned = 0
+  for (const event of events) {
+    if (event.type === 'image/offload') {
+      const targets = Array.isArray(event.data?.targets) ? event.data.targets : []
+      const alive = targets.filter((target) => {
+        const seq = Number(target?.seq)
+        const source = bySeq.get(seq)
+        return nodes.includes(seq) && source !== undefined && (source.type === 'user/message' || source.type === 'tool/result')
+      })
+      if (alive.length !== targets.length) {
+        pruned += targets.length - alive.length
+        if (alive.length === 0) {
+          removed += 1
+          continue
+        }
+        event.data = { ...event.data, targets: alive }
+      }
+    }
+    out.push(event)
+    const op = event.surfaceOp
+    if (op === undefined || op === null) continue
+    if (op === 'append') {
+      nodes.push(event.seq)
+      continue
+    }
+    if (typeof op === 'object' && op.op === 'replace') {
+      const start = Number(op.startSeq)
+      const end = Number(op.endSeq)
+      const startIdx = nodes.indexOf(start)
+      const endIdx = nodes.indexOf(end)
+      if (startIdx >= 0 && endIdx >= 0 && startIdx <= endIdx) {
+        for (let index = endIdx; index >= startIdx; index -= 1) nodes.splice(index, 1)
+      }
+      for (const seq of Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []) {
+        const at = nodes.indexOf(seq)
+        if (at >= 0) nodes.splice(at, 1)
+      }
+      nodes.push(event.seq)
+    }
+  }
+  return { events: out, removed, pruned }
 }
 
 export async function stageTrim(logFile, keep, options = {}) {
@@ -2192,18 +3016,170 @@ export async function stageTrim(logFile, keep, options = {}) {
   }
   const original = await readLogAsync(logFile)
   const trimmed = keepLastWindows(original.events, keep)
+
+  // 走了「可见区域重切」兜底的会话：兜底产物**本身就是最终形态**，它的 checkpoint
+  // 区间、system 链尾、goal 遮蔽、inbox 拼接都是按目标结构算好的。再跑
+  // `dropShadowedPrefix` / `stripOldStreams` / compaction 清扫这些后处理，会把
+  // 精心对齐的结构重新拆掉 —— 实测 5 个会话全被后处理弄成
+  // `step/end does not match an open turn and step` 或
+  // `compaction checkpoint has no matching compaction/summary`。
+  // 所以这条路径直接进入校验/写盘。
+  if (trimmed.fallback === true) {
+    assertNoGoalEventsDropped(original.events, trimmed.events)
+    const renamedFallback = { events: trimmed.events, refsFixed: 0, titlesDropped: 0, compactionDropped: 0 }
+    const stampFallback = new Date().toISOString().replace(/[:.]/g, '-')
+    const backupFallback = `${logFile}.precompact-${stampFallback}`
+    const stagingFallback = `${logFile}.staging-${stampFallback}`
+    await fs.promises.writeFile(stagingFallback, await encodeLogAsync(original.header, renamedFallback.events))
+    return {
+      staging: stagingFallback,
+      backup: backupFallback,
+      summary: {
+        backup: backupFallback,
+        before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.realWindows },
+        after: { events: renamedFallback.events.length, bytes: (await fs.promises.stat(stagingFallback)).size },
+        dropped: trimmed.dropped,
+        refsFixed: 0,
+        titlesDropped: 0,
+        compactionDropped: 0,
+        stream: { stripped: 0, bytesSaved: 0, keepTurns: null },
+        transcript: { before: transcriptRows(original.events), after: transcriptRows(renamedFallback.events) },
+        model: { before: foldSurface(original.events).visible.length, after: foldSurface(renamedFallback.events).visible.length },
+      },
+    }
+  }
   // 旧回合的流式回放记录：与 data.message.content 逐块重复，留最近几轮就够。
   const streamKeepTurns = options.streamKeepTurns === undefined ? Infinity : options.streamKeepTurns
   // 先丢掉被 checkpoint 遮蔽的前缀（连续尾巴 + frame），再清流式回放。
   const shadowed = options.shadowPrefix === false ? { events: trimmed.events, dropped: 0 } : dropShadowedPrefix(trimmed.events)
   const stripped = stripOldStreams(shadowed.events, streamKeepTurns)
   assertNoGoalEventsDropped(original.events, stripped.events)
-  if (trimmed.cutSeq === null && shadowed.dropped === 0) throw new Error(`只有 ${trimmed.windows} 个窗口，不需要裁`)
+  if (trimmed.cutSeq === null && shadowed.dropped === 0) throw new Error(`只有 ${trimmed.realWindows} 个窗口，不需要裁`)
   let renamed = renumber(stripped.events)
   const repaired = repairLateToolResults(renamed.events)
   if (repaired.moved > 0 || repaired.dropped > 0) {
     // 挪动会改变 seq，重新编号一次让所有引用跟上。
     renamed = renumber(repaired.events)
+  }
+
+  // `image/offload` 的 targets 指向的是投影那一刻的表面节点：裁剪把它们移走之后
+  // 宿主会拒收整份日志（`target seq N is not a current surface node`）。按每条
+  // offload 自己那一刻的节点栈筛一遍，全失效的整条丢掉。
+  //
+  // 必须**迭代到稳定**：丢掉整条 offload 会让后面的 seq 全部前移，那些 target
+  // 又指到了别的东西上（实测 25515ab4 第二轮就撞 `target seq 2535`）。每轮重编
+  // 之后重筛，直到只剩"删 target 项"（事件数不变、seq 不变）为止。
+  for (let round = 0; round < 6; round += 1) {
+    const pruned = pruneOffloadTargets(renamed.events)
+    if (pruned.removed === 0) {
+      // 只剪了 target 项，seq 没动，可以收工。
+      if (pruned.pruned > 0) renamed = { ...renamed, events: pruned.events }
+      break
+    }
+    renamed = renumber(pruned.events)
+  }
+
+  // `llm/retry` / `llm/retry-started` 必须能找到一个**在它之前**、provider 相同的
+  // `request/header`（宿主逐条校验 `llm/retry provider does not match the open
+  // request/header`）。前缀与窗口一起裁之后，某些 retry 前面那条 header 被删掉，
+  // 产物一开头就是一批悬空的 retry（实测 25515ab4 剩 22 条）。
+  //
+  // 收尾办法：扫一遍产物，维护"当前开着的 header provider"；provider 对不上的
+  // retry 去**原日志**里按 `retryId` 找回它，再取原日志里它之前最近的那条 header，
+  // 把这条 header 的内容补进产物并重编。补不回来才丢那批 retry。
+  for (let round = 0; round < 6; round += 1) {
+    const missing = []
+    let currentProvider = null
+    for (const event of renamed.events) {
+      if (event.type === 'request/header') {
+        currentProvider = event.data?.header?.config?.provider ?? null
+        continue
+      }
+      if (event.type !== 'llm/retry' && event.type !== 'llm/retry-started') continue
+      const provider = event.data?.provider
+      if (provider !== undefined && provider !== currentProvider) missing.push(event)
+    }
+    if (missing.length === 0) break
+    const originalById = new Map()
+    for (const event of original.events) {
+      const id = event.data?.retryId
+      if (typeof id === 'string') originalById.set(id, event)
+    }
+    const wantHeaders = new Set()
+    const dropIds = new Set()
+    for (const event of missing) {
+      const id = event.data?.retryId
+      const origin = typeof id === 'string' ? originalById.get(id) : undefined
+      if (origin === undefined) {
+        dropIds.add(id ?? null)
+        continue
+      }
+      const header = original.events
+        .filter((candidate) => candidate.type === 'request/header' && candidate.seq < origin.seq)
+        .pop()
+      if (header === undefined) {
+        dropIds.add(id ?? null)
+        continue
+      }
+      wantHeaders.add(header.seq)
+    }
+    if (wantHeaders.size === 0 && dropIds.size === 0) break
+    const additions = []
+    for (const headerSeq of wantHeaders) {
+      const header = original.events.find((candidate) => candidate.seq === headerSeq)
+      if (header !== undefined) additions.push(structuredClone(header))
+    }
+    const filtered = dropIds.size === 0
+      ? renamed.events
+      : renamed.events.filter((event) => {
+          const id = event.data?.retryId
+          return !(typeof id === 'string' && dropIds.has(id))
+        })
+    if (additions.length === 0 && filtered.length === renamed.events.length) break
+    // 插到**它该在的位置**，不是追加到末尾：`request/header` 排在最前面才会被
+    // 后面的 retry 当成"开着的"。先按原日志 seq 决定插入点（用第一条 retry 在
+    // 产物里的位置当锚），再重编。
+    const firstRetryAt = filtered.findIndex(
+      (event) => event.type === 'llm/retry' || event.type === 'llm/retry-started',
+    )
+    const insertAt = firstRetryAt < 0 ? 0 : firstRetryAt
+    renamed = renumber([
+      ...filtered.slice(0, insertAt),
+      ...additions,
+      ...filtered.slice(insertAt),
+    ])
+  }
+
+  // compaction 必须**整组齐全**（`start` + `summary` + `end`，同一个 compactionId）。
+  // 只留下一个孤立的 `compaction/start`，宿主在后面遇到 `turn/end` 时报
+  // `turn/end crosses an open compaction`（实测 25515ab4 / 50d48342 / a982e317
+  // 各剩 4 个孤立 start）。这些是纯记账行，不占模型视图，缺项就整组丢掉。
+  for (let round = 0; round < 6; round += 1) {
+    const kept = new Set(renamed.events.map((e) => e.seq))
+    const groups = new Map()
+    for (const event of renamed.events) {
+      if (!String(event.type).startsWith('compaction/')) continue
+      const id = event.data?.compactionId
+      if (typeof id !== 'string') continue
+      const slot = groups.get(id) ?? { start: false, summary: false, end: false }
+      const type = String(event.type)
+      if (type === 'compaction/start') slot.start = true
+      else if (type === 'compaction/summary') slot.summary = true
+      else if (type === 'compaction/end') slot.end = true
+      groups.set(id, slot)
+    }
+    let dropped = 0
+    for (const event of renamed.events) {
+      if (!String(event.type).startsWith('compaction/')) continue
+      const id = event.data?.compactionId
+      if (typeof id !== 'string') continue
+      const slot = groups.get(id)
+      if (slot !== undefined && slot.start && slot.summary && slot.end) continue
+      kept.delete(event.seq)
+      dropped += 1
+    }
+    if (dropped === 0) break
+    renamed = renumber(renamed.events.filter((e) => kept.has(e.seq)))
   }
 
   const seqs = new Set(renamed.events.map((e) => e.seq))
@@ -2230,7 +3206,7 @@ export async function stageTrim(logFile, keep, options = {}) {
     backup,
     summary: {
       backup,
-      before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.windows },
+      before: { events: original.events.length, bytes: original.compressedBytes, windows: trimmed.realWindows },
       after: { events: renamed.events.length, bytes: (await fs.promises.stat(staging)).size },
       dropped: trimmed.dropped + shadowed.dropped,
       refsFixed: renamed.refsFixed,
@@ -2317,14 +3293,14 @@ function trimReport(file, keep, target) {
   const original = readLog(file)
   const trimmed = keepLastWindows(original.events, keep)
   if (trimmed.cutSeq === null) {
-    console.log(`只有 ${trimmed.windows} 个窗口，不需要裁。`)
+    console.log(`只有 ${trimmed.realWindows} 个窗口，不需要裁。`)
     return
   }
   const renamed = renumber(trimmed.events)
   const bytes = encodeLog(original.header, renamed.events)
   fs.writeFileSync(target, bytes)
   console.log(`原日志    ${file}`)
-  console.log(`窗口      ${trimmed.windows} 个 → 保留最后 ${keep} 个（切点 seq ${trimmed.cutSeq}）`)
+  console.log(`窗口      ${trimmed.realWindows} 个 → 保留最后 ${keep} 个（切点 seq ${trimmed.cutSeq}）`)
   console.log(`事件      ${original.events.length} → ${renamed.events.length}（删除 ${trimmed.dropped} 条）`)
   console.log(`大小      ${human(original.compressedBytes)} → ${human(bytes.length)}`)
   console.log(`对话区    可见行 ${transcriptRows(original.events)} → ${transcriptRows(renamed.events)}`)
